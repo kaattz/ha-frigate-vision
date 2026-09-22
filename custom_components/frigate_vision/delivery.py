@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .clip_proxy import ClipUrlError, hls_path_for, signed_clip_url_for
+from .clip_proxy import ClipUrlError, signed_clip_url_for, signed_hls_url_for
 from .models import ActivityRecord, ActivityStage
 from .repairs import async_set_issue
 from .store import ActivityStore
@@ -74,11 +74,19 @@ class DeliveryManager:
         # a video it cannot range-request. HLS is segmented, so this is the
         # playable one.
         #
-        # Degraded rather than raised: delivery is the product and the play
-        # link is an enhancement, so a camera name the URL builder rejects must
-        # not cost the user their notification.
+        # Signed, and relative rather than absolute: every HLS segment is
+        # auth-gated on its own, so an unsigned manifest loads and then never
+        # plays. `signed_hls_url_for` returns None rather than raising -- the
+        # play link is an enhancement and the notification is the product --
+        # so a None here is a delivered event without a player, not a failure.
+        #
+        # Degraded rather than raised: a camera name the URL builder rejects must
+        # not cost the user their notification. `signed_hls_url_for` already
+        # answers None for that case, and this `except` is kept as a backstop
+        # because `delivery` is the product and must not depend on the builder's
+        # internals for its own survival.
         try:
-            hls_url: str | None = hls_path_for(record.camera, record)
+            hls_url: str | None = signed_hls_url_for(self._hass, record)
         except ClipUrlError:
             hls_url = None
             _LOGGER.warning(

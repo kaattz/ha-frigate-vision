@@ -237,12 +237,17 @@ async def test_activity_event_carries_a_playable_hls_url(hass: HomeAssistant) ->
     `clip_url` is kept: it is the shareable absolute link. `hls_url` is what
     the in-app player uses, because no MP4 endpoint here can be
     range-requested and a mobile browser will not stream without that.
+
+    The manifest must carry `authSig`, exactly as `clip_url` does, because the
+    HA Frigate integration gates *every segment* on its own signature: an
+    unsigned manifest loads and then nothing in it ever plays.
     """
     # `clip_url` is absolute, so it needs an origin. The bare `hass` fixture has
     # none, and `signed_clip_url_for` returns None without one.
     # Signing additionally needs the http component's auth: without this setup
-    # `async_sign_path` raises, and the link silently degrades to the unsigned
-    # fallback, so the test would never touch the path production uses.
+    # `async_sign_path` raises, and both links silently degrade -- the clip to
+    # its unsigned fallback and the manifest to no link at all -- so the test
+    # would never touch the path production uses.
     assert await async_setup_component(hass, "http", {})
     hass.config.external_url = "https://ha.example.com"
 
@@ -275,9 +280,14 @@ async def test_activity_event_carries_a_playable_hls_url(hass: HomeAssistant) ->
     assert data["clip_url"], "the shareable link must still be delivered"
     hls = data["hls_url"]
     assert hls.startswith("/api/frigate/vod/front/start/")
-    assert hls.endswith("/index.m3u8")
+    # Still Frigate's manifest path -- the signature is appended as a query
+    # parameter, so the path itself must be untouched.
+    assert hls.split("?", 1)[0].endswith("/index.m3u8")
+    # The signature is what authorises the segments that Frigate derives from
+    # this manifest; without it every segment request is refused.
+    assert "authSig=" in hls, f"the HLS manifest is unsigned and will not play: {hls}"
     # Relative, so the same stored value works on the LAN and via the tunnel.
-    assert "://" not in hls
+    assert "://" not in hls, f"the HLS manifest must stay origin-less: {hls}"
     await manager.async_stop()
 
 
@@ -286,27 +296,21 @@ async def test_delivery_survives_an_unbuildable_hls_url(
 ) -> None:
     """A missing play URL must never cost the notification itself.
 
-    This is a synthetic branch-coverage test, not a reproduction of reachable
-    behaviour: `hls_path_for` and `ActivityRecord` gate the camera name on the
-    very same `SAFE_ID` pattern object, and that check is the only `ClipUrlError`
-    source `hls_path_for` has, so a record it would reject cannot be constructed
-    at all. The `except` in `delivery` is therefore a defensive backstop --
-    defence-in-depth -- and it can only fire if the two checks stop agreeing
-    (that guard tightened on one side, or loosened on the other) or if
-    `hls_path_for` grows a new validation of its own.
-
-    The behaviour it pins is the requirement that outlives the current
-    validation: delivery is the product; the play link is an enhancement.
-    Letting such an error escape would turn a cosmetic gap into a lost
-    notification.
+    `signed_hls_url_for` answers `None` itself rather than raising, so this
+    branch can only be reached if it starts raising again -- which is exactly
+    the regression this pins. The `except` in `delivery` is a defensive
+    backstop, and the behaviour it protects is the requirement that outlives
+    the current signatures: delivery is the product; the play link is an
+    enhancement. Letting such an error escape would turn a cosmetic gap into a
+    lost notification.
     """
     import custom_components.frigate_vision.delivery as delivery_module
     from custom_components.frigate_vision.clip_proxy import ClipUrlError
 
-    def boom(camera: str, record: object) -> str:
+    def boom(hass_: HomeAssistant, record: object) -> str:
         raise ClipUrlError("invalid_camera")
 
-    monkeypatch.setattr(delivery_module, "hls_path_for", boom)
+    monkeypatch.setattr(delivery_module, "signed_hls_url_for", boom)
 
     # As above: the shareable link is absolute and needs an origin, and signing
     # it needs the http component's auth.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import Mock
 
 import pytest
@@ -273,3 +274,103 @@ def test_hls_path_accepts_a_camera_at_the_models_length_limit() -> None:
 
     with pytest.raises(ClipUrlError, match="invalid_camera"):
         hls_path_for("a" * 193, record)
+
+
+async def test_signed_hls_url_carries_authSig_and_stays_relative(
+    hass: HomeAssistant,
+) -> None:
+    """Every HLS segment is auth-gated, so the manifest must be signed.
+
+    The HA Frigate integration's `VodSegmentProxyView` rejects any segment
+    without a valid `authSig`, and Frigate echoes the manifest's query string
+    into the segment URIs -- so signing the manifest is what authorises the
+    whole stream.
+    """
+    from homeassistant.setup import async_setup_component
+
+    from custom_components.frigate_vision.clip_proxy import signed_hls_url_for
+
+    assert await async_setup_component(hass, "http", {})
+    url = signed_hls_url_for(hass, _record())
+    assert url is not None
+    assert url.startswith("/api/frigate/vod/front/start/")
+    assert "authSig=" in url
+    # Still relative: the player runs same-origin inside the HA frontend, so a
+    # relative URL works on the LAN and through the tunnel alike.
+    assert "://" not in url
+
+
+async def test_signed_hls_url_degrades_to_none_when_signing_fails(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manifest that cannot be signed must not take the delivery down with it.
+
+    `async_sign_path` reaches for `hass.data["http.auth"]`, which is absent
+    until the http component is set up, so this is a real state rather than a
+    contrived one. The play link is an enhancement and the notification is the
+    product: the helper answers None and lets the caller deliver without a
+    player.
+    """
+    from custom_components.frigate_vision import clip_proxy
+
+    def boom(*args: object, **kwargs: object) -> str:
+        raise KeyError("http.auth")
+
+    monkeypatch.setattr(clip_proxy, "async_sign_path", boom)
+    assert clip_proxy.signed_hls_url_for(hass, _record()) is None
+
+
+async def test_signed_hls_url_degrades_to_none_for_an_unbuildable_path(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unbuildable path is the same outcome as an unsignable one: no player.
+
+    Reached through `hls_path_for` raising rather than by patching the signer,
+    so the helper's own `try` is what is under test -- a `ClipUrlError` from
+    the path builder must degrade, not propagate.
+    """
+    from custom_components.frigate_vision import clip_proxy
+
+    def boom(camera: str, record: object) -> str:
+        raise clip_proxy.ClipUrlError("invalid_camera")
+
+    monkeypatch.setattr(clip_proxy, "hls_path_for", boom)
+    assert clip_proxy.signed_hls_url_for(hass, _record()) is None
+
+
+def test_signed_hls_url_delegates_the_path_to_hls_path_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Signing must wrap `hls_path_for`, not re-derive the manifest path.
+
+    Two builders for one URL would drift: a window change in `hls_path_for`
+    would silently stop applying to the delivered link. The path is replaced
+    with one nothing else could produce, so only a call through can satisfy the
+    assertion.
+    """
+    from custom_components.frigate_vision import clip_proxy
+
+    seen: list[tuple[str, ActivityRecord]] = []
+    ttls: list[timedelta] = []
+
+    def fake_path(camera: str, record: ActivityRecord) -> str:
+        seen.append((camera, record))
+        return "/api/frigate/vod/side/start/1/end/2/index.m3u8"
+
+    def fake_sign(hass: object, path: str, ttl: timedelta) -> str:
+        ttls.append(ttl)
+        return f"{path}?authSig=SIG"
+
+    monkeypatch.setattr(clip_proxy, "hls_path_for", fake_path)
+    monkeypatch.setattr(clip_proxy, "async_sign_path", fake_sign)
+
+    record = _record()
+    assert (
+        clip_proxy.signed_hls_url_for(Mock(), record)
+        == "/api/frigate/vod/side/start/1/end/2/index.m3u8?authSig=SIG"
+    )
+    assert seen == [("front", record)]
+    # The same TTL as the shareable link: both are opened from one
+    # notification, so a shorter one here would break the player while
+    # `clip_url` still worked.
+    assert ttls == [clip_proxy.CLIP_LINK_TTL]

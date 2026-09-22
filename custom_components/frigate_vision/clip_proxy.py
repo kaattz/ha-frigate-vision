@@ -171,6 +171,56 @@ def signed_clip_url_for(
     return f"{origin}{path}"
 
 
+def signed_hls_url_for(hass: HomeAssistant, record: ActivityRecord) -> str | None:
+    """Return a playable HLS manifest for one activity, or None.
+
+    The manifest has to be signed even though the player runs inside an
+    authenticated frontend. The HA Frigate integration's `VodSegmentProxyView`
+    validates an `authSig` on *every segment request* and refuses the request
+    without one, so an unsigned manifest loads and then nothing in it ever
+    plays. Frigate echoes the manifest's own query string into the segment URIs
+    it writes, so signing the manifest authorises the whole stream in one step:
+    the segments inherit the token by themselves. Signing is also what the
+    signature check expects -- it compares the token's `path` claim against the
+    segment's parent directory with `startswith`, which the manifest's path
+    satisfies.
+
+    Deliberately server-relative, unlike `signed_clip_url_for`, and for the
+    reason `hls_path_for` gives: the player resolves the URL against whatever
+    origin the frontend is on, so one delivered value works on the LAN and
+    through the reverse tunnel alike, with no `external_url` change. The
+    signature is bound to the path rather than the host, so it stays valid
+    whichever of those origins the request arrives on.
+
+    The TTL is `CLIP_LINK_TTL` rather than a shorter player-sized window: the
+    popup is opened from the same notification as the shareable link, so the
+    two age out together instead of the player breaking first.
+
+    Returns None instead of raising. The play link is an enhancement and the
+    notification is the product, so a manifest that cannot be built or signed
+    must cost the user the player, not the delivery.
+    """
+    try:
+        # Both steps share one `try` because from the caller's side they are one
+        # outcome: a manifest that cannot be built is no more playable than one
+        # that cannot be signed, and there is a single answer for either.
+        path = hls_path_for(record.camera, record)
+        return async_sign_path(hass, path, CLIP_LINK_TTL)
+    except Exception:  # noqa: BLE001
+        # Broad on purpose, mirroring `signed_clip_url_for`: `async_sign_path`
+        # reaches for `hass.data["http.auth"]`, which does not exist until the
+        # http component is set up, so a bare `hass` fails with a `KeyError`
+        # that is not a signing error and has no narrower type worth catching.
+        # Letting it escape would fail the delivery over the play link.
+        _LOGGER.warning(
+            "Could not build or sign the HLS manifest for %s; delivering the "
+            "activity without a playable link",
+            record.activity_id,
+            exc_info=True,
+        )
+        return None
+
+
 class FrigateClipView(HomeAssistantView):
     """Stream one activity's clip from Frigate, behind Home Assistant's auth."""
 
