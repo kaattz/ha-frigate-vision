@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from urllib.parse import urlencode
@@ -10,10 +11,12 @@ from urllib.parse import urlencode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .clip_proxy import signed_clip_url_for
+from .clip_proxy import ClipUrlError, hls_path_for, signed_clip_url_for
 from .models import ActivityRecord, ActivityStage
 from .repairs import async_set_issue
 from .store import ActivityStore
+
+_LOGGER = logging.getLogger(__name__)
 
 EVENT_ACTIVITY = "frigate_vision_activity"
 
@@ -66,6 +69,23 @@ class DeliveryManager:
             record.entry_id,
             record,
         )
+        # The in-app player cannot use `clip_url`: every MP4 endpoint here
+        # answers without `Accept-Ranges`, and a mobile browser will not stream
+        # a video it cannot range-request. HLS is segmented, so this is the
+        # playable one.
+        #
+        # Degraded rather than raised: delivery is the product and the play
+        # link is an enhancement, so a camera name the URL builder rejects must
+        # not cost the user their notification.
+        try:
+            hls_url: str | None = hls_path_for(record.camera, record)
+        except ClipUrlError:
+            hls_url = None
+            _LOGGER.warning(
+                "No playable URL for %s: camera %r is not a valid path segment",
+                record.activity_id,
+                record.camera,
+            )
         self._hass.bus.async_fire(
             EVENT_ACTIVITY,
             {
@@ -77,6 +97,7 @@ class DeliveryManager:
                 "confidence": record.confidence,
                 "evidence_url": record.evidence_media_url,
                 "clip_url": clip_url,
+                "hls_url": hls_url,
                 "frigate_review_url": review_url,
                 "review_ids": list(record.review_ids),
                 "occurred_at": record.created_at,

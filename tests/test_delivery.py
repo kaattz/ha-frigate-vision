@@ -229,3 +229,103 @@ async def test_signed_link_is_bound_to_one_activity(hass: HomeAssistant) -> None
     assert first != second
     # No origin means no absolute link, rather than a host-less path.
     assert signed_clip_url_for(hass, "", "entry_1", record) is None
+
+
+async def test_activity_event_carries_a_playable_hls_url(hass: HomeAssistant) -> None:
+    """The popup player needs a URL it can actually stream.
+
+    `clip_url` is kept: it is the shareable absolute link. `hls_url` is what
+    the in-app player uses, because no MP4 endpoint here can be
+    range-requested and a mobile browser will not stream without that.
+    """
+    # `clip_url` is absolute, so it needs an origin. The bare `hass` fixture has
+    # none, and `signed_clip_url_for` returns None without one -- the same
+    # reason the signing test above sets it.
+    hass.config.external_url = "https://ha.example.com"
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="activity_1",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.ANALYSIS_DONE,
+            processing_mode=ProcessingMode.LIVE,
+            created_at=100.0,
+            updated_at=140.0,
+            camera="front",
+            classification="visitor",
+            description="有人到访。",
+            confidence=80,
+            sample_times=(100.0, 105.0, 110.0, 118.0, 130.0, 133.0),
+        )
+    )
+    entry = MockConfigEntry(domain="frigate_vision", entry_id="entry_1", title="Front")
+    events: list[dict] = []
+    hass.bus.async_listen(EVENT_ACTIVITY, lambda event: events.append(event.data))
+    manager = DeliveryManager(hass, entry, store, ack_timeout=60)
+    await manager.async_start("activity_1")
+    await hass.async_block_till_done()
+
+    data = events[0]
+    assert data["clip_url"], "the shareable link must still be delivered"
+    hls = data["hls_url"]
+    assert hls.startswith("/api/frigate/vod/front/start/")
+    assert hls.endswith("/index.m3u8")
+    # Relative, so the same stored value works on the LAN and via the tunnel.
+    assert "://" not in hls
+    await manager.async_stop()
+
+
+async def test_delivery_survives_an_unbuildable_hls_url(
+    hass: HomeAssistant, monkeypatch
+) -> None:
+    """A missing play URL must never cost the notification itself.
+
+    `hls_path_for` validates the camera name, so a record with an odd camera
+    raises. Delivery is the product; the play link is an enhancement. Letting
+    the error escape would turn a cosmetic gap into a lost notification.
+    """
+    import custom_components.frigate_vision.delivery as delivery_module
+    from custom_components.frigate_vision.clip_proxy import ClipUrlError
+
+    def boom(camera: str, record: object) -> str:
+        raise ClipUrlError("invalid_camera")
+
+    monkeypatch.setattr(delivery_module, "hls_path_for", boom)
+
+    # Same as above: the shareable link is absolute and needs an origin.
+    hass.config.external_url = "https://ha.example.com"
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="activity_1",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.ANALYSIS_DONE,
+            processing_mode=ProcessingMode.LIVE,
+            created_at=100.0,
+            updated_at=140.0,
+            camera="front",
+            classification="visitor",
+            description="有人到访。",
+            confidence=80,
+            sample_times=(100.0, 105.0, 110.0, 118.0, 130.0, 133.0),
+        )
+    )
+    entry = MockConfigEntry(domain="frigate_vision", entry_id="entry_1", title="Front")
+    events: list[dict] = []
+    hass.bus.async_listen(EVENT_ACTIVITY, lambda event: events.append(event.data))
+    manager = DeliveryManager(hass, entry, store, ack_timeout=60)
+    started = await manager.async_start("activity_1")
+    await hass.async_block_till_done()
+
+    # The activity still reached DELIVERY_STARTED and still fired its event.
+    assert started.stage is ActivityStage.DELIVERY_STARTED
+    assert len(events) == 1
+    assert events[0]["hls_url"] is None
+    assert events[0]["clip_url"], "the shareable link must survive too"
+    await manager.async_stop()
