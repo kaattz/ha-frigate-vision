@@ -239,8 +239,11 @@ async def test_activity_event_carries_a_playable_hls_url(hass: HomeAssistant) ->
     range-requested and a mobile browser will not stream without that.
     """
     # `clip_url` is absolute, so it needs an origin. The bare `hass` fixture has
-    # none, and `signed_clip_url_for` returns None without one -- the same
-    # reason the signing test above sets it.
+    # none, and `signed_clip_url_for` returns None without one.
+    # Signing additionally needs the http component's auth: without this setup
+    # `async_sign_path` raises, and the link silently degrades to the unsigned
+    # fallback, so the test would never touch the path production uses.
+    assert await async_setup_component(hass, "http", {})
     hass.config.external_url = "https://ha.example.com"
 
     store = ActivityStore(hass, "entry_1")
@@ -283,9 +286,19 @@ async def test_delivery_survives_an_unbuildable_hls_url(
 ) -> None:
     """A missing play URL must never cost the notification itself.
 
-    `hls_path_for` validates the camera name, so a record with an odd camera
-    raises. Delivery is the product; the play link is an enhancement. Letting
-    the error escape would turn a cosmetic gap into a lost notification.
+    This is a synthetic branch-coverage test, not a reproduction of reachable
+    behaviour: `hls_path_for` and `ActivityRecord` gate the camera name on the
+    very same `SAFE_ID` pattern object, and that check is the only `ClipUrlError`
+    source `hls_path_for` has, so a record it would reject cannot be constructed
+    at all. The `except` in `delivery` is therefore a defensive backstop --
+    defence-in-depth -- and it can only fire if the two checks stop agreeing
+    (that guard tightened on one side, or loosened on the other) or if
+    `hls_path_for` grows a new validation of its own.
+
+    The behaviour it pins is the requirement that outlives the current
+    validation: delivery is the product; the play link is an enhancement.
+    Letting such an error escape would turn a cosmetic gap into a lost
+    notification.
     """
     import custom_components.frigate_vision.delivery as delivery_module
     from custom_components.frigate_vision.clip_proxy import ClipUrlError
@@ -295,7 +308,9 @@ async def test_delivery_survives_an_unbuildable_hls_url(
 
     monkeypatch.setattr(delivery_module, "hls_path_for", boom)
 
-    # Same as above: the shareable link is absolute and needs an origin.
+    # As above: the shareable link is absolute and needs an origin, and signing
+    # it needs the http component's auth.
+    assert await async_setup_component(hass, "http", {})
     hass.config.external_url = "https://ha.example.com"
 
     store = ActivityStore(hass, "entry_1")

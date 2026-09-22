@@ -92,7 +92,7 @@ Home Assistant 自定义集成（HACS）：把**任意受监控区域的活动**
 | `frigate_vision.retry_failed` | 仅对**可证明安全**的失败建立一次显式重试 |
 | `frigate_vision.ack_delivery` | 通知蓝图处理成功后回执，活动转为 `completed` |
 
-**交付事件** `frigate_vision_activity` 字段：`entry_id`、`activity_id`、`delivery_attempt_id`、`classification`、`description`、`confidence`、`evidence_url`、`clip_url`、`frigate_review_url`、`review_ids`、`occurred_at`。
+**交付事件** `frigate_vision_activity` 字段：`entry_id`、`activity_id`、`delivery_attempt_id`、`classification`、`description`、`confidence`、`evidence_url`、`clip_url`、`hls_url`、`frigate_review_url`、`review_ids`、`occurred_at`。
 
 ## 安装
 
