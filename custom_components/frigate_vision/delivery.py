@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .clip_proxy import clip_url_for
+from .clip_proxy import signed_clip_url_for
 from .models import ActivityRecord, ActivityStage
 from .repairs import async_set_issue
 from .store import ActivityStore
@@ -53,11 +53,18 @@ class DeliveryManager:
             else None
         )
         # The clip is served through Home Assistant, not Frigate, so the link
-        # works away from home and requires a login. Frigate's own URL would
-        # only resolve on the home network, which is how the previous
-        # video-based automation behaved.
-        clip_url = clip_url_for(
-            str(self._hass.config.external_url or ""), record.entry_id, record
+        # works away from home. Frigate's own URL would only resolve on the home
+        # network, which is how the previous video-based automation behaved.
+        #
+        # Signed rather than bare: the link is opened from a notification, often
+        # on a phone with no session in that browser, and a bare `/api/` URL is
+        # refused with 401 there -- measured on this deployment, every tap was
+        # rejected as `invalid authentication`.
+        clip_url = signed_clip_url_for(
+            self._hass,
+            str(self._hass.config.external_url or ""),
+            record.entry_id,
+            record,
         )
         self._hass.bus.async_fire(
             EVENT_ACTIVITY,

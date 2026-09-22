@@ -18,10 +18,12 @@ single event's recording.
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
+from homeassistant.components.http.auth import async_sign_path
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.http import HomeAssistantView
 
@@ -30,6 +32,14 @@ from .models import ActivityRecord, ActivityStage
 _LOGGER = logging.getLogger(__name__)
 
 CLIP_URL_PREFIX = "/api/frigate_vision/clip/"
+
+# How long a signed clip link stays usable. Long enough that a notification
+# read the next morning still opens, short enough that a leaked URL stops
+# working rather than exposing the camera indefinitely.
+#
+# Measured need: the activity is delivered once and the notification persists,
+# so the window has to outlive "I'll look at it later" rather than the event.
+CLIP_LINK_TTL = timedelta(hours=24)
 
 # Seconds of footage kept either side of the activity. The first sample is
 # already the first person frame and the last is before the postroll, so a
@@ -73,9 +83,56 @@ def clip_url_for(base_url: str, entry_id: str, record: ActivityRecord) -> str | 
     if not origin:
         return None
     return (
-        f"{origin}{CLIP_URL_PREFIX}"
+        f"{origin}{clip_path_for(entry_id, record)}"
+    )
+
+
+def clip_path_for(entry_id: str, record: ActivityRecord) -> str:
+    """Return the server-relative path of one activity's clip."""
+    return (
+        f"{CLIP_URL_PREFIX}"
         f"{quote(entry_id, safe='')}/{quote(record.activity_id, safe='')}.mp4"
     )
+
+
+def signed_clip_url_for(
+    hass: HomeAssistant,
+    base_url: str,
+    entry_id: str,
+    record: ActivityRecord,
+) -> str | None:
+    """Return a clip URL that opens without a Home Assistant session.
+
+    A bare `/api/...` link is refused with 401 for anyone who is not already
+    logged in. The link is read from a notification -- frequently on a phone
+    that has no session in the browser it opens in -- so a bare link is a link
+    that does nothing. Measured on this deployment: every tap on the unsigned
+    URL was logged as `invalid authentication`, which the user sees as the page
+    simply not loading.
+
+    `async_sign_path` appends HA's own `authSig` token, so the endpoint stays
+    authenticated while the URL itself carries the authorisation. The signature
+    is bound to the path, so it cannot be replayed against another activity.
+
+    Falls back to the unsigned URL if signing is unavailable: a link that needs
+    a login still beats no link at all, and delivery must not fail over it.
+    """
+    origin = base_url.strip().rstrip("/")
+    if not origin:
+        return None
+    try:
+        path = async_sign_path(
+            hass, clip_path_for(entry_id, record), CLIP_LINK_TTL
+        )
+    except Exception:  # noqa: BLE001
+        _LOGGER.warning(
+            "Could not sign the clip link for %s; falling back to an "
+            "authenticated URL",
+            record.activity_id,
+            exc_info=True,
+        )
+        return f"{origin}{clip_path_for(entry_id, record)}"
+    return f"{origin}{path}"
 
 
 class FrigateClipView(HomeAssistantView):
