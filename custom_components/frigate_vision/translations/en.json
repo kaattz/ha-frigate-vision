@@ -1,0 +1,174 @@
+{
+  "title": "Frigate Vision",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Frigate",
+        "data": {
+          "name": "Name",
+          "base_url": "Base URL",
+          "auth_mode": "Authentication",
+          "mqtt_topic_prefix": "MQTT topic prefix",
+          "camera": "Camera",
+          "near_zones": "Near zones",
+          "transition_zones": "Transition zones",
+          "far_zones": "Far zones"
+        }
+      },
+      "door": {
+        "title": "Entrance devices",
+        "data": {
+          "event_entity_id": "Lock event entity",
+          "action_attribute": "Action attribute",
+          "open_values": "Open values",
+          "close_values": "Close values",
+          "side_attribute": "Side attribute",
+          "inside_values": "Inside values",
+          "outside_values": "Outside values",
+          "contact_entity_id": "Door contact (optional)",
+          "doorbell_event_entity_id": "Doorbell event (optional)"
+        }
+      },
+      "llmvision": {
+        "title": "Vision provider",
+        "data": {
+          "llm_base_url": "Base URL",
+          "llm_api_key": "API key",
+          "llm_model": "Model",
+          "llm_thinking": "Reasoning"
+        }
+      },
+      "options": {
+        "title": "Behavior",
+        "data": {
+          "processing_mode": "Processing mode",
+          "target_width": "Image width",
+          "max_tokens": "Maximum tokens",
+          "output_language": "Output language",
+          "history_retention_days": "History retention days",
+          "media_retention_days": "Media retention days",
+          "queue_size": "Queue size",
+          "analyze_night_unknown": "Analyze unknown night activity",
+          "analyze_all_far_reviews": "Analyze all far-zone reviews"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure Frigate",
+        "data": {
+          "base_url": "Base URL",
+          "auth_mode": "Authentication",
+          "mqtt_topic_prefix": "MQTT topic prefix",
+          "camera": "Camera",
+          "username": "Username",
+          "password": "Password",
+          "near_zones": "Near zones",
+          "transition_zones": "Transition zones",
+          "far_zones": "Far zones"
+        }
+      },
+      "reconfigure_door": {
+        "title": "Entrance devices",
+        "description": "Leave the lock event entity empty to run review-only: the integration then keys every activity off Frigate person reviews and never creates a door cycle.",
+        "data": {
+          "event_entity_id": "Lock event entity",
+          "action_attribute": "Action attribute",
+          "open_values": "Open values",
+          "close_values": "Close values",
+          "side_attribute": "Side attribute",
+          "inside_values": "Inside values",
+          "outside_values": "Outside values",
+          "contact_entity_id": "Door contact (optional)",
+          "doorbell_event_entity_id": "Doorbell event (optional)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to Frigate",
+      "invalid_url": "Frigate URL is invalid",
+      "invalid_auth": "Native authentication requires a username and password",
+      "invalid_zones": "Zone lists are invalid",
+      "invalid_door_mapping": "Door mapping values overlap or are invalid",
+      "door_lock_required": "Door contact and doorbell require a lock event entity",
+      "llm_incomplete": "Base URL and model are both required",
+      "llm_missing_key": "An API key is required"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Behavior",
+        "menu_options": {
+          "settings": "Configure settings",
+          "test_connection": "Test vision provider connection"
+        }
+      },
+      "settings": {
+        "title": "Behavior",
+        "data": {
+          "processing_mode": "Processing mode",
+          "llm_base_url": "Base URL",
+          "llm_api_key": "API key",
+          "llm_model": "Model",
+          "llm_thinking": "Reasoning",
+          "target_width": "Image width",
+          "max_tokens": "Maximum tokens",
+          "output_language": "Output language",
+          "history_retention_days": "History retention days",
+          "media_retention_days": "Media retention days",
+          "queue_size": "Queue size",
+          "analyze_night_unknown": "Analyze unknown night activity",
+          "analyze_all_far_reviews": "Analyze all far-zone reviews"
+        }
+      },
+      "test_connection": {
+        "title": "Test connection",
+        "description": "Result using the saved settings: model {model}, {seconds}s, {tokens} tokens. A successful reply means the URL, key and model name all work."
+      }
+    },
+    "error": {
+      "llm_missing_url": "Base URL is not set",
+      "llm_missing_key": "API key is not set",
+      "llm_missing_model": "Model is not set",
+      "provider_unavailable": "Could not reach the provider",
+      "invalid_provider_response": "The provider replied in an unexpected format",
+      "provider_http_401": "The provider rejected the API key",
+      "provider_http_403": "The provider denied access",
+      "provider_http_404": "The model or endpoint was not found",
+      "provider_http_400": "The provider rejected the request"
+    }
+  },
+  "issues": {
+    "vision_not_configured": {
+      "title": "Vision provider not configured",
+      "description": "Entry {entry_id} has no vision provider settings, so activities are never analysed."
+    },
+    "provider_unavailable": {
+      "title": "Vision provider unreachable",
+      "description": "Entry {entry_id} cannot reach the configured vision provider."
+    },
+    "frigate_unavailable": {
+      "title": "Frigate unavailable",
+      "description": "Entry {entry_id} cannot reach Frigate."
+    },
+    "door_mapping_invalid": {
+      "title": "Door mapping invalid",
+      "description": "Entry {entry_id} rejected the configured lock event."
+    },
+    "door_open_too_long": {
+      "title": "Front door open too long",
+      "description": "Entry {entry_id} received no close event for 30 minutes, so the open door cycle was closed as failed. Check whether the door is ajar and whether the lock still reports close events."
+    },
+    "storage_corrupt": {
+      "title": "Stored state invalid",
+      "description": "Entry {entry_id} stopped to protect persisted state."
+    },
+    "media_cleanup_failed": {
+      "title": "Media cleanup failed",
+      "description": "Entry {entry_id} could not clean an evidence file."
+    },
+    "delivery_outcome_unknown": {
+      "title": "Delivery outcome unknown",
+      "description": "Entry {entry_id} will not resend the notification."
+    }
+  }
+}

@@ -1,0 +1,27 @@
+[project]
+name = "ha-frigate-entry-intelligence"
+version = "0.1.0"
+requires-python = ">=3.14.2"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+# Opt-in live harness: drives the real HA host over SSH and the real provider
+# API. It is excluded from the default run (not named test_*.py) because it
+# needs network access, credentials and a running Home Assistant. Its helpers
+# are deliberately plain rather than async-aware.
+"tests/e2e_llm_live.py" = ["E501", "ASYNC221", "ASYNC240"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unused_ignores = true

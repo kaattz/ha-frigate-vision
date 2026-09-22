@@ -1,0 +1,32 @@
+{
+  "title": "Frigate Vision",
+  "config": {
+    "step": {
+      "user": {"title": "Frigate", "data": {"name": "门口名称", "base_url": "Frigate 地址", "auth_mode": "认证方式", "mqtt_topic_prefix": "MQTT 主题前缀", "camera": "摄像头名称", "near_zones": "近端区域", "transition_zones": "过渡区域", "far_zones": "远端区域"}},
+      "door": {"title": "门口设备", "data": {"event_entity_id": "门锁事件实体", "action_attribute": "动作属性名", "open_values": "开门匹配值", "close_values": "关门匹配值", "side_attribute": "操作侧属性名", "inside_values": "室内侧匹配值", "outside_values": "室外侧匹配值", "contact_entity_id": "门磁实体（可选）", "doorbell_event_entity_id": "门铃事件实体（可选）"}},
+      "llmvision": {"title": "视觉模型服务", "data": {"llm_base_url": "接口地址", "llm_api_key": "API 密钥", "llm_model": "模型名称", "llm_reasoning_effort": "推理强度", "llm_thinking": "推理模式"}, "data_description": {"llm_reasoning_effort": "降低推理强度可省费用且不影响推理能力。推理模式可用于完全关闭思考，但关闭后多步推理任务会失败。"}},
+      "options": {"title": "行为选项", "data": {"processing_mode": "处理模式", "target_width": "图片宽度", "max_tokens": "最大 Token", "output_language": "输出语言", "history_retention_days": "历史保留天数", "media_retention_days": "媒体保留天数", "queue_size": "队列上限", "analyze_night_unknown": "分析夜间未知活动", "analyze_all_far_reviews": "分析所有远端区域 Review"}},
+      "reconfigure": {"title": "重新配置 Frigate", "data": {"base_url": "Frigate 地址", "auth_mode": "认证方式", "mqtt_topic_prefix": "MQTT 主题前缀", "camera": "摄像头名称", "username": "用户名", "password": "密码", "near_zones": "近端区域", "transition_zones": "过渡区域", "far_zones": "远端区域"}},
+      "reconfigure_door": {"title": "门口设备", "description": "门锁事件实体留空即切换为纯 Review 模式：集成将完全以 Frigate 人物 Review 作为活动入口，不再创建门周期。", "data": {"event_entity_id": "门锁事件实体", "action_attribute": "动作属性名", "open_values": "开门匹配值", "close_values": "关门匹配值", "side_attribute": "操作侧属性名", "inside_values": "室内侧匹配值", "outside_values": "室外侧匹配值", "contact_entity_id": "门磁实体（可选）", "doorbell_event_entity_id": "门铃事件实体（可选）"}}
+    },
+    "error": {"cannot_connect": "无法连接 Frigate", "invalid_url": "Frigate 地址无效", "invalid_auth": "原生认证必须填写用户名和密码", "invalid_zones": "区域列表无效", "invalid_door_mapping": "门锁映射值重叠或无效", "door_lock_required": "配置门磁或门铃前必须先选择门锁事件实体", "llm_incomplete": "接口地址与模型名称均为必填", "llm_missing_key": "必须填写 API 密钥"}
+  },
+  "options": {
+    "step": {
+      "init": {"title": "行为选项", "menu_options": {"settings": "配置参数", "test_connection": "测试视觉模型连通性"}},
+      "settings": {"title": "行为选项", "data": {"processing_mode": "处理模式", "llm_base_url": "接口地址", "llm_api_key": "API 密钥", "llm_model": "模型名称", "llm_reasoning_effort": "推理强度", "llm_thinking": "推理模式", "target_width": "图片宽度", "max_tokens": "最大 Token", "output_language": "输出语言", "history_retention_days": "历史保留天数", "media_retention_days": "媒体保留天数", "queue_size": "队列上限", "min_review_seconds": "最短活动时长（秒）", "analyze_night_unknown": "分析夜间未知活动", "analyze_all_far_reviews": "分析所有远端区域 Review"}, "data_description": {"llm_reasoning_effort": "降低推理强度可省费用且不影响推理能力。推理模式可用于完全关闭思考，但关闭后多步推理任务会失败。", "min_review_seconds": "短于该时长的活动会被完全忽略：不取帧、不分析。设为 0 表示不过滤。"}},
+      "test_connection": {"title": "连通性测试", "description": "使用已保存的配置测试：模型 {model}，耗时 {seconds} 秒，消耗 {tokens} Token。能收到回复即表示地址、密钥与模型名称均可用。"}
+    },
+    "error": {"llm_missing_url": "未填写接口地址", "llm_missing_key": "未填写 API 密钥", "llm_missing_model": "未填写模型名称", "provider_unavailable": "无法连接视觉模型服务", "invalid_provider_response": "服务返回格式异常", "provider_http_401": "API 密钥被拒绝", "provider_http_403": "访问被拒绝", "provider_http_404": "模型或接口地址不存在", "provider_http_400": "服务拒绝了该请求"}
+  },
+  "issues": {
+    "vision_not_configured": {"title": "未配置视觉模型", "description": "配置项 {entry_id} 缺少视觉模型设置，活动不会被分析。"},
+    "provider_unavailable": {"title": "视觉模型不可达", "description": "配置项 {entry_id} 无法连接已配置的视觉模型服务。"},
+    "frigate_unavailable": {"title": "Frigate 不可用", "description": "配置项 {entry_id} 无法连接 Frigate。"},
+    "door_mapping_invalid": {"title": "门锁映射无效", "description": "配置项 {entry_id} 拒绝了门锁事件。"},
+    "door_open_too_long": {"title": "入户门长时间未关闭", "description": "配置项 {entry_id} 超过 30 分钟未收到关门事件，该门周期已按失败结束。请检查门是否处于虚掩状态，以及门锁是否仍在上报关门事件。"},
+    "storage_corrupt": {"title": "持久状态无效", "description": "配置项 {entry_id} 已停止以保护状态。"},
+    "media_cleanup_failed": {"title": "媒体清理失败", "description": "配置项 {entry_id} 无法清理证据文件。"},
+    "delivery_outcome_unknown": {"title": "通知结果未知", "description": "配置项 {entry_id} 不会重复发送通知。"}
+  }
+}

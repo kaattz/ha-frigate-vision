@@ -1,0 +1,13 @@
+{
+  "domain": "frigate_vision",
+  "name": "Frigate Vision",
+  "codeowners": ["@kaattz"],
+  "config_flow": true,
+  "dependencies": ["mqtt", "media_source"],
+  "documentation": "https://github.com/kaattz/ha-frigate-vision",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/kaattz/ha-frigate-vision/issues",
+  "requirements": ["aiohttp", "pillow"],
+  "version": "0.1.0"
+}

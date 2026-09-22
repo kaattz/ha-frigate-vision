@@ -1,0 +1,44 @@
+.venv/
+.venv*/
+.tools/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.gstack/
+
+# Local review artifacts pulled from the Home Assistant media directory.
+# Evidence contact sheets contain real footage and must never be committed.
+evidence-review/
+
+# Scratch directories created by the local-only Windows test plugins
+# (tests/windows_tmpdir.py) and verification harnesses.
+.pytest-tmp*/
+.pytest-run/
+.probe-*/
+.verify-ir-tmp/
+
+# Opt-in live harness artifacts
+.e2e-media/
+
+# Local-only working documents. The design/requirements/specs set and the
+# validation records describe one specific deployment, so they stay local.
+docs/
+specs/
+
+# Scratch clone of Frigate's own source used for reference while implementing.
+# It carries its own repository metadata and must never be published here.
+# Matched by suffix: the on-disk name carries private-use icon glyphs.
+*frigate-src-codex/
+
+# Throwaway sandbox directory.
+sub/
+
+# Local deployment and debugging helpers. These reference a specific Home
+# Assistant host and are not part of the distributable integration.
+.codex-*.ps1
+diag2.py
+repair_sessions.py

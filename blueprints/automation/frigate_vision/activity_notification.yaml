@@ -1,0 +1,116 @@
+blueprint:
+  name: Frigate Vision notification
+  domain: automation
+  source_url: https://github.com/kaattz/ha-frigate-vision/blob/main/blueprints/automation/frigate_vision/activity_notification.yaml
+  input:
+    classifications:
+      name: Classifications
+      default: []
+      selector:
+        select:
+          multiple: true
+          options:
+            - home_arrival
+            - home_departure
+            - short_roundtrip
+            - package_delivery
+            - food_delivery
+            - cleaning
+            - maintenance
+            - visitor
+            - elevator_activity
+            - suspicious_activity
+            - unknown_activity
+            - unable_to_confirm
+    quiet_start:
+      name: Quiet start
+      default: "00:00:00"
+      selector: {time: {}}
+    quiet_end:
+      name: Quiet end
+      default: "00:00:00"
+      selector: {time: {}}
+    title_prefix:
+      name: Title prefix
+      default: 门口活动
+      selector: {text: {}}
+    include_image:
+      name: Include evidence image
+      default: true
+      selector: {boolean: {}}
+    include_clip:
+      name: Include recording link
+      description: >-
+        Adds a link to the recording for the whole activity. It is served by Home
+        Assistant rather than Frigate, so it also works away from home, and it
+        needs a Home Assistant login.
+      default: true
+      selector: {boolean: {}}
+    notification_action:
+      name: Notification action
+      selector:
+        action: {}
+trigger:
+  - platform: event
+    event_type: frigate_vision_activity
+variables:
+  allowed_classifications: !input classifications
+  quiet_start: !input quiet_start
+  quiet_end: !input quiet_end
+  title_prefix: !input title_prefix
+  include_image: !input include_image
+  include_clip: !input include_clip
+  entry_id: "{{ trigger.event.data.entry_id }}"
+  activity_id: "{{ trigger.event.data.activity_id }}"
+  delivery_attempt_id: "{{ trigger.event.data.delivery_attempt_id }}"
+  classification: "{{ trigger.event.data.classification }}"
+  description: "{{ trigger.event.data.description | default('', true) | trim }}"
+  confidence: "{{ trigger.event.data.confidence }}"
+  evidence_url: "{{ trigger.event.data.evidence_url if include_image else none }}"
+  clip_url: "{{ trigger.event.data.clip_url if include_clip else none }}"
+  frigate_review_url: "{{ trigger.event.data.frigate_review_url }}"
+  # The classification is the integration's internal enum; the user should read
+  # the same kind of label the previous video automation showed as tags.
+  classification_labels:
+    home_arrival: 回家
+    home_departure: 离家
+    short_roundtrip: 短暂外出
+    package_delivery: 快递
+    food_delivery: 外卖
+    cleaning: 保洁
+    maintenance: 维修
+    visitor: 访客
+    elevator_activity: 电梯活动
+    suspicious_activity: 可疑活动
+    unknown_activity: 活动
+    unable_to_confirm: 无法确认
+  classification_label: "{{ classification_labels.get(classification, classification) }}"
+  notification_title: "{{ title_prefix ~ ' · ' ~ classification_label }}"
+  # Confidence is deliberately absent: the same image analysed repeatedly returns
+  # different answers, so a number that moves between runs would cast doubt on a
+  # verdict that is already the best reading available.
+  notification_message: >-
+    {{ description if description | length > 0 else '（无文字描述）' }}
+    {%- if clip_url %}
+    📹 **视频链接：**[点击查看]({{ clip_url }})
+    {%- endif %}
+  should_notify: >-
+    {% set classification_allowed = allowed_classifications | length == 0 or classification in allowed_classifications %}
+      {% set start = today_at(quiet_start) %}
+      {% set end = today_at(quiet_end) %}
+    {% set outside_quiet = start == end or (not (start <= now() < end) if start < end
+       else not (now() >= start or now() < end)) %}
+    {{ classification_allowed and outside_quiet }}
+action:
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ should_notify }}"
+        sequence: !input notification_action
+  - service: frigate_vision.ack_delivery
+    data:
+      entry_id: "{{ entry_id }}"
+      activity_id: "{{ activity_id }}"
+      delivery_attempt_id: "{{ delivery_attempt_id }}"
+mode: parallel
+max: 20

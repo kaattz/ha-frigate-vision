@@ -1,0 +1,35 @@
+get_activity:
+  fields:
+    entry_id:
+      required: true
+      selector: {config_entry: {integration: frigate_vision}}
+    activity_id:
+      required: true
+      selector: {text: {}}
+retry_failed:
+  fields:
+    entry_id:
+      required: true
+      selector: {config_entry: {integration: frigate_vision}}
+    activity_id:
+      required: true
+      selector: {text: {}}
+process_review:
+  fields:
+    entry_id:
+      required: true
+      selector: {config_entry: {integration: frigate_vision}}
+    review_id:
+      required: true
+      selector: {text: {}}
+ack_delivery:
+  fields:
+    entry_id:
+      required: true
+      selector: {config_entry: {integration: frigate_vision}}
+    activity_id:
+      required: true
+      selector: {text: {}}
+    delivery_attempt_id:
+      required: true
+      selector: {text: {}}

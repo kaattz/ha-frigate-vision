@@ -1,0 +1,167 @@
+"""Tests for the authenticated Frigate clip proxy."""
+
+from __future__ import annotations
+
+from unittest.mock import Mock
+
+import pytest
+from aiohttp import web
+from homeassistant.core import HomeAssistant
+
+from custom_components.frigate_vision.clip_proxy import (
+    CLIP_URL_PREFIX,
+    FrigateClipView,
+    clip_url_for,
+    clip_window,
+)
+from custom_components.frigate_vision.models import (
+    ActivityRecord,
+    ActivitySource,
+    ActivityStage,
+    ProcessingMode,
+)
+
+
+def _record(**overrides: object) -> ActivityRecord:
+    base: dict[str, object] = {
+        "activity_id": "review_entry_1_front_review_1",
+        "entry_id": "entry_1",
+        "source": ActivitySource.STANDALONE_REVIEW,
+        "stage": ActivityStage.COMPLETED,
+        "processing_mode": ProcessingMode.LIVE,
+        "created_at": 100.0,
+        "updated_at": 140.0,
+        "camera": "front",
+        "review_ids": ("review_1",),
+        "sample_times": (100.0, 105.0, 110.0, 118.0, 130.0, 133.0),
+    }
+    base.update(overrides)
+    return ActivityRecord(**base)  # type: ignore[arg-type]
+
+
+def test_clip_window_starts_before_the_person_and_ends_after() -> None:
+    """The clip must show the whole activity, not start at its first frame.
+
+    The first sample is already the first person frame, so a window beginning
+    there would cut off the approach. The last sample sits before the postroll,
+    so ending there would cut off the departure. A margin on both sides keeps the
+    movement that gives the clip its meaning.
+    """
+    start, end = clip_window(_record())
+    assert start < 100.0
+    assert end > 133.0
+    # Long enough to be useful, short enough not to pull in unrelated footage.
+    assert 8.0 <= end - start <= 90.0
+
+
+def test_clip_window_stays_bounded_for_a_very_long_activity() -> None:
+    """The clip must not grow without limit.
+
+    Sample times are validated by the model, but a long activity is legitimate:
+    recorded reviews run past 700 seconds. Left unbounded the window would follow
+    it, and a phone would be asked to fetch an enormous video.
+    """
+    start, end = clip_window(
+        _record(sample_times=(100.0, 300.0, 500.0, 700.0, 900.0, 1100.0))
+    )
+    assert end - start <= 90.0
+    # Still anchored to the activity's beginning, not to its tail.
+    assert start < 100.0
+
+
+def test_clip_window_handles_a_record_with_no_samples() -> None:
+    """A record whose samples are missing still needs a usable window."""
+    start, end = clip_window(_record(sample_times=()))
+    assert end > start
+    assert 8.0 <= end - start <= 90.0
+
+
+def test_clip_url_is_absolute_and_uses_the_ha_origin() -> None:
+    """The link goes into a chat message, so it must be a full URL.
+
+    A relative path would be meaningless once pasted into WeChat, and the
+    external origin is the only host that resolves away from home.
+    """
+    url = clip_url_for("https://ha.example.com", "entry_1", _record())
+    assert url is not None
+    assert url.startswith("https://ha.example.com" + CLIP_URL_PREFIX)
+    assert url.endswith(".mp4")
+    # No doubled separators from a trailing slash on the configured origin.
+    assert "//api" not in url.replace("https://", "")
+
+
+def test_clip_url_is_omitted_without_an_origin() -> None:
+    """With no known origin the caller must fall back, not emit a broken link."""
+    assert clip_url_for("", "entry_1", _record()) is None
+
+
+def test_clip_url_encodes_the_identifier() -> None:
+    """Identifiers reach the URL, so they must be escaped rather than pasted."""
+    url = clip_url_for("https://ha.example.com", "entry 1", _record())
+    assert url is not None
+    assert " " not in url
+
+
+async def test_clip_view_builds_frigates_range_endpoint(hass: HomeAssistant) -> None:
+    """The view must translate an activity into Frigate's range endpoint.
+
+    Frigate serves a clip for any start/end pair, but only this integration knows
+    which window an activity occupies. The view exists so the message can carry
+    one stable, authenticated link.
+
+    The upstream URL is checked through the view's own builder rather than by
+    driving a full HTTP response: `web.StreamResponse.prepare` needs a real
+    payload writer, so a mocked request cannot exercise the streaming path
+    meaningfully -- it would only assert that aiohttp's internals ran.
+    """
+    record = _record()
+    view = FrigateClipView(hass, "http://frigate.test:5001")
+    url = view.upstream_url(record)
+
+    assert url.startswith("http://frigate.test:5001/api/front/start/")
+    assert url.endswith("/clip.mp4")
+    start, end = clip_window(record)
+    assert f"{start:.6f}" in url
+    assert f"{end:.6f}" in url
+
+
+def test_clip_view_url_escapes_the_camera() -> None:
+    """The camera name reaches a URL path, so it must be escaped.
+
+    `ActivityRecord` already constrains camera names to safe identifiers, so this
+    guards the boundary rather than a reachable state: quoting here means a future
+    relaxation of that rule cannot silently produce a malformed URL.
+    """
+    view = FrigateClipView(Mock(), "http://frigate")
+    record = _record()
+    object.__setattr__(record, "camera", "front door")
+    url = view.upstream_url(record)
+    assert "front door" not in url
+    assert "front%20door" in url
+
+
+def test_clip_url_survives_an_origin_with_a_trailing_slash() -> None:
+    """A configured origin may carry a trailing slash; the result must not."""
+    with_slash = clip_url_for("https://ha.example.com/", "entry_1", _record())
+    without = clip_url_for("https://ha.example.com", "entry_1", _record())
+    assert with_slash == without
+    assert "example.com//" not in str(with_slash)
+
+
+async def test_clip_view_refuses_an_unknown_activity(hass: HomeAssistant) -> None:
+    """An unknown identifier must 404, not reach Frigate.
+
+    The route is available to any logged-in user, so it must not become a way to
+    ask Frigate for arbitrary footage.
+    """
+    store = Mock()
+    store.get = Mock(return_value=None)
+    runtime = Mock()
+    runtime.store = store
+    entry = Mock()
+    entry.runtime_data = runtime
+    hass.config_entries.async_get_entry = Mock(return_value=entry)  # type: ignore[method-assign]
+
+    view = FrigateClipView(hass, "http://frigate.test:5001")
+    with pytest.raises(web.HTTPNotFound):
+        await view.get(Mock(spec=web.Request), "entry_1", "nope")

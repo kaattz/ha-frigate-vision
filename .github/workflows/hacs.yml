@@ -1,0 +1,10 @@
+name: HACS
+on: [push, pull_request]
+permissions: {contents: read}
+jobs:
+  hacs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@22.5.0
+        with: {category: integration}
