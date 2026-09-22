@@ -68,6 +68,12 @@ variables:
   confidence: "{{ trigger.event.data.confidence }}"
   evidence_url: "{{ trigger.event.data.evidence_url if include_image else none }}"
   clip_url: "{{ trigger.event.data.clip_url if include_clip else none }}"
+  # The in-app player's URL, kept separate from `clip_url`: that one is the
+  # MP4, which no endpoint here can stream (no `Accept-Ranges`), so the popup
+  # would be handed the one address that cannot play. This is the signed HLS
+  # manifest, and it is relative so the player works on the LAN and through a
+  # tunnel alike.
+  hls_url: "{{ trigger.event.data.hls_url if include_clip else none }}"
   frigate_review_url: "{{ trigger.event.data.frigate_review_url }}"
   # The classification is the integration's internal enum; the user should read
   # the same kind of label the previous video automation showed as tags.
@@ -91,9 +97,6 @@ variables:
   # verdict that is already the best reading available.
   notification_message: >-
     {{ description if description | length > 0 else '（无文字描述）' }}
-    {%- if clip_url %}
-    📹 **视频链接：**[点击查看]({{ clip_url }})
-    {%- endif %}
   should_notify: >-
     {% set classification_allowed = allowed_classifications | length == 0 or classification in allowed_classifications %}
       {% set start = today_at(quiet_start) %}
