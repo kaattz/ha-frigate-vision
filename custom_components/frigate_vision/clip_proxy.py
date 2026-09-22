@@ -18,7 +18,6 @@ single event's recording.
 from __future__ import annotations
 
 import logging
-import re
 from datetime import timedelta
 from urllib.parse import quote
 
@@ -28,17 +27,13 @@ from homeassistant.components.http.auth import async_sign_path
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.http import HomeAssistantView
 
-from .models import ActivityRecord, ActivityStage
+from .models import SAFE_ID, ActivityRecord, ActivityStage
 
 _LOGGER = logging.getLogger(__name__)
 
 CLIP_URL_PREFIX = "/api/frigate_vision/clip/"
 
 HLS_PATH_PREFIX = "/api/frigate/vod/"
-
-# Camera names reach a URL path, so they are constrained to the same shape the
-# record model already enforces rather than escaped blindly.
-SAFE_CAMERA = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 
 class ClipUrlError(ValueError):
@@ -127,7 +122,7 @@ def hls_path_for(camera: str, record: ActivityRecord) -> str:
     Seconds are truncated to integers so identical footage always yields an
     identical URL.
     """
-    if not SAFE_CAMERA.fullmatch(camera):
+    if not SAFE_ID.fullmatch(camera):
         raise ClipUrlError("invalid_camera")
     start, end = clip_window(record)
     return (

@@ -212,8 +212,6 @@ def test_hls_path_covers_the_same_window_as_the_clip() -> None:
 def test_hls_path_rejects_a_camera_name_that_cannot_be_a_url_segment() -> None:
     """The camera name reaches a URL path, so it is constrained, not escaped
     blindly."""
-    import pytest
-
     from custom_components.frigate_vision.clip_proxy import (
         ClipUrlError,
         hls_path_for,
@@ -223,3 +221,55 @@ def test_hls_path_rejects_a_camera_name_that_cannot_be_a_url_segment() -> None:
         hls_path_for("front/door", _record())
     with pytest.raises(ClipUrlError, match="invalid_camera"):
         hls_path_for("", _record())
+
+
+def test_hls_path_delegates_the_window_to_clip_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The path must carry `clip_window`'s answer, not a second opinion.
+
+    Asserting the path against `clip_window`'s own output would also pass for a
+    reimplementation that happened to use the same formula, so the window is
+    replaced with values nothing else could derive: the popup and the clip link
+    must describe one window, and only a call through proves they share it.
+    """
+    from custom_components.frigate_vision import clip_proxy
+
+    calls: list[ActivityRecord] = []
+    window = (4242.0, 4343.0)
+
+    def fake_window(record: ActivityRecord) -> tuple[float, float]:
+        calls.append(record)
+        return window
+
+    monkeypatch.setattr(clip_proxy, "clip_window", fake_window)
+    record = _record()
+    path = clip_proxy.hls_path_for("front", record)
+
+    assert calls == [record]
+    assert path == "/api/frigate/vod/front/start/4242/end/4343/index.m3u8"
+
+
+def test_hls_path_accepts_a_camera_at_the_models_length_limit() -> None:
+    """The guard must not be narrower than the model that feeds it.
+
+    `ActivityRecord` accepts camera names up to 192 characters, and the popup
+    degrades a rejected name to no HLS link at all -- a silent, successful-looking
+    delivery with a working clip_url next to a missing hls_url. Frigate itself
+    imposes no bound, and `quote` already reduces any string to one path segment,
+    so the record's own limit is the only limit justified here.
+    """
+    from custom_components.frigate_vision.clip_proxy import (
+        ClipUrlError,
+        hls_path_for,
+    )
+
+    longest = "a" * 192
+    # The record model is the source of the bound, so it must accept what the
+    # path builder accepts -- otherwise the guard is stricter than its input.
+    record = _record(camera=longest)
+    path = hls_path_for(longest, record)
+    assert path.startswith(f"/api/frigate/vod/{longest}/start/")
+
+    with pytest.raises(ClipUrlError, match="invalid_camera"):
+        hls_path_for("a" * 193, record)
