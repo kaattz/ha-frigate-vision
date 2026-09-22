@@ -14,6 +14,7 @@ from custom_components.frigate_vision.models import (
     IngressMessage,
     ModelValidationError,
     ProcessingMode,
+    analysis_key,
 )
 from custom_components.frigate_vision.store import (
     ActivityStore,
@@ -310,3 +311,46 @@ async def test_complete_media_persists_selection_source(hass: HomeAssistant) -> 
         updated_at=120,
     )
     assert completed.selection_source == "path_motion"
+
+
+async def test_complete_analysis_accepts_the_key_that_was_actually_claimed(
+    hass: HomeAssistant,
+) -> None:
+    """The completion must look for the same key the start persisted.
+
+    `VisionAnalyzer` claims its side effect with `analysis_key(...)`, which
+    includes the scene: `analysis:<id>:<scene_mode>:<prompt_version>`. This
+    method previously rebuilt the key as `analysis:<id>:<prompt_version>`, so
+    the membership test could never succeed. Every analysis reached
+    `analysis_started` and then failed with `side_effect_key_mismatch`; because
+    the stage was already `analysis_started`, the retry policy also refused to
+    re-run it, and no delivery was ever attempted.
+
+    The key must therefore be derived, not re-spelled here.
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(replace(_record(), stage=ActivityStage.EVIDENCE_READY))
+
+    scene = "review_six"
+    version = "prompt_3"
+    claimed = analysis_key("activity_1", scene, version)
+    assert await store.async_start_side_effect(
+        "activity_1",
+        claimed,
+        ActivityStage.EVIDENCE_READY,
+        ActivityStage.ANALYSIS_STARTED,
+        updated_at=110,
+    )
+
+    done = await store.async_complete_analysis(
+        "activity_1",
+        scene_mode=scene,
+        prompt_version=version,
+        classification="visitor",
+        description="一人经过。",
+        confidence=60,
+        updated_at=120,
+    )
+    assert done.stage is ActivityStage.ANALYSIS_DONE
+    assert done.classification == "visitor"

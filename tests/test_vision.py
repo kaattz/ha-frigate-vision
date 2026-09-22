@@ -8,8 +8,10 @@ import json
 from typing import Any
 
 import pytest
+from homeassistant.core import HomeAssistant
 from PIL import Image
 
+from custom_components.frigate_vision.models import analysis_key
 from custom_components.frigate_vision.vision import (
     VisionConfig,
     VisionError,
@@ -380,6 +382,88 @@ def test_validate_rejects_out_of_range_confidence(confidence: Any) -> None:
 def test_validate_rejects_a_missing_choices_array() -> None:
     with pytest.raises(VisionError, match="invalid_provider_response"):
         validate_response({"error": "nope"}, ALLOWED)
+
+
+async def test_client_completes_the_analysis_it_claimed(
+    hass: HomeAssistant,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full claim -> analyse -> complete cycle must reach ANALYSIS_DONE.
+
+    This is the path that broke in production. `VisionClient` claims its side
+    effect with a key that includes the scene, but the store rebuilt that key
+    without it when completing, so the membership check could never pass. Every
+    real activity stopped at `analysis_started` with `side_effect_key_mismatch`
+    and the retry policy then refused to re-run it, because an analysis that may
+    already have been billed is not a safe retry.
+
+    The unit tests around the store and the response validator both passed while
+    this was broken, because nothing exercised the two halves together.
+    """
+    from custom_components.frigate_vision.models import (
+        ActivityRecord,
+        ActivitySource,
+        ActivityStage,
+        ProcessingMode,
+    )
+    from custom_components.frigate_vision.store import ActivityStore
+    from custom_components.frigate_vision.vision import VisionClient
+
+    sheet = tmp_path / "activity.png"
+    sheet.write_bytes(_png(640, 240))
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="activity_1",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.EVIDENCE_READY,
+            processing_mode=ProcessingMode.SHADOW,
+            created_at=1,
+            updated_at=1,
+            camera="front",
+            evidence_mode="review_six",
+            evidence_path=str(sheet),
+        )
+    )
+
+    reply = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "classification": "visitor",
+                                "description": "一人在门前经过。",
+                                "confidence": 71,
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+    )
+    session = _FakeSession(body=reply)
+    monkeypatch.setattr(
+        "custom_components.frigate_vision.vision.async_get_clientsession",
+        lambda _hass: session,
+    )
+
+    client = VisionClient(hass, store, _config())
+    done = await client.async_analyze("activity_1")
+
+    assert done.stage is ActivityStage.ANALYSIS_DONE
+    assert done.classification == "visitor"
+    assert done.confidence == 71
+    # The scene-aware key must be what got recorded, not a shortened variant.
+    assert (
+        analysis_key("activity_1", "review_six", done.prompt_version)
+        in done.claimed_side_effects
+    )
 
 
 class _FakeResponse:

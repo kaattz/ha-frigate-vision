@@ -328,6 +328,9 @@ class VisionClient:
             raise VisionError("analysis_outcome_unknown") from exc
         return await self._store.async_complete_analysis(
             activity_id,
+            # The scene is part of the claimed key, so it must be passed back
+            # rather than left to be re-derived from an ambiguous version string.
+            scene_mode=record.evidence_mode,
             prompt_version=prompt_version,
             classification=classification,
             description=description,

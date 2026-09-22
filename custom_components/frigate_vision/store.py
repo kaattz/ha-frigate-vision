@@ -17,6 +17,7 @@ from .models import (
     BufferedIngress,
     IngressMessage,
     ModelValidationError,
+    analysis_key,
     attempt_activity_id,
     retry_is_safe,
 )
@@ -535,22 +536,26 @@ class ActivityStore:
         self,
         activity_id: str,
         *,
+        scene_mode: str,
         prompt_version: str,
         classification: str,
         description: str,
         confidence: int,
         updated_at: float,
     ) -> ActivityRecord:
+        # Derived from the same helper the claim used. Rebuilding the string here
+        # is what let the two spellings drift apart: the claim carries the scene
+        # (`analysis:<id>:<scene>:<version>`) and a hand-written
+        # `analysis:<id>:<version>` never matched it, so every analysis failed
+        # with `side_effect_key_mismatch` *after* the side effect was claimed.
+        key = analysis_key(activity_id, scene_mode, prompt_version)
         async with self._lock:
             existing = self._activities.get(activity_id)
             if existing is None:
                 raise StoreConflictError("activity_missing")
             if existing.stage is not ActivityStage.ANALYSIS_STARTED:
                 raise StoreConflictError("stage_conflict")
-            if (
-                f"analysis:{activity_id}:{prompt_version}"
-                not in existing.claimed_side_effects
-            ):
+            if key not in existing.claimed_side_effects:
                 raise StoreConflictError("side_effect_key_mismatch")
             updated = replace(
                 existing,
