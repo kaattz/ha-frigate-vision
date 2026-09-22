@@ -18,6 +18,7 @@ single event's recording.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import timedelta
 from urllib.parse import quote
 
@@ -32,6 +33,17 @@ from .models import ActivityRecord, ActivityStage
 _LOGGER = logging.getLogger(__name__)
 
 CLIP_URL_PREFIX = "/api/frigate_vision/clip/"
+
+HLS_PATH_PREFIX = "/api/frigate/vod/"
+
+# Camera names reach a URL path, so they are constrained to the same shape the
+# record model already enforces rather than escaped blindly.
+SAFE_CAMERA = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+
+class ClipUrlError(ValueError):
+    """A clip URL cannot be built for this record."""
+
 
 # How long a signed clip link stays usable. Long enough that a notification
 # read the next morning still opens, short enough that a leaked URL stops
@@ -92,6 +104,35 @@ def clip_path_for(entry_id: str, record: ActivityRecord) -> str:
     return (
         f"{CLIP_URL_PREFIX}"
         f"{quote(entry_id, safe='')}/{quote(record.activity_id, safe='')}.mp4"
+    )
+
+
+def hls_path_for(camera: str, record: ActivityRecord) -> str:
+    """Return the HLS playlist path for one activity's footage.
+
+    Deliberately server-relative and deliberately without the Frigate instance
+    id. Both choices are load-bearing:
+
+    * HLS rather than the MP4 clip, because every MP4 endpoint measured on this
+      deployment answers `200` with `Transfer-Encoding: chunked` and no
+      `Accept-Ranges`, and a mobile browser will not stream a 17 MB video it
+      cannot range-request. HLS is segmented and its segments answer `206`.
+    * Relative, because the link is opened both on the LAN and through the
+      reverse tunnel; keeping the browser's current origin makes one stored URL
+      work in both places, with no `external_url` change.
+    * No instance id, because Frigate registers an `extra_urls` form
+      (`/api/frigate/vod/...`) alongside the id-bearing one. The id comes from
+      Frigate's own MQTT `client_id`, which this integration never reads.
+
+    Seconds are truncated to integers so identical footage always yields an
+    identical URL.
+    """
+    if not SAFE_CAMERA.fullmatch(camera):
+        raise ClipUrlError("invalid_camera")
+    start, end = clip_window(record)
+    return (
+        f"{HLS_PATH_PREFIX}{quote(camera, safe='')}"
+        f"/start/{int(start)}/end/{int(end)}/index.m3u8"
     )
 
 

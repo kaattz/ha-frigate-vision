@@ -165,3 +165,61 @@ async def test_clip_view_refuses_an_unknown_activity(hass: HomeAssistant) -> Non
     view = FrigateClipView(hass, "http://frigate.test:5001")
     with pytest.raises(web.HTTPNotFound):
         await view.get(Mock(spec=web.Request), "entry_1", "nope")
+
+
+def test_hls_path_uses_integer_seconds_and_no_instance_id() -> None:
+    """Frigate's VOD path segments accept integers, and this proxy form needs
+    no instance id.
+
+    Seconds are truncated to integers: a floating-point timestamp in the URL
+    would make one activity produce two different URLs, and therefore two
+    cache entries for identical footage.
+    """
+    from custom_components.frigate_vision.clip_proxy import hls_path_for
+
+    record = _record(
+        created_at=1789987214.292209,
+        updated_at=1789987281.0,
+        sample_times=(1789987214.29, 1789987247.5, 1789987281.0),
+    )
+    path = hls_path_for("front", record)
+    assert path.startswith("/api/frigate/vod/front/start/")
+    assert path.endswith("/index.m3u8")
+    # No scheme and no host: a relative path is what makes the same stored
+    # value work on the LAN and through the reverse tunnel.
+    assert "://" not in path
+    # Integer seconds only, in the variable part of the path. The fixed
+    # `index.m3u8` suffix is excluded because its own dot is not a timestamp.
+    tail = path.split("/vod/front/", 1)[1].removesuffix("index.m3u8")
+    assert "." not in tail
+
+
+def test_hls_path_covers_the_same_window_as_the_clip() -> None:
+    """Both links must describe the same footage, or the popup would show a
+    different span than the shareable link."""
+    from custom_components.frigate_vision.clip_proxy import (
+        clip_window,
+        hls_path_for,
+    )
+
+    record = _record()
+    start, end = clip_window(record)
+    path = hls_path_for("front", record)
+    assert f"/start/{int(start)}/" in path
+    assert f"/end/{int(end)}/" in path
+
+
+def test_hls_path_rejects_a_camera_name_that_cannot_be_a_url_segment() -> None:
+    """The camera name reaches a URL path, so it is constrained, not escaped
+    blindly."""
+    import pytest
+
+    from custom_components.frigate_vision.clip_proxy import (
+        ClipUrlError,
+        hls_path_for,
+    )
+
+    with pytest.raises(ClipUrlError, match="invalid_camera"):
+        hls_path_for("front/door", _record())
+    with pytest.raises(ClipUrlError, match="invalid_camera"):
+        hls_path_for("", _record())
