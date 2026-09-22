@@ -778,6 +778,13 @@ class IntegrationRuntime:
                     except VisionError as exc:
                         error = exc
                     except Exception as exc:  # noqa: BLE001
+                        # Recorded on the sensor as a bare string, which is all
+                        # the UI needs -- but the traceback is the only way to
+                        # tell an unexpected failure apart from a handled one.
+                        _LOGGER.exception(
+                            "Analysis failed unexpectedly for %s",
+                            record.activity_id,
+                        )
                         self.last_error = str(exc)
                         return
                 self.record_error(str(error))
