@@ -16,10 +16,23 @@
  *
  * Usage:
  *   type: custom:frigate-clip-player
- *   entity: input_text.frigate_clip_url
+ *   entity: input_text.frigate_clip_url        # holds a notification id, or
+ *   # a URL directly, when the entity's state is already an absolute/relative
+ *   # URL (kept for the simple case and for manual testing).
+ *
+ * Why the entity holds an *id* and not the URL itself: `input_text` caps its
+ * state at 255 characters (`MAX_LENGTH_STATE_STATE`), and a signed HLS manifest
+ * measures ~370-390 -- the JWT payload embeds the whole path, so even a
+ * one-letter camera name overflows. Attributes carry no such limit, so the URL
+ * travels in `sensor.notifications_store`'s `items` and the card looks it up by
+ * id. Measured: a 462-character URL round-trips through that attribute intact.
  */
 
 const HLS_JS_URL = "/local/frigate-vision/hls.min.js";
+
+// Where the delivered URLs live, and the attribute that holds them.
+const STORE_ENTITY = "sensor.notifications_store";
+const STORE_ITEMS_ATTRIBUTE = "items";
 
 // Helper states that mean "no clip to play", never a URL. HA reports
 // "unknown" before the helper is first written and "unavailable" when the
@@ -79,14 +92,49 @@ class FrigateClipPlayer extends HTMLElement {
   set hass(hass) {
     this._hass = hass;
     const state = hass.states[this._entity];
-    const url =
+    const raw =
       state && state.state && !this._isNotPlayable(state.state)
         ? state.state
         : null;
+    const url = raw ? this._resolveUrl(raw) : null;
     if (url !== this._currentUrl) {
       this._currentUrl = url;
       this._applySource(url);
     }
+  }
+
+  /**
+   * Turn the entity's state into a playable URL.
+   *
+   * The state is normally a notification id, because the URL is too long to
+   * live in an `input_text` state. A bare URL is still accepted so the card can
+   * be pointed at one directly, and because that was the original interface --
+   * the two are told apart by shape rather than by a second config key, which
+   * keeps one card config correct in both cases.
+   */
+  _resolveUrl(value) {
+    const text = String(value).trim();
+    if (text.startsWith("/") || text.includes("://")) {
+      return text;
+    }
+    return this._lookupNotificationUrl(text);
+  }
+
+  /** Find the delivered play URL for one notification id, or null. */
+  _lookupNotificationUrl(notificationId) {
+    const store = this._hass && this._hass.states[STORE_ENTITY];
+    const items = store && store.attributes && store.attributes[STORE_ITEMS_ATTRIBUTE];
+    if (!Array.isArray(items)) return null;
+    // Newest first, and ids are unique, so the first match is the one the user
+    // just tapped. Falling back to any match keeps older notifications playable
+    // as long as their footage is still within Frigate's retention.
+    for (const item of items) {
+      if (item && item.id === notificationId) {
+        const url = item.hls_url ? String(item.hls_url).trim() : "";
+        return url && !this._isNotPlayable(url) ? url : null;
+      }
+    }
+    return null;
   }
 
   getCardSize() {
