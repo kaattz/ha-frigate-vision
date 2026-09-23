@@ -243,26 +243,51 @@ class FrigateClipPlayer extends HTMLElement {
     // genuine empty state does not inherit a stale message.
     this._empty.textContent = EMPTY_STATE_TEXT;
 
-    // Safari (and iOS in particular) plays HLS natively; loading hls.js there
-    // is wasted work and can be worse than the native path.
+    // Prefer hls.js whenever the browser has Media Source Extensions, and fall
+    // back to native HLS only when it does not (iPhone Safari, mainly).
+    //
+    // This order is the opposite of "native first", and the reversal is the
+    // point: `canPlayType("application/vnd.apple.mpegurl")` answers "maybe" on
+    // some Chromium-derived browsers -- Huawei's ArkWeb among them -- whose
+    // native HLS path then renders the first frame and never advances. The
+    // symptom is a still picture with a play button that does nothing, which
+    // looks like a broken clip even though the stream is fine. MSE is the
+    // dependable capability test on those browsers, so it decides first.
+    const canUseMse = typeof window.MediaSource !== "undefined";
+    const Hls = canUseMse ? await this._loadHls() : null;
+    // Superseded while hls.js was loading — by a newer URL, or by a disconnect.
+    // Constructing Hls here would start downloading a clip the state no longer
+    // references, into a hidden player with no owner that nothing can destroy.
+    if (gen !== this._gen) return;
+
+    if (Hls && Hls.isSupported()) {
+      this._hls = new Hls();
+      // Surface what hls.js says instead of leaving a frozen frame on screen:
+      // a stalled stream and a rejected stream look identical otherwise.
+      this._hls.on(Hls.Events.ERROR, (_evt, data) => {
+        if (!data || !data.fatal) return;
+        this._showEmpty(
+          data.type === "networkError"
+            ? "视频加载失败（链接可能已过期）"
+            : "视频无法解码"
+        );
+        if (this._hls) {
+          this._hls.destroy();
+          this._hls = null;
+        }
+      });
+      this._hls.loadSource(url);
+      this._hls.attachMedia(this._video);
+      return;
+    }
+
     if (this._video.canPlayType("application/vnd.apple.mpegurl")) {
       this._video.src = url;
       return;
     }
 
-    const Hls = await this._loadHls();
-    // Superseded while hls.js was loading — by a newer URL, or by a disconnect.
-    // Constructing Hls here would start downloading a clip the state no longer
-    // references, into a hidden player with no owner that nothing can destroy.
-    if (gen !== this._gen) return;
-    if (!Hls || !Hls.isSupported()) {
-      // No MSE and no native HLS: surface it rather than showing a dead player.
-      this._showEmpty(NOT_PLAYABLE_TEXT);
-      return;
-    }
-    this._hls = new Hls();
-    this._hls.loadSource(url);
-    this._hls.attachMedia(this._video);
+    // Neither MSE nor native HLS: say so rather than showing a dead player.
+    this._showEmpty(NOT_PLAYABLE_TEXT);
   }
 
   _loadHls() {
