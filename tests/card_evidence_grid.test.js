@@ -297,5 +297,64 @@ check("a source with no playable url shows the empty state and no sheet", () => 
   assert.strictEqual(evidence.hidden, true, "the sheet is only for comparison with a video");
 });
 
+// --- the `entity` path, which is what the deployed popup actually uses ------
+// The popup passes `entity: input_text.frigate_clip_notification_id`, not
+// `notification_id`. That helper holds an id, so the card has to resolve it
+// through the store exactly like the id-configured form does. Testing only the
+// `notification_id` form would leave the production path uncovered.
+
+check("the entity path resolves an id through the store and shows the sheet", () => {
+  const { card, evidence, cells } = makeCard({
+    entity: "input_text.frigate_clip_notification_id",
+  });
+  card.hass = {
+    states: {
+      "input_text.frigate_clip_notification_id": { state: "alert_9" },
+      "sensor.notifications_store": {
+        attributes: {
+          items: [
+            {
+              id: "alert_9",
+              hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
+              evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=Y",
+              evidence_offsets: "4.1|7.4|38.9|46.3|55.9|58.9",
+            },
+          ],
+        },
+      },
+    },
+  };
+  assert.strictEqual(evidence.hidden, false, "the sheet must be shown");
+  assert.strictEqual(cells.children.length, 6, "six cells for six offsets");
+  assert.ok(
+    String(card._sheet.src).indexOf("authSig=Y") !== -1,
+    "the signed image must be assigned to the img"
+  );
+});
+
+check("the entity path still works when the helper is empty", () => {
+  const { card, evidence } = makeCard({
+    entity: "input_text.frigate_clip_notification_id",
+  });
+  card.hass = {
+    states: {
+      "input_text.frigate_clip_notification_id": { state: "" },
+      "sensor.notifications_store": { attributes: { items: [] } },
+    },
+  };
+  assert.strictEqual(evidence.hidden, true, "no id means no sheet");
+});
+
+check("a bare URL in the entity still plays, with no sheet to look up", () => {
+  const { card, evidence } = makeCard({ entity: "input_text.some_url" });
+  card.hass = {
+    states: {
+      "input_text.some_url": { state: "/api/frigate/vod/cam/x.m3u8?authSig=Z" },
+    },
+  };
+  assert.strictEqual(evidence.hidden, true, "a bare URL has no notification behind it");
+  assert.strictEqual(card._currentSource.indexOf("/api/frigate/vod/cam/x.m3u8"), 0);
+});
+
 console.log(failures ? `\n${failures} FAILED` : "\nALL PASSED");
 process.exit(failures ? 1 : 0);
