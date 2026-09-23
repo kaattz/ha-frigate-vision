@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>活动回放</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; background: #000; color: #eee;
+    font: 15px/1.5 -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+    display: flex; flex-direction: column; min-height: 100vh;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 14px; background: #111; border-bottom: 1px solid #222;
+  }
+  header a { color: #7ab8ff; text-decoration: none; font-size: 14px; }
+  header .t { font-weight: 600; flex: 1; }
+  #wrap { flex: 1; display: flex; align-items: center; justify-content: center; }
+  video { width: 100%; max-height: 78vh; background: #000; display: block; }
+  #msg { padding: 28px 20px; text-align: center; color: #bbb; }
+  #msg .big { font-size: 17px; color: #eee; margin-bottom: 8px; }
+  #msg .small { font-size: 13px; color: #888; word-break: break-all; }
+  .warn { color: #ffb86b; }
+</style>
+</head>
+<body>
+<header>
+  <a href="/lovelace/home">← 返回</a>
+  <span class="t">活动回放</span>
+</header>
+<div id="wrap">
+  <div id="msg">正在载入…</div>
+</div>
+
+<script>
+// A tiny player page rather than a link straight at the manifest: navigating
+// to an .m3u8 shows raw text in every Chromium-based browser (this user's
+// device included), so the manifest has to be handed to something that can
+// actually play it. Safari plays HLS natively; everything else needs hls.js.
+//
+// The page is opened as  play.html#<notification id>  and looks the URL up in
+// the notification store itself. That is deliberate: the id is short and
+// stable, and resolving it here means the page always plays what the
+// notification currently points at.
+const HLS_JS_URL = "/local/frigate-vision/hls.min.js";
+const STORE_ENTITY = "sensor.notifications_store";
+
+const msgEl = document.getElementById("msg");
+const wrapEl = document.getElementById("wrap");
+
+function fail(big, small, cls) {
+  msgEl.innerHTML = "";
+  const b = document.createElement("div");
+  b.className = "big" + (cls ? " " + cls : "");
+  b.textContent = big;
+  msgEl.appendChild(b);
+  if (small) {
+    const s = document.createElement("div");
+    s.className = "small";
+    s.textContent = small;
+    msgEl.appendChild(s);
+  }
+  wrapEl.appendChild(msgEl);
+}
+
+/**
+ * What to play, taken from the fragment.
+ *
+ * The fragment is used rather than the query string because browsers never send
+ * it to the server, so a signed link cannot end up in an access log.
+ *
+ * A signed manifest URL is preferred and is the normal case: it authorises
+ * itself through `authSig`, so playing it needs no session at all. An older
+ * notification id is still accepted and resolved against the store, which does
+ * need the session -- that path exists only so a link that was already written
+ * into a notification keeps working.
+ */
+function fragmentTarget() {
+  let raw = location.hash.replace(/^#/, "");
+  try {
+    raw = decodeURIComponent(raw);
+  } catch (err) {
+    // A literal '%' in the fragment is not fatal -- use it as-is.
+  }
+  raw = raw.trim();
+  if (!raw) return null;
+  if (raw.startsWith("/") || raw.includes("://")) return { url: raw };
+  return { id: raw };
+}
+
+async function findClipUrl(id) {
+  const res = await fetch(`/api/states/${STORE_ENTITY}`, {
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) {
+    throw new Error(`读取通知失败（HTTP ${res.status}）`);
+  }
+  const state = await res.json();
+  const items = (state.attributes || {}).items || [];
+  const hit = items.find((i) => i && i.id === id);
+  if (!hit) {
+    throw new Error("找不到这条通知，它可能已被清理");
+  }
+  const url = hit.hls_url ? String(hit.hls_url).trim() : "";
+  if (!url) {
+    throw new Error("这条通知没有可播放的视频");
+  }
+  return { url, title: hit.title || "" };
+}
+
+function play(url) {
+  wrapEl.innerHTML = "";
+  const video = document.createElement("video");
+  video.controls = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  video.setAttribute("playsinline", "");
+  wrapEl.appendChild(video);
+
+  // Safari and iOS play HLS directly; loading hls.js there is wasted work.
+  if (video.canPlayType("application/vnd.apple.mpegurl")) {
+    video.src = url;
+    return;
+  }
+
+  loadHls().then((Hls) => {
+    if (!Hls || !Hls.isSupported()) {
+      fail("此浏览器无法播放该视频", "需要支持 HLS 的浏览器");
+      return;
+    }
+    const hls = new Hls();
+    hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (!data || !data.fatal) return;
+      // The signed link is valid for 24h, so the usual cause here is an
+      // expired token on an older notification rather than a broken clip.
+      fail(
+        "视频加载失败",
+        data.type === "networkError"
+          ? "链接可能已过期（签名有效期 24 小时）"
+          : String(data.details || data.type || "")
+      );
+    });
+    hls.loadSource(url);
+    hls.attachMedia(video);
+  });
+}
+
+let hlsPromise = null;
+function loadHls() {
+  if (window.Hls) return Promise.resolve(window.Hls);
+  if (hlsPromise) return hlsPromise;
+  hlsPromise = new Promise((resolve) => {
+    const s = document.createElement("script");
+    s.src = HLS_JS_URL;
+    s.onload = () => resolve(window.Hls || null);
+    s.onerror = () => { hlsPromise = null; resolve(null); };
+    document.head.appendChild(s);
+  });
+  return hlsPromise;
+}
+
+(async () => {
+  // ?url=… plays a URL directly, which is what makes this page testable on its
+  // own without going through a notification first.
+  const direct = new URLSearchParams(location.search).get("url");
+  if (direct) return play(direct);
+
+  const target = fragmentTarget();
+  if (!target) return fail("没有指定要播放的视频", "请从通知中心点击播放");
+  if (target.url) return play(target.url);
+
+  try {
+    const { url } = await findClipUrl(target.id);
+    play(url);
+  } catch (err) {
+    fail("无法播放", err && err.message ? err.message : String(err));
+  }
+})();
+</script>
+</body>
+</html>
