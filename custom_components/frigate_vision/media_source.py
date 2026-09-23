@@ -18,9 +18,17 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.http import HomeAssistantView
 
 from .const import DOMAIN
+from .models import SAFE_ID
 
 DATA_MEDIA_REGISTRY = f"{DOMAIN}_media_registry"
 DATA_MEDIA_ROOT = f"{DOMAIN}_media_root"
+
+# The one place the evidence route is spelled out. `EvidenceMediaView.url` and
+# `evidence_media_path()` both derive from it, because the two must agree
+# exactly: HA validates a signature with `claims["path"] != request.path`
+# (an equality check, not a prefix match), so a path built even slightly
+# differently from the registered route is refused with 401.
+EVIDENCE_MEDIA_URL_TEMPLATE = f"/api/{DOMAIN}/media/{{entry_id}}/{{activity_id}}.jpg"
 
 
 class EvidenceMediaSource(MediaSource):
@@ -119,10 +127,33 @@ async def async_default_media_root(hass: HomeAssistant) -> Path:
     return root
 
 
+def evidence_media_path(entry_id: str, activity_id: str) -> str:
+    """Return the browser-loadable path of one activity's evidence sheet.
+
+    Distinct from `record.evidence_media_url`, which is a `media-source://`
+    identifier and only resolvable by Home Assistant's own media browser -- it
+    cannot be put in an `<img src>`. This is the HTTP route instead.
+
+    Relative on purpose, like the HLS manifest path: the popup is opened both on
+    the LAN and through the reverse tunnel, so letting the browser keep the
+    current origin makes one delivered value work in both places.
+
+    Identifiers are validated rather than escaped. Both are model-enforced
+    `SAFE_ID`s, and a value that needs escaping is a bug upstream, not something
+    to paper over here -- escaping it would also change the path the signature
+    is bound to.
+    """
+    if not SAFE_ID.fullmatch(entry_id) or not SAFE_ID.fullmatch(activity_id):
+        raise ValueError("invalid_evidence_identifier")
+    return EVIDENCE_MEDIA_URL_TEMPLATE.format(
+        entry_id=entry_id, activity_id=activity_id
+    )
+
+
 class EvidenceMediaView(HomeAssistantView):
     """Serve registered evidence through an authenticated HA endpoint."""
 
-    url = f"/api/{DOMAIN}/media/{{entry_id}}/{{activity_id}}.jpg"
+    url = EVIDENCE_MEDIA_URL_TEMPLATE
     name = f"api:{DOMAIN}:media"
     requires_auth = True
 

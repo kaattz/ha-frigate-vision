@@ -27,6 +27,7 @@ from homeassistant.components.http.auth import async_sign_path
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.http import HomeAssistantView
 
+from .media_source import evidence_media_path
 from .models import SAFE_ID, ActivityRecord, ActivityStage
 
 _LOGGER = logging.getLogger(__name__)
@@ -34,6 +35,19 @@ _LOGGER = logging.getLogger(__name__)
 CLIP_URL_PREFIX = "/api/frigate_vision/clip/"
 
 HLS_PATH_PREFIX = "/api/frigate/vod/"
+
+# Seconds are reported to a tenth, which is far below the seek precision a phone
+# can act on. Rounding keeps the delivered string short and stable.
+OFFSET_DECIMALS = 1
+
+# Deliberately not a comma. Home Assistant's native template parser reads a
+# comma-separated template *result* as a tuple, so `"1.5,9.2"` arrives at
+# `to_json` as a `TupleWrapper` and the script dies with
+# `TypeError: Object of type TupleWrapper is not JSON serializable` -- measured
+# on this deployment, where it broke the notification entirely rather than just
+# the offsets. A pipe has no meaning to that parser, so the value stays the
+# string it was written as.
+OFFSET_SEPARATOR = "|"
 
 
 class ClipUrlError(ValueError):
@@ -78,6 +92,101 @@ def clip_window(record: ActivityRecord) -> tuple[float, float]:
     start = max(0.0, record.created_at - CLIP_LEAD_SECONDS)
     end = min(last + CLIP_TAIL_SECONDS, start + MAX_CLIP_SECONDS)
     return start, end
+
+
+def evidence_offsets(record: ActivityRecord) -> tuple[float, ...]:
+    """Return each evidence sheet cell's offset into the clip, in seconds.
+
+    The offsets are relative to the clip's own start rather than absolute wall
+    clock times, so the player can assign one straight to `video.currentTime`
+    without knowing anything about `clip_window()`. Recomputing the window in
+    the browser would be a second implementation of it, free to drift from this
+    one; deriving the offsets here makes the sheet and the video agree by
+    construction.
+
+    Every offset is clamped into the window. `clip_window()` caps the clip at
+    `MAX_CLIP_SECONDS`, but `sample_times` is not capped the same way: a record
+    whose first sample is long before its last can plan a final frame past the
+    end of the clip. Left unclamped, tapping that cell would seek to a time the
+    video does not contain and simply appear to do nothing.
+
+    Order matches the sheet's cells: the model validates `sample_times` as
+    sorted and strictly increasing, and `build_contact_sheet` places them in
+    that same order, so cell *i* of the image is `sample_times[i]`.
+    """
+    start, end = clip_window(record)
+    span = end - start
+    return tuple(
+        round(min(max(sample - start, 0.0), span), OFFSET_DECIMALS)
+        for sample in record.sample_times
+    )
+
+
+def evidence_offsets_text(record: ActivityRecord) -> str:
+    """Return the offsets as one separator-joined string, or "" when there are none.
+
+    A string rather than a JSON array because this value crosses seven layers on
+    its way to the card -- delivery event, blueprint variable, automation action,
+    script field, `to_json`, `jq -s`, and finally a sensor attribute -- and a
+    string stays a string in every one of them. The frontend already carries a
+    comment about a value silently changing shape in that chain; sending text
+    removes the question instead of testing for it.
+
+    The separator is `OFFSET_SEPARATOR`, and it must not be a comma: HA's native
+    template parser reads a comma-separated result as a tuple, which then fails
+    to serialise inside the notification script and takes the whole notification
+    down with it.
+
+    Empty for a record with no samples, which the card reads as "no sheet" -- the
+    same answer as a missing field, so there is only one case to handle.
+    """
+    offsets = evidence_offsets(record)
+    if not offsets:
+        return ""
+    return OFFSET_SEPARATOR.join(f"{offset:g}" for offset in offsets)
+
+
+def signed_evidence_url_for(
+    hass: HomeAssistant, record: ActivityRecord
+) -> str | None:
+    """Return a loadable, signed URL for one activity's evidence sheet, or None.
+
+    Signed for the same reason the clip and the manifest are, and the reason is
+    stronger here than it looks: an `<img>` cannot carry an `Authorization`
+    header, and Home Assistant's auth middleware accepts exactly two things --
+    that header, or an `authSig` query parameter (`components/http/auth.py`,
+    `auth_middleware`). There is no cookie path. So a bare `/api/` image URL is
+    a 401 and a broken image, every time, with no way for the frontend to fix it
+    by asking differently.
+
+    The signature cannot be borrowed from the clip: HA validates it with
+    `claims["path"] != request.path`, an exact match, so a token signed for the
+    clip is refused for the image. Each route needs its own.
+
+    Relative, like the manifest, so the browser supplies the origin and one
+    stored value works on the LAN and through the tunnel alike. The TTL matches
+    `CLIP_LINK_TTL` so the sheet and the video age out together rather than the
+    picture breaking first.
+
+    Returns None rather than raising. The sheet is a comparison aid and the
+    notification is the product, so a URL that cannot be built costs the user
+    the grid, not the delivery.
+    """
+    try:
+        path = evidence_media_path(record.entry_id, record.activity_id)
+        return async_sign_path(hass, path, CLIP_LINK_TTL)
+    except Exception:  # noqa: BLE001
+        # Broad for the same reason `signed_hls_url_for` is: `async_sign_path`
+        # reaches for `hass.data["http.auth"]`, which does not exist until the
+        # http component is set up, so a bare `hass` raises a `KeyError` that is
+        # no signing error and has no narrower type worth catching.
+        _LOGGER.warning(
+            "Could not build or sign the evidence image for %s; delivering the "
+            "activity without a comparison sheet",
+            record.activity_id,
+            exc_info=True,
+        )
+        return None
 
 
 def clip_url_for(base_url: str, entry_id: str, record: ActivityRecord) -> str | None:

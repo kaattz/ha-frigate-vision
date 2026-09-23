@@ -14,6 +14,8 @@ from custom_components.frigate_vision.clip_proxy import (
     FrigateClipView,
     clip_url_for,
     clip_window,
+    evidence_offsets,
+    evidence_offsets_text,
 )
 from custom_components.frigate_vision.models import (
     ActivityRecord,
@@ -374,3 +376,105 @@ def test_signed_hls_url_delegates_the_path_to_hls_path_for(
     # notification, so a shorter one here would break the player while
     # `clip_url` still worked.
     assert ttls == [clip_proxy.CLIP_LINK_TTL]
+
+
+def test_evidence_offsets_are_relative_to_the_clip_start() -> None:
+    """Offsets are seconds into the clip, so the player can assign them directly.
+
+    Absolute timestamps would force the browser to recompute `clip_window()` to
+    use them, which is a second implementation of the window free to drift from
+    this one. Relative offsets make the sheet and the video agree by
+    construction.
+    """
+    record = _record(sample_times=(100.0, 105.0, 110.0, 118.0, 130.0, 133.0))
+    start, _ = clip_window(record)
+    offsets = evidence_offsets(record)
+    assert len(offsets) == 6
+    assert offsets == tuple(round(value - start, 1) for value in record.sample_times)
+    # Strictly increasing, matching the sheet's cell order.
+    assert list(offsets) == sorted(offsets)
+    assert offsets[0] > 0.0
+
+
+def test_evidence_offsets_are_clamped_into_the_clip() -> None:
+    """A frame past the end of the clip must not seek past the end of the video.
+
+    `clip_window()` caps the clip at `MAX_CLIP_SECONDS`, but `sample_times` is
+    not capped the same way, so a long activity plans its last frame beyond the
+    video. Unclamped, tapping that cell seeks to a time that does not exist and
+    the tap simply appears to do nothing.
+    """
+    record = _record(sample_times=(100.0, 300.0, 500.0, 700.0, 900.0, 1100.0))
+    start, end = clip_window(record)
+    span = end - start
+    offsets = evidence_offsets(record)
+    assert max(offsets) <= round(span, 1)
+    assert offsets[-1] == round(span, 1)
+    # The early frames are unaffected: clamping must not flatten the whole set.
+    assert offsets[0] == round(100.0 - start, 1)
+
+
+def test_evidence_offsets_text_is_separator_joined_and_empty_without_samples() -> None:
+    """A string survives every hop to the card as the same type.
+
+    The value crosses seven layers (event, blueprint variable, automation
+    action, script field, `to_json`, `jq -s`, sensor attribute). A JSON array
+    can come back as a string somewhere in that chain -- this project has
+    already lost a value to exactly that. Text has no such ambiguity.
+
+    The separator must not be a comma: HA's native template parser reads a
+    comma-separated result as a tuple, which then fails to serialise and takes
+    the whole notification down. That was measured, so it is pinned here.
+    """
+    text = evidence_offsets_text(_record())
+    assert "," not in text, "a comma would be parsed as a tuple by HA's template"
+    parts = text.split("|")
+    assert len(parts) == 6
+    assert all(part.replace(".", "", 1).isdigit() for part in parts)
+    # No samples means "no sheet", and the card treats it exactly like a missing
+    # field -- so there is a single absent case to handle, not two.
+    assert evidence_offsets_text(_record(sample_times=())) == ""
+
+
+def test_signed_evidence_url_is_relative_and_signed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sheet URL is relative and carries its own signature.
+
+    Relative so the browser's origin decides the host (LAN and tunnel alike).
+    Signed separately because an `<img>` cannot send an `Authorization` header
+    and HA's auth middleware has no cookie path -- and because a signature is
+    bound to one exact path, the clip's token cannot be reused here.
+    """
+    from custom_components.frigate_vision import clip_proxy
+
+    ttls: list[timedelta] = []
+
+    def fake_sign(hass: object, path: str, ttl: timedelta) -> str:
+        ttls.append(ttl)
+        return f"{path}?authSig=SIG"
+
+    monkeypatch.setattr(clip_proxy, "async_sign_path", fake_sign)
+    url = clip_proxy.signed_evidence_url_for(Mock(), _record())
+
+    assert url is not None
+    assert "://" not in url
+    assert url.startswith("/api/frigate_vision/media/entry_1/")
+    assert url.split("?")[0].endswith("/review_entry_1_front_review_1.jpg")
+    assert "authSig=SIG" in url
+    # Same TTL as the clip: both are opened from one notification, so a shorter
+    # one here would break the sheet while the video still played.
+    assert ttls == [clip_proxy.CLIP_LINK_TTL]
+
+
+def test_signed_evidence_url_falls_back_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sheet that cannot be signed must cost the grid, not the delivery."""
+    from custom_components.frigate_vision import clip_proxy
+
+    def boom(entry_id: str, activity_id: str) -> str:
+        raise ValueError("invalid_evidence_identifier")
+
+    monkeypatch.setattr(clip_proxy, "evidence_media_path", boom)
+    assert clip_proxy.signed_evidence_url_for(Mock(), _record()) is None

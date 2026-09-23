@@ -52,6 +52,31 @@ def test_blueprint_message_does_not_show_confidence() -> None:
     assert "confidence:" in text
 
 
+def test_blueprint_forwards_the_evidence_sheet() -> None:
+    """The popup's comparison sheet must reach the notification.
+
+    Defined here and *passed* by the user's automation action are two different
+    things: a blueprint variable that the action never forwards arrives empty,
+    while the automation still fires and the notification still sends. This
+    project has already lost a feature to exactly that, so the forwarding half
+    is asserted in the automation's own file by
+    `test_blueprint_links_the_clip_when_available`'s sibling checks below --
+    here the blueprint must at least define both fields from the event, gated by
+    `include_image` alongside the sheet the model was given.
+    """
+    text = BLUEPRINT.read_text("utf-8")
+    assert "evidence_image_url" in text
+    assert "trigger.event.data.evidence_image_url" in text
+    assert "evidence_offsets" in text
+    for name in ("evidence_image_url:", "evidence_offsets:"):
+        line = next(
+            line for line in text.splitlines() if line.strip().startswith(name)
+        )
+        # Both are gated with the sheet itself: a user who turned images off
+        # should not get a grid either.
+        assert "include_image" in line
+
+
 def test_blueprint_links_the_clip_when_available() -> None:
     """The message must offer the recording, which is what the old one did.
 

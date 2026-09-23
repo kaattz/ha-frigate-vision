@@ -92,7 +92,13 @@ Home Assistant 自定义集成（HACS）：把**任意受监控区域的活动**
 | `frigate_vision.retry_failed` | 仅对**可证明安全**的失败建立一次显式重试 |
 | `frigate_vision.ack_delivery` | 通知蓝图处理成功后回执，活动转为 `completed` |
 
-**交付事件** `frigate_vision_activity` 字段：`entry_id`、`activity_id`、`delivery_attempt_id`、`classification`、`description`、`confidence`、`evidence_url`、`clip_url`、`hls_url`、`frigate_review_url`、`review_ids`、`occurred_at`。
+**交付事件** `frigate_vision_activity` 字段：`entry_id`、`activity_id`、`delivery_attempt_id`、`classification`、`description`、`confidence`、`evidence_url`、`evidence_image_url`、`evidence_offsets`、`clip_url`、`hls_url`、`frigate_review_url`、`review_ids`、`occurred_at`。
+
+其中：
+
+- `evidence_url` 是 `media-source://` 标识，供 Home Assistant 媒体浏览器使用。
+- `evidence_image_url` 是**已签名**的相对 HTTP 地址，供回放弹窗内的六宫格显示。`<img>` 带不上 `Authorization` 头，HA 的鉴权中间件也没有 cookie 通道，因此未签名的 `/api/` 图片必然 401；签名与路径精确绑定，也不能复用视频的签名。
+- `evidence_offsets` 是六宫格每格对应的**视频秒数**（相对片段起点，已夹取到窗口内），**竖线**分隔，如 `5.3|11.2|48.1`。分隔符不能是逗号：HA 的原生模板解析器会把逗号分隔的模板结果当作 tuple，导致通知脚本以 `TypeError: TupleWrapper is not JSON serializable` 失败，整条通知都写不进去。
 
 ## 安装
 

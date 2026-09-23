@@ -67,6 +67,15 @@ variables:
   description: "{{ trigger.event.data.description | default('', true) | trim }}"
   confidence: "{{ trigger.event.data.confidence }}"
   evidence_url: "{{ trigger.event.data.evidence_url if include_image else none }}"
+  # The same sheet in a form a browser can load, for the popup's side-by-side
+  # comparison. Kept separate from `evidence_url` above rather than replacing
+  # it: that one is a `media-source://` identifier for Home Assistant's media
+  # browser, while this is the signed HTTP route -- the only kind an `<img>`
+  # can use, since it cannot send an `Authorization` header.
+  evidence_image_url: "{{ trigger.event.data.evidence_image_url if include_image else none }}"
+  # Seconds into the clip for each cell of the sheet, in cell order. A string
+  # so it stays one type across every hop to the card; the card splits it.
+  evidence_offsets: "{{ trigger.event.data.evidence_offsets | default('', true) if include_image else '' }}"
   clip_url: "{{ trigger.event.data.clip_url if include_clip else none }}"
   # The in-app player's URL, kept separate from `clip_url`: that one is the
   # MP4, which no endpoint here can stream (no `Accept-Ranges`), so the popup

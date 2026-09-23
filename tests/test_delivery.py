@@ -348,3 +348,130 @@ async def test_delivery_survives_an_unbuildable_hls_url(
     assert events[0]["hls_url"] is None
     assert events[0]["clip_url"], "the shareable link must survive too"
     await manager.async_stop()
+
+
+async def test_activity_event_carries_the_evidence_sheet(hass: HomeAssistant) -> None:
+    """The popup offers the model's own six-cell sheet beside the clip.
+
+    Two fields travel: a signed image URL and the per-cell offsets into the
+    clip, so a tap can seek to the frame a cell came from.
+
+    The image needs its *own* signature. An `<img>` cannot send an
+    `Authorization` header and HA's auth middleware has no cookie path, so an
+    unsigned `/api/` image is a 401 and a broken image; and because a signature
+    is bound to one exact path, the clip's token cannot be reused for it.
+    """
+    # Signing needs the http component's auth: without it `async_sign_path`
+    # raises and the URL degrades to None, so the test would never touch the
+    # path production uses.
+    assert await async_setup_component(hass, "http", {})
+    hass.config.external_url = "https://ha.example.com"
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="activity_1",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.ANALYSIS_DONE,
+            processing_mode=ProcessingMode.LIVE,
+            created_at=100.0,
+            updated_at=140.0,
+            camera="front",
+            classification="visitor",
+            description="有人到访。",
+            confidence=80,
+            sample_times=(100.0, 105.0, 110.0, 118.0, 130.0, 133.0),
+            evidence_mode="review_six",
+            evidence_revision=1,
+            evidence_path="/media/frigate_vision/entry_1/activity_1.jpg",
+            evidence_media_url="media-source://frigate_vision/entry_1/activity_1",
+        )
+    )
+    entry = MockConfigEntry(domain="frigate_vision", entry_id="entry_1", title="Front")
+    events: list[dict] = []
+    hass.bus.async_listen(EVENT_ACTIVITY, lambda event: events.append(event.data))
+    manager = DeliveryManager(hass, entry, store, ack_timeout=60)
+    await manager.async_start("activity_1")
+    await hass.async_block_till_done()
+
+    data = events[0]
+    image = data["evidence_image_url"]
+    assert image, "the comparison sheet must be delivered with the clip"
+    # The HTTP route, not the `media-source://` identifier: only this one can be
+    # put in an `<img src>`. `evidence_url` keeps its own meaning alongside it.
+    assert image.split("?", 1)[0] == (
+        "/api/frigate_vision/media/entry_1/activity_1.jpg"
+    )
+    assert "authSig=" in image, f"the sheet image is unsigned and will 401: {image}"
+    assert "://" not in image, f"the sheet image must stay origin-less: {image}"
+    assert data["evidence_url"] == (
+        "media-source://frigate_vision/entry_1/activity_1"
+    ), "the media-source identifier must not be repurposed"
+
+    # One offset per cell, in cell order, relative to the clip's start.
+    # Split on a pipe: a comma-separated value would be parsed as a tuple by
+    # HA's template engine downstream and break the notification script.
+    assert "," not in data["evidence_offsets"]
+    offsets = [float(part) for part in data["evidence_offsets"].split("|")]
+    assert len(offsets) == 6
+    assert offsets == sorted(offsets)
+    assert offsets[0] > 0.0
+
+    # Neither existing link may regress.
+    assert data["clip_url"], "the shareable link must still be delivered"
+    assert data["hls_url"], "the playable manifest must still be delivered"
+    await manager.async_stop()
+
+
+async def test_delivery_survives_an_unbuildable_evidence_image(
+    hass: HomeAssistant, monkeypatch
+) -> None:
+    """A sheet that cannot be signed must cost the grid, not the notification.
+
+    `signed_evidence_url_for` answers `None` itself rather than raising, so this
+    branch is reachable only if it starts raising again -- which is the
+    regression this pins. The requirement that outlives the current signatures:
+    delivery is the product, the comparison sheet is an enhancement.
+    """
+    from custom_components.frigate_vision import delivery as delivery_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("signing exploded")
+
+    monkeypatch.setattr(delivery_module, "signed_evidence_url_for", boom)
+
+    assert await async_setup_component(hass, "http", {})
+    hass.config.external_url = "https://ha.example.com"
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="activity_1",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.ANALYSIS_DONE,
+            processing_mode=ProcessingMode.LIVE,
+            created_at=100.0,
+            updated_at=140.0,
+            camera="front",
+            classification="visitor",
+            description="有人到访。",
+            confidence=80,
+            sample_times=(100.0, 105.0, 110.0, 118.0, 130.0, 133.0),
+        )
+    )
+    entry = MockConfigEntry(domain="frigate_vision", entry_id="entry_1", title="Front")
+    events: list[dict] = []
+    hass.bus.async_listen(EVENT_ACTIVITY, lambda event: events.append(event.data))
+    manager = DeliveryManager(hass, entry, store, ack_timeout=60)
+    await manager.async_start("activity_1")
+    await hass.async_block_till_done()
+
+    assert len(events) == 1, "the notification must still be delivered"
+    assert events[0]["evidence_image_url"] is None
+    assert events[0]["clip_url"], "the shareable link must survive too"
+    assert events[0]["hls_url"], "the playable manifest must survive too"
+    await manager.async_stop()

@@ -11,7 +11,13 @@ from urllib.parse import urlencode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .clip_proxy import ClipUrlError, signed_clip_url_for, signed_hls_url_for
+from .clip_proxy import (
+    ClipUrlError,
+    evidence_offsets_text,
+    signed_clip_url_for,
+    signed_evidence_url_for,
+    signed_hls_url_for,
+)
 from .models import ActivityRecord, ActivityStage
 from .repairs import async_set_issue
 from .store import ActivityStore
@@ -94,6 +100,28 @@ class DeliveryManager:
                 record.activity_id,
                 record.camera,
             )
+        # The evidence sheet the model itself analysed, offered to the reader as
+        # a still comparison against the clip. Signed separately from the clip:
+        # an `<img>` cannot send an `Authorization` header and HA's auth
+        # middleware has no cookie path, so an unsigned `/api/` image is a 401.
+        # A signature is also bound to one exact path, so the clip's token
+        # cannot be reused here.
+        #
+        # `evidence_url` above is left alone: it is a `media-source://`
+        # identifier for HA's media browser, with a different audience and a
+        # different meaning. This is the HTTP form, and the two coexist.
+        try:
+            evidence_image_url: str | None = signed_evidence_url_for(
+                self._hass, record
+            )
+        except Exception:  # noqa: BLE001
+            # `signed_evidence_url_for` already answers None for its own
+            # failures; this is a backstop so that a fault in the builder can
+            # never cost the user their notification.
+            evidence_image_url = None
+            _LOGGER.warning(
+                "No comparison sheet for %s", record.activity_id, exc_info=True
+            )
         self._hass.bus.async_fire(
             EVENT_ACTIVITY,
             {
@@ -104,6 +132,11 @@ class DeliveryManager:
                 "description": record.description,
                 "confidence": record.confidence,
                 "evidence_url": record.evidence_media_url,
+                "evidence_image_url": evidence_image_url,
+                # Comma-separated seconds, one per sheet cell, in cell order.
+                # A string so it survives every hop as the same type; see
+                # `evidence_offsets_text`.
+                "evidence_offsets": evidence_offsets_text(record),
                 "clip_url": clip_url,
                 "hls_url": hls_url,
                 "frigate_review_url": review_url,
