@@ -149,6 +149,13 @@ class FrigateClipPlayer extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         :host { display: block; }
+        /* The UA stylesheet's [hidden] { display: none } loses to any author
+           rule that sets display, and both children below set it -- so the
+           hidden attribute silently did nothing and the controls stayed on
+           screen next to the empty-state text. Restore it explicitly.
+           Keep this comment free of backticks: it lives inside a template
+           literal, and one would end the literal early. */
+        [hidden] { display: none !important; }
         .wrap { position: relative; background: #000; border-radius: 12px; overflow: hidden; }
         video { width: 100%; display: block; max-height: 60vh; background: #000; }
         .empty {
