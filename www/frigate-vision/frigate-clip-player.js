@@ -16,16 +16,17 @@
  *
  * Usage:
  *   type: custom:frigate-clip-player
- *   entity: input_text.frigate_clip_url        # holds a notification id, or
- *   # a URL directly, when the entity's state is already an absolute/relative
- *   # URL (kept for the simple case and for manual testing).
+ *   notification_id: alert_1790106601     # play this notification's clip
+ *   # or, for testing:
+ *   entity: input_text.some_url           # holds an id, or a URL directly
  *
- * Why the entity holds an *id* and not the URL itself: `input_text` caps its
- * state at 255 characters (`MAX_LENGTH_STATE_STATE`), and a signed HLS manifest
- * measures ~370-390 -- the JWT payload embeds the whole path, so even a
- * one-letter camera name overflows. Attributes carry no such limit, so the URL
- * travels in `sensor.notifications_store`'s `items` and the card looks it up by
- * id. Measured: a 462-character URL round-trips through that attribute intact.
+ * Why `notification_id` is the normal form: the link that opens this popup is a
+ * plain markdown link, because a markdown link is the only kind that sits
+ * inline with the text above it -- every card-based button occupies a whole row.
+ * A markdown link can only carry the id in the popup's hash, so each
+ * notification gets its own popup and its own id, and no helper is involved.
+ * The URL itself cannot travel in a hash either: it is unsigned-or-400-chars,
+ * and the store's attributes, which are not length-capped, hold it instead.
  */
 
 const HLS_JS_URL = "/local/frigate-vision/hls.min.js";
@@ -66,10 +67,17 @@ class FrigateClipPlayer extends HTMLElement {
   }
 
   setConfig(config) {
-    if (!config || !config.entity) {
-      throw new Error("frigate-clip-player: 'entity' is required");
+    if (!config || (!config.entity && !config.notification_id)) {
+      throw new Error(
+        "frigate-clip-player: 'entity' or 'notification_id' is required"
+      );
     }
-    this._entity = config.entity;
+    this._entity = config.entity || null;
+    // A popup knows exactly which notification it belongs to, so it can be
+    // told the id directly instead of having one written into a helper. That
+    // keeps the link that opens it a plain markdown link, which is the only
+    // kind of link that sits inline with the surrounding text.
+    this._notificationId = config.notification_id || null;
     // Stop whatever was bound to the element _render() is about to discard —
     // an Hls instance or a native <video> would otherwise keep playing (and
     // downloading) behind a shadow DOM that no longer shows it.
@@ -91,6 +99,17 @@ class FrigateClipPlayer extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    // A popup configured with a fixed notification id resolves from that id
+    // alone -- it needs no helper, and it keeps working when the helper is
+    // empty (which is its normal resting state).
+    if (this._notificationId) {
+      const url = this._lookupNotificationUrl(this._notificationId);
+      if (url !== this._currentUrl) {
+        this._currentUrl = url;
+        this._applySource(url);
+      }
+      return;
+    }
     const state = hass.states[this._entity];
     const raw =
       state && state.state && !this._isNotPlayable(state.state)
