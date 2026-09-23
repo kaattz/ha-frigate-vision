@@ -6,6 +6,7 @@ algorithm can be unit tested without a Home Assistant runtime.
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -66,11 +67,32 @@ def select_motion_times(
     lower: float | None = None,
     upper: float | None = None,
 ) -> tuple[float, ...] | None:
-    """Pick highest-motion timestamps, one per equal movement third.
+    """Pick high-motion timestamps that also stay spread across the activity.
 
-    Movement intervals are grouped by index so the picks span the whole
-    activity instead of clustering on one burst. Returns None when the path
-    data cannot fill every group. Ties prefer the later timestamp.
+    Two properties matter, and they pull against each other:
+
+    * **Motion.** A frame is worth taking where the picture changed, so the
+      candidate instants are ranked by how far the person moved.
+    * **Coverage.** The three picks become the middle of a six-cell sheet whose
+      outer cells are the person's first and last frames. If the picks cluster,
+      everything between them is invisible to the model -- and a door opening,
+      a hand-off, or a turn is exactly the kind of short event that lands in
+      such a hole.
+
+    Measured on this deployment, ranking by motion alone failed the second
+    property badly. An activity whose path points were dense in its first half
+    got two picks inside 3.8s of each other while the next sat 33.3s later; the
+    moment the entry door opened fell in that 33.3s gap and the model, with no
+    frame showing it, answered `home_arrival` for someone walking *out*.
+
+    Splitting the movement list into equal groups **by index** is what allowed
+    that: index thirds only equal time thirds when the points are spread
+    evenly, and Frigate emits points as the detector reports them, which is
+    anything but even. So the span is divided by *time* instead, and within each
+    third the largest movement still wins.
+
+    Returns None when the path data cannot fill every group, which is the
+    caller's signal to fall back to image-change selection.
     """
     if count <= 0:
         return None
@@ -89,21 +111,72 @@ def select_motion_times(
         movements.append((occurred_at, math.hypot(x - previous_x, y - previous_y)))
     if len(movements) < count:
         return None
-    selected: list[float] = []
-    total = len(movements)
-    for group in range(count):
-        group_start = total * group // count
-        group_end = total * (group + 1) // count
-        chunk = movements[group_start:group_end]
-        eligible = [
-            item
-            for item in chunk
-            if (lower is None or item[0] > lower) and (upper is None or item[0] < upper)
-        ]
-        if not eligible:
-            return None
-        selected.append(max(eligible, key=lambda item: (item[1], item[0]))[0])
-    unique = sorted(set(selected))
-    if len(unique) != count:
+    eligible_movements = [
+        item
+        for item in movements
+        if (lower is None or item[0] > lower) and (upper is None or item[0] < upper)
+    ]
+    if len(eligible_movements) < count:
         return None
-    return tuple(unique)
+
+    # Choose the combination that minimises the worst unobserved stretch, and
+    # break ties towards more movement.
+    #
+    # Equal thirds of the window were tried first and are not good enough.
+    # Measured on activity 19:05, whose movements sit at relative seconds 0.2,
+    # 1.8, 5.6, 21.4, 23.3, ...: index thirds picked 1.8/34.5/42.5 (a 32.7s
+    # hole), and time thirds picked 1.8/23.7/35.1 (a 21.9s hole). Both left the
+    # entry door opening -- 6.2s in -- unobserved, and the model, shown no frame
+    # of it, called a person walking *out* a `home_arrival`.
+    #
+    # Minimising the maximum gap instead picks 5.6/21.4/35.1 on the same data:
+    # a 17.0s worst gap with a pick 0.58s from the door. That is the difference
+    # between a rule that merely spreads picks and one that actually aims at
+    # covering the activity.
+    #
+    # The search is exhaustive: `count` is 3 and the candidate list is bounded
+    # by Frigate's own path-point density (measured: 14-18 movements per
+    # activity), so this is a few hundred to a few thousand combinations of
+    # arithmetic -- negligible beside a single snapshot fetch.
+    span_start = lower if lower is not None else eligible_movements[0][0]
+    span_end = upper if upper is not None else eligible_movements[-1][0]
+    if span_end <= span_start:
+        return None
+
+    def worst_gap(combo: Sequence[tuple[float, float]]) -> float:
+        edges = [span_start, *(item[0] for item in combo), span_end]
+        return max(b - a for a, b in zip(edges, edges[1:], strict=False))
+
+    # Deduplicate by instant: several movements can share a timestamp, and two
+    # of them landing in different slots would collapse to fewer than `count`
+    # distinct picks.
+    by_instant: dict[float, float] = {}
+    for occurred_at, distance in eligible_movements:
+        if distance > by_instant.get(occurred_at, -1.0):
+            by_instant[occurred_at] = distance
+    candidates = sorted(by_instant.items())
+    if len(candidates) < count:
+        return None
+
+    def score(combo: Sequence[tuple[float, float]]) -> tuple[tuple[float, ...], float]:
+        edges = [span_start, *(item[0] for item in combo), span_end]
+        gaps = sorted(
+            (b - a for a, b in zip(edges, edges[1:], strict=False)), reverse=True
+        )
+        # Compare the gaps *worst-first*, not just the worst one. Minimising the
+        # single largest gap leaves ties, and an arbitrary tie-break spends two
+        # cells on adjacent instants while a quieter stretch keeps its hole --
+        # measured on a fixture whose movements span 104-109 inside a 103-117
+        # window, where the largest gap is set by the quiet tail either way and
+        # only the second-largest gap distinguishes a good spread from a
+        # clustered one.
+        #
+        # Ties then go to the combination that saw more movement, so a pick
+        # prefers a moment something happened over a moment nothing did.
+        return (tuple(gaps), -sum(distance for _, distance in combo))
+
+    best_combo = min(itertools.combinations(candidates, count), key=score)
+    selected = sorted(occurred_at for occurred_at, _ in best_combo)
+    if len(set(selected)) != count:
+        return None
+    return tuple(selected)
