@@ -42,8 +42,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from PIL import Image, UnidentifiedImageError
 
+from .const import CONF_SCENE_DESCRIPTION, MAX_SCENE_DESCRIPTION_LENGTH
 from .models import ActivityRecord, ActivityStage, analysis_key
-from .scenes import SCENES, SceneRequest, scene_for
+from .scenes import SCENES, SceneRequest, effective_prompt_version, scene_for
 from .store import ActivityStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -103,6 +104,10 @@ class VisionConfig:
     max_tokens: int = 4000
     target_width: int = 768
     language: str = "zh-CN"
+    # The deployment's own description of the camera's view. Empty by default,
+    # and empty means the prompt is byte-for-byte what it was before this
+    # option existed.
+    scene_description: str = ""
 
     def endpoint(self) -> str:
         """Return the chat-completions URL for this base URL.
@@ -227,6 +232,9 @@ def vision_config_from(
         max_tokens=int(options.get("max_tokens", 4000)),
         target_width=int(options.get("target_width", 768)),
         language=str(options.get("output_language", "zh-CN")),
+        scene_description=pick(CONF_SCENE_DESCRIPTION)[
+            :MAX_SCENE_DESCRIPTION_LENGTH
+        ],
     )
 
 
@@ -279,7 +287,14 @@ class VisionClient:
             raise VisionError("unsupported_evidence_mode")
         allowed = set(scene.classifications)
 
-        key = analysis_key(activity_id, record.evidence_mode, scene.prompt_version)
+        key = analysis_key(
+            activity_id,
+            record.evidence_mode,
+            effective_prompt_version(
+                record.evidence_mode, self._config.scene_description
+            )
+            or scene.prompt_version,
+        )
         started = await self._store.async_start_side_effect(
             activity_id,
             key,
@@ -445,6 +460,13 @@ async def async_analyze(
     """Analyse one contact sheet.
 
     Returns (classification, description, confidence, prompt_version).
+
+    The returned version is the effective one -- the base version with the
+    deployment's scene description folded in -- not the bare
+    `scene.prompt_version`. The caller stores it, and the store derives the
+    claimed side-effect key from it, so returning the base version while the
+    claim used the effective one would fail the analysis *after* the provider
+    had already been billed, with `side_effect_key_mismatch`.
     """
     scene = scene_for(evidence_mode)
     if scene is None:
@@ -460,6 +482,7 @@ async def async_analyze(
                 "door_remained_open": door_remained_open,
                 "opening_side": opening_side,
             },
+            scene_description=config.scene_description,
         )
     )
     image_bytes = await asyncio.get_running_loop().run_in_executor(
@@ -482,7 +505,13 @@ async def async_analyze(
         elapsed,
         classification,
     )
-    return classification, description, confidence, scene.prompt_version
+    # The effective version, not the bare scene one: the caller stores this and
+    # the store rebuilds the claimed key from it. See the docstring.
+    version = (
+        effective_prompt_version(evidence_mode, config.scene_description)
+        or scene.prompt_version
+    )
+    return classification, description, confidence, version
 
 
 @dataclass(frozen=True)

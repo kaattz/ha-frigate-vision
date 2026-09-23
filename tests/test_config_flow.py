@@ -920,3 +920,75 @@ async def test_zone_lists_may_be_empty_for_review_only(hass: HomeAssistant) -> N
         )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"]["zones"] == {"near": [], "transition": [], "far": []}
+
+
+async def test_options_flow_round_trips_the_scene_description(
+    hass: HomeAssistant,
+) -> None:
+    """The layout description must survive a save/read cycle.
+
+    It is optional, so the flow has to accept both an omitted and a supplied
+    value; an option the schema rejects would surface only when the user tried
+    to save their camera's layout, which is the one moment it must work.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"processing_mode": "observe"},
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings"}
+    )
+    description = "入户门在画面左侧画外；画面中央是电梯门，走廊远端通往另一部画外电梯。"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            "processing_mode": "shadow",
+            "target_width": 768,
+            "max_tokens": 20000,
+            "output_language": "zh-CN",
+            "history_retention_days": 30,
+            "media_retention_days": 7,
+            "queue_size": 10,
+            "scene_description": description,
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"]["scene_description"] == description
+
+
+async def test_scene_description_reaches_the_vision_config(
+    hass: HomeAssistant,
+) -> None:
+    """The stored option must actually reach the prompt, not just the entry.
+
+    A saved option that never reaches `VisionConfig` would look configured in
+    the UI while every analysis still ran the old prompt -- the silent-failure
+    shape this project has hit before.
+    """
+    from custom_components.frigate_vision.vision import vision_config_from
+
+    text = "入户门在画面左侧画外"
+    config = vision_config_from({}, {"scene_description": text})
+    assert config.scene_description == text
+
+    # Unset must stay empty rather than becoming a placeholder.
+    assert vision_config_from({}, {}).scene_description == ""
+
+
+async def test_a_long_scene_description_is_truncated_not_rejected(
+    hass: HomeAssistant,
+) -> None:
+    """A pasted essay must not break analysis.
+
+    The cap protects the prompt budget. Truncating keeps a working
+    configuration; rejecting at save time would lose the whole edit.
+    """
+    from custom_components.frigate_vision.const import MAX_SCENE_DESCRIPTION_LENGTH
+    from custom_components.frigate_vision.vision import vision_config_from
+
+    config = vision_config_from({}, {"scene_description": "长" * 2000})
+    assert len(config.scene_description) == MAX_SCENE_DESCRIPTION_LENGTH

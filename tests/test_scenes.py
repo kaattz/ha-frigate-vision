@@ -254,3 +254,156 @@ def test_roundtrip_scene_reports_the_lock_evidence_it_was_given() -> None:
 
     unknown = _render("door_roundtrip", door_remained_open=None, opening_side="inside")
     assert "未知" in unknown
+
+
+# --- deployment-supplied scene description (diagnosis defect C) -------------
+# The general prompt's arrival/departure rules speak of "the front door", but
+# nothing told the model which door in frame that is. Measured on this
+# deployment: a person stepping out of a lift and walking away was classified
+# `home_departure`, because the nearest door was read as the front door.
+
+
+def test_an_empty_description_leaves_the_prompt_byte_for_byte_unchanged() -> None:
+    """A deployment that configures nothing must see no change at all.
+
+    This is the whole safety argument for shipping the option: the prompt is a
+    cache key input and a behaviour input, so "empty means untouched" has to
+    hold exactly, not approximately.
+    """
+    scene = SCENES["review_six"]
+    without = scene.render(
+        SceneRequest(language="中文", allowed=scene.classifications, signals={})
+    )
+    for empty in ("", "   ", "\n\t "):
+        assert (
+            scene.render(
+                SceneRequest(
+                    language="中文",
+                    allowed=scene.classifications,
+                    signals={},
+                    scene_description=empty,
+                )
+            )
+            == without
+        ), "whitespace-only descriptions must count as unset"
+
+
+def test_the_description_is_injected_before_the_rules() -> None:
+    """Context first, rules second.
+
+    The template's rules refer to "the front door" and to movement relative to
+    it. If the description arrived after them, the model would read the rules
+    without knowing which door they mean -- which is the defect itself.
+    """
+    scene = SCENES["review_six"]
+    marker = "电梯1门通往大堂，入户门在画面左侧画外"
+    prompt = scene.render(
+        SceneRequest(
+            language="中文",
+            allowed=scene.classifications,
+            signals={},
+            scene_description=marker,
+        )
+    )
+    assert marker in prompt
+    assert prompt.index(marker) < prompt.index("六格依次是")
+
+
+def test_the_description_carries_no_authority_of_its_own() -> None:
+    """Layout is context; it must not license a classification by itself.
+
+    A description that merely said "the front door is off-camera" would still
+    let a model conclude a departure from it. The injected text therefore says
+    the description only identifies what is in frame.
+    """
+    scene = SCENES["review_six"]
+    prompt = scene.render(
+        SceneRequest(
+            language="中文",
+            allowed=scene.classifications,
+            signals={},
+            scene_description="入户门在画外",
+        )
+    )
+    assert "只是摄像头视野的说明" in prompt
+    assert "不得据布局猜测" in prompt
+
+
+def test_only_the_general_scene_accepts_a_description() -> None:
+    """Declared, not assumed -- the same isolation `signals` uses.
+
+    The door scenes carry their own preamble about the lift and the off-camera
+    door; a description written for the general scene would duplicate or
+    contradict it. A scene that did not ask for the text must never see it.
+    """
+    assert SCENES["review_six"].accepts_scene_description is True
+    assert SCENES["door_single"].accepts_scene_description is False
+    assert SCENES["door_roundtrip"].accepts_scene_description is False
+
+    marker = "入户门在画面左侧画外"
+    for mode in ("door_single", "door_roundtrip"):
+        scene = SCENES[mode]
+        prompt = scene.render(
+            SceneRequest(
+                language="中文",
+                allowed=scene.classifications,
+                signals=dict.fromkeys(scene.signals, "unknown"),
+                scene_description=marker,
+            )
+        )
+        assert marker not in prompt, (
+            f"{mode} must ignore a description it did not declare"
+        )
+
+
+def test_editing_the_description_changes_the_cache_key() -> None:
+    """Otherwise the edit looks like it did nothing.
+
+    The version is a module constant, so it cannot see a deployment's option. A
+    user who rewrote their description would be served the previous prompt's
+    stored answer, and the change would appear to have had no effect -- the same
+    shape of silent failure this project has already hit twice.
+    """
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+
+    first = effective_prompt_version("review_six", "入户门在画外左侧")
+    second = effective_prompt_version("review_six", "入户门在画外右侧")
+    assert first != second, "different descriptions must not share a cache key"
+    assert first == effective_prompt_version("review_six", "入户门在画外左侧")
+
+
+def test_an_unset_description_keeps_the_plain_version() -> None:
+    """No description means no key change, so existing caches stay valid."""
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+
+    base = SCENES["review_six"].prompt_version
+    assert effective_prompt_version("review_six", "") == base
+    assert effective_prompt_version("review_six", "   ") == base
+    # A scene that never accepts a description is unaffected even if handed one.
+    door = SCENES["door_single"].prompt_version
+    assert effective_prompt_version("door_single", "任何描述") == door
+
+
+def test_the_effective_version_is_a_valid_cache_key_component() -> None:
+    """It reaches `analysis_key`, which validates against a strict alphabet.
+
+    A digest that happened to contain a colon or a space would raise at analysis
+    time -- after frames were fetched and possibly after the provider was
+    charged.
+    """
+    from custom_components.frigate_vision.models import SAFE_ID
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+    from custom_components.frigate_vision.vision import analysis_key
+
+    for description in (
+        "入户门在画外左侧",
+        "a" * 500,
+        "多行\n描述\t带特殊字符 :/?#[]@!$&'()*+,;=",
+    ):
+        version = effective_prompt_version("review_six", description)
+        assert version is not None
+        assert SAFE_ID.fullmatch(version), f"not a safe key component: {version!r}"
+        # The real call site must accept it.
+        assert analysis_key("activity_1", "review_six", version)
+
+    assert effective_prompt_version("no_such_scene", "x") is None

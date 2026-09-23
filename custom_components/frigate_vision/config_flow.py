@@ -36,6 +36,7 @@ from .const import (
     CONF_MQTT_TOPIC_PREFIX,
     CONF_NAME,
     CONF_NEAR_ZONES,
+    CONF_SCENE_DESCRIPTION,
     CONF_TRANSITION_ZONES,
     DOMAIN,
     PROCESSING_MODES,
@@ -109,6 +110,11 @@ def _options_schema() -> vol.Schema:
             ),
             vol.Required("max_tokens", default=4000): vol.All(int, vol.Range(1, 20000)),
             vol.Required("output_language", default="zh-CN"): _text(),
+            # Optional. Empty keeps the prompt exactly as it was, so a
+            # deployment that does not need this is unaffected.
+            vol.Optional(CONF_SCENE_DESCRIPTION, default=""): selector.TextSelector(
+                selector.TextSelectorConfig(multiline=True)
+            ),
             vol.Required("history_retention_days", default=30): vol.All(
                 int, vol.Range(1, 365)
             ),

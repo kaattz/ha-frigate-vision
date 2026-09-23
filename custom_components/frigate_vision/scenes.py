@@ -22,12 +22,17 @@ asking the model to invent evidence.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 # Bumped whenever any scene's wording changes in a way that could alter its
 # answer. It is part of the analysis cache key, so a stale result is never
 # reused after the prompt that produced it has changed.
+#
+# A deployment-supplied scene description changes the prompt without changing
+# this constant -- see `effective_prompt_version`, which folds that description
+# into the key so a user editing it is not silently served a cached answer.
 PROMPT_VERSION = "prompt_3"
 
 
@@ -42,6 +47,9 @@ class SceneRequest:
     # Auxiliary evidence, e.g. door-lock state. A scene reads only the keys it
     # declared, so an undeclared signal can never reach its prompt.
     signals: Mapping[str, object] = field(default_factory=dict)
+    # The deployment's own description of what the camera looks at. Injected
+    # only into scenes that declare `accepts_scene_description`.
+    scene_description: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +65,11 @@ class Scene:
     # separate from `template` so a scene's wording stays readable.
     signal_text: Mapping[str, Mapping[object, str]] = field(default_factory=dict)
     preamble: str = ""
+    # Whether the deployment's own description of the camera's view may be
+    # injected. Declared rather than assumed, for the same reason `signals` is:
+    # a scene only ever receives input it asked for, so a description written
+    # for one layout cannot leak into a scene that would misread it.
+    accepts_scene_description: bool = False
 
     def render(self, request: SceneRequest) -> str:
         """Return the prompt for this scene.
@@ -69,6 +82,11 @@ class Scene:
         parts = [self._common(request.language)]
         if request.allowed:
             parts.append(self._contract(request.allowed))
+        # Before the template, not after: the template's rules refer to "the
+        # front door" and to movement relative to it, so the model has to be
+        # told which door that is before it is told how to reason about it.
+        if self.accepts_scene_description:
+            parts.append(_scene_context(request.scene_description))
         parts.append(self.template)
         for name in sorted(self.signals):
             # Only declared signals are consulted; anything else in the request
@@ -99,6 +117,22 @@ class Scene:
         )
 
 
+# Wraps the deployment's description so the model reads it as context rather
+# than as another rule. The closing sentence matters: a description alone tells
+# the model what it is looking at, while this tells it what may *not* be
+# concluded from that -- which is the part that actually prevents the
+# "saw someone leave a lift, called it a departure" error.
+def _scene_context(description: str) -> str:
+    text = description.strip()
+    if not text:
+        return ""
+    return (
+        f"现场布局：{text}"
+        "以上只是摄像头视野的说明，用于判断画面中的门和通道分别是什么；"
+        "仍须按下面的规则根据实际可见动作判断，不得据布局猜测。"
+    )
+
+
 # The general scene. Its phrasing carries the arrival/departure rules because no
 # zone telemetry reaches this path (measured: 0 of 90 standalone reviews carried
 # detection_zone_updates, while door cycles did), so direction has to be seen in
@@ -122,6 +156,13 @@ _REVIEW_SIX = Scene(
     ),
     signals=frozenset(),
     prompt_version=PROMPT_VERSION,
+    # Measured on this deployment: without a layout description the model read a
+    # person stepping out of a lift and walking away down the corridor as
+    # `home_departure`, because the prompt told it to judge movement relative to
+    # "the front door" without ever saying that the door in frame is a lift and
+    # the front door is off-camera. The rule was right; the missing context was
+    # the door's identity.
+    accepts_scene_description=True,
     template=(
         "六格依次是人物首帧、三张变化候选、人物末帧和后置现场。"
         "只有连续清楚出现清扫、扫地、拖地或擦拭动作才可判断cleaning。"
@@ -192,3 +233,41 @@ def scene_prompt_version(mode: str) -> str | None:
     """Return the prompt version for a mode, or None when unregistered."""
     scene = SCENES.get(mode)
     return scene.prompt_version if scene is not None else None
+
+
+def effective_prompt_version(
+    mode: str, scene_description: str = ""
+) -> str | None:
+    """Return the version to key an analysis on, for a mode and a description.
+
+    The base version is a module constant, so it cannot reflect a description
+    the deployment supplies from its own options. Without folding that
+    description in, editing it would leave the cache key untouched and the next
+    analysis of an activity would be answered from the *previous* prompt's
+    stored result -- the change would look like it had no effect at all. This
+    project has already lost a feature to exactly that shape of failure twice
+    (a blueprint silently rewritten by Home Assistant, and a template value
+    that stopped being a string), so the version is derived from the content
+    rather than trusted to be bumped by hand.
+
+    Returns None for an unregistered mode, matching `scene_prompt_version`.
+
+    The digest is eight hex characters, which keeps the result inside the
+    `SAFE_ID` alphabet that `analysis_key` validates. Eight characters is far
+    more than enough to distinguish the handful of descriptions a deployment
+    would ever write, and it is a cache key rather than a security boundary.
+    """
+    scene = SCENES.get(mode)
+    if scene is None:
+        return None
+    base = scene.prompt_version
+    if not scene.accepts_scene_description:
+        return base
+    text = scene_description.strip()
+    if not text:
+        # Nothing was configured, so the prompt is exactly the base one and the
+        # key must stay exactly the base key. Deployments that never set a
+        # description keep their existing cache and behaviour untouched.
+        return base
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+    return f"{base}-{digest}"
