@@ -317,7 +317,10 @@ class ActivityRecord:
             ):
                 raise ModelValidationError("invalid_evidence_location")
         if (
-            len(self.sample_times) not in {0, 3, 6}
+            # 0 means "not planned yet"; otherwise the count must be one a contact
+            # sheet can be built from -- a whole number of 3-column rows, which
+            # covers the 2x3 and 3x3 layouts the planner produces.
+            len(self.sample_times) not in {0, 3, 6, 9, 12}
             or tuple(sorted(set(self.sample_times))) != self.sample_times
             or any(not math.isfinite(value) or value < 0 for value in self.sample_times)
         ):

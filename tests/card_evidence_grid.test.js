@@ -167,6 +167,25 @@ check("non-numeric entries are dropped, not turned into NaN", () => {
   assert.deepStrictEqual(card._parseOffsets("1.5||oops|9.2"), [1.5, 9.2]);
 });
 
+check("a nine-offset notification builds nine cells", () => {
+  // The sheet grew from 2x3 to 3x3 so the extra probed frames reach the popup.
+  // The grid is declared as `grid-auto-rows: 1fr` with one button per offset, so
+  // it should follow the count rather than assume two rows -- asserted here
+  // because "should" is not evidence, and a hardcoded row count would clip the
+  // third row without any error.
+  const { card, cells, evidence } = makeCard({ notification_id: "alert_nine" });
+  card.hass = storeWith({
+    id: "alert_nine",
+    hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
+    evidence_image_url: "/api/frigate_vision/media/e/nine.jpg?authSig=Y",
+    evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7|52.3|61.8|70.2",
+  });
+  assert.strictEqual(evidence.hidden, false, "the sheet must be shown");
+  assert.strictEqual(cells.children.length, 9, "nine cells for nine offsets");
+  assert.strictEqual(cells.children[0].dataset.cell, "1");
+  assert.strictEqual(cells.children[8].dataset.cell, "9");
+});
+
 check("a source with a sheet builds one button per offset", () => {
   const { card, cells, evidence } = makeCard({ notification_id: "alert_1" });
   card.hass = storeWith({

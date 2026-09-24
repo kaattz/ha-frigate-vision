@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 # A deployment-supplied scene description changes the prompt without changing
 # this constant -- see `effective_prompt_version`, which folds that description
 # into the key so a user editing it is not silently served a cached answer.
-PROMPT_VERSION = "prompt_4"
+PROMPT_VERSION = "prompt_5"
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +213,13 @@ _REVIEW_SIX = Scene(
     # the door's identity.
     accepts_scene_description=True,
     template=(
-        "六格依次是人物首帧、三张变化候选、人物末帧和后置现场。"
+        # Structure, not a count. The sheet is 2x3 when no hole is wide enough to
+        # probe and 3x3 when one is, so naming a number would be wrong half the
+        # time -- and wrong in the direction that matters, since it would place the
+        # emptied scene three cells early.
+        "图按时间顺序排列，从左到右、再从上到下读取。"
+        "第一格是人物首帧，最后一格是人物离开后的后置现场，倒数第二格是人物末帧，"
+        "中间各格是这段时间内的变化候选。"
         "只有连续清楚出现清扫、扫地、拖地或擦拭动作才可判断cleaning。"
         "只有清楚看到放下包裹或外卖且离开后物品仍留下，才可判断配送。"
         "不能根据制服、携带物或停留时间猜测职业。"

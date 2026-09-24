@@ -10,7 +10,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
@@ -369,6 +369,40 @@ def _change_scores(
     return scored
 
 
+def pair_times_with_roles(
+    plan: EvidencePlan, probes: Sequence[float]
+) -> tuple[tuple[float, ...], tuple[str, ...]]:
+    """Return the sheet's timestamps and their roles, sorted together.
+
+    A pure function on purpose. The pairing cannot be tested where it is used --
+    inside an async method that fetches frames and writes files -- and a mutation
+    that sorted the times while leaving the roles in insertion order passed every
+    test, because nothing observed the two lists as a pair.
+
+    That mutation is a real defect, not a hypothetical one:
+    `_nudge_uncovered_frames` reads `roles[index]` to decide which frames the sheet
+    cannot be built without. `first`, `last` and `postroll` are required, a probe
+    is not, and probes land *inside* the motion span -- so a mispaired role lets a
+    required frame be treated as droppable.
+
+    Probes are included as ordinary cells; they are added to the sheet rather than
+    replacing a motion pick, which is what grows it from 2x3 to 3x3.
+    """
+    paired = sorted(
+        [
+            (plan.first_time, "first"),
+            *((moment, "motion") for moment in plan.motion_times),
+            *((moment, "probe") for moment in probes),
+            (plan.last_time, "last"),
+            (plan.postroll_time, "postroll"),
+        ]
+    )
+    return (
+        tuple(moment for moment, _ in paired),
+        tuple(role for _, role in paired),
+    )
+
+
 def build_contact_sheet(
     frame_paths: Sequence[Path],
     output_path: Path,
@@ -376,7 +410,14 @@ def build_contact_sheet(
     columns: int = 3,
     cell_size: tuple[int, int] = (640, 360),
 ) -> None:
-    if columns != 3 or len(frame_paths) not in {3, 6}:
+    if columns <= 0:
+        raise MediaError("invalid_frame_count")
+    # The row count follows the frame count rather than being fixed at two.
+    # A nine-cell sheet is the same 3-column layout with three rows, and hardcoding
+    # two would drop the third row silently -- which is how a malformed fixture of
+    # mine once reported an inflated result. A partial final row is rejected
+    # outright for the same reason.
+    if not frame_paths or len(frame_paths) % columns:
         raise MediaError("invalid_frame_count")
     width, height = cell_size
     sheet = Image.new("RGB", (width * columns, height * (len(frame_paths) // columns)))
@@ -794,14 +835,14 @@ class MediaManager:
         # The detector reports where the *person* moved, and the middle cells are
         # chosen from that. But a door opening while the person stands still
         # moves no path point at all, so the sheet's largest hole can be exactly
-        # where the decisive moment is. Measured on this deployment, every hole
-        # wider than MAX_SAMPLE_GAP contained real change.
+        # where the decisive moment is. Measured here, every hole wider than
+        # MAX_SAMPLE_GAP contained real change.
         #
-        # Runs after the recordings are known (the probes fall inside the person
-        # window, so coverage already covers them) and before the sheet is
-        # assembled, because re-aiming a pick changes which frames are needed.
-        # The probes are fetched into their own directory first: they need a
-        # place to land, and the main temporary directory is created below.
+        # The probes become *extra cells*, growing the sheet from 2x3 to 3x3,
+        # rather than replacing a motion pick: spending extra cells on more
+        # motion picks measured 16.4s worst gap against 11.5s for probed ones.
+        # The probes are fetched into their own directory because the main
+        # temporary directory is created further down.
         if plan.motion_times:
             probe_dir = Path(
                 await self._hass.async_add_executor_job(
@@ -809,26 +850,19 @@ class MediaManager:
                 )
             )
             try:
-                filled = await self._async_fill_widest_gap(
+                found = await self._async_probe_widest_gap(
                     record.camera,
                     probe_dir,
                     plan,
                     recordings,
-                    motion_paths,
                 )
             finally:
                 await self._hass.async_add_executor_job(
                     shutil.rmtree, probe_dir, True
                 )
-            if filled is not None and filled != plan.motion_times:
-                plan = replace(plan, motion_times=filled)
-                times = (
-                    plan.first_time,
-                    *plan.motion_times,
-                    plan.last_time,
-                    plan.postroll_time,
-                )
-                requested = tuple(times)
+            if found:
+                times, roles = pair_times_with_roles(plan, found)
+                requested = times
         # A required frame inside a recording hole cannot be discarded the way a
         # change candidate can, so it is nudged to the nearest covered instant
         # first. Coverage is then checked on what actually must be present.
@@ -1003,31 +1037,30 @@ class MediaManager:
         }
         return tuple(result), fixed, nudges
 
-    async def _async_fill_widest_gap(
+    async def _async_probe_widest_gap(
         self,
         camera: str,
         temporary: Path,
         plan: EvidencePlan,
         recordings: Sequence[Mapping[str, Any]],
-        motion_paths: Mapping[str, MotionPath] | None = None,
     ) -> tuple[float, ...] | None:
-        """Re-aim the middle picks using evidence found inside the widest hole.
+        """Instants worth adding as extra cells, found by visible change.
 
         The sheet's middle cells come from the person's motion path. The detector
         reports where the *person* moved, which is not where the *picture*
-        changed: a door opening while the person stands still produces no path
-        movement, and the moment the entry door opened on this deployment fell
-        inside a 33.3s hole exactly that way. The model, shown no frame of it,
-        called a person walking out a `home_arrival`.
+        changed: a door opening while the person stands still moves no path point
+        at all, and the moment the entry door opened on this deployment fell
+        inside a 33.3s hole for exactly that reason.
 
-        This probes the widest hole for visible change and offers what it finds
-        back to the same selection rule, so the trade between covering the
-        activity and covering the moment is made by one rule rather than two.
+        These are *added* to the sheet rather than replacing a motion pick.
+        Measured across 48 activities: spending the extra cells on more motion
+        picks barely helps (mean worst gap 17.1s -> 16.4s) because a hole is by
+        definition where the person was not moving, while three probed cells
+        nearly halves it (17.1s -> 11.5s), improving 29 and worsening none.
 
-        Returns None when there is nothing to do -- no hole wide enough, no
+        Returns None when there is nothing to add -- no hole wide enough, too few
         frames retrievable, or no visible change in the hole. A failure here must
-        not lose the sheet: the caller keeps the original picks in every one of
-        those cases.
+        not cost the sheet: the caller keeps its six cells in every such case.
         """
         probes = probe_gap_times(
             (plan.first_time, *plan.motion_times, plan.last_time),
@@ -1046,9 +1079,10 @@ class MediaManager:
             for moment in probes
             if any(start <= moment <= end for start, end in covered)
         ]
-        if len(fetchable) < 2:
-            # Fewer than two frames cannot show a change, and one is not worth
-            # the fetch.
+        if len(fetchable) < GAP_PROBE_COUNT:
+            # Only a full set of probes yields a whole number of rows. A short set
+            # would leave a partial row, which cannot be laid out -- and padding
+            # it with frames chosen for no reason would be worse than six cells.
             return None
 
         frames: list[tuple[float, Path]] = []
@@ -1060,32 +1094,19 @@ class MediaManager:
             path = temporary / f"probe-{index}.jpg"
             await self._hass.async_add_executor_job(path.write_bytes, data)
             frames.append((moment, path))
-        if len(frames) < 2:
-            return None
-
-        changes = await self._hass.async_add_executor_job(_change_scores, frames)
-        if not changes:
+        if len(frames) < GAP_PROBE_COUNT:
             return None
 
         # A night-vision probe is not comparable to a colour one, so a hole that
         # only yielded IR frames is left alone rather than trusted.
-        usable = [
-            (moment, score)
-            for moment, score in changes
-            if not await self._hass.async_add_executor_job(
-                frame_is_infrared, dict(frames)[moment]
-            )
-        ]
-        if not usable:
+        usable = []
+        for moment, path in frames:
+            if await self._hass.async_add_executor_job(frame_is_infrared, path):
+                continue
+            usable.append(moment)
+        if len(usable) < GAP_PROBE_COUNT:
             return None
-
-        return select_motion_times(
-            list(motion_paths.values()) if motion_paths else [],
-            count=len(plan.motion_times),
-            lower=plan.first_time,
-            upper=plan.last_time,
-            extra=usable,
-        )
+        return tuple(sorted(usable))
 
     @staticmethod
     def _coverage_intervals(

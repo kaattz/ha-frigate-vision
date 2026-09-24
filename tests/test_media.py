@@ -11,11 +11,13 @@ from PIL import Image
 
 from custom_components.frigate_vision.correlation import ZoneRoles
 from custom_components.frigate_vision.media import (
+    EvidencePlan,
     MediaError,
     MediaManager,
     build_contact_sheet,
     frame_is_infrared,
     frame_is_overexposed,
+    pair_times_with_roles,
     recordings_cover,
     select_review_change_frames,
     validate_unique_frames,
@@ -84,6 +86,84 @@ def _changing_jpeg(timestamp: float) -> bytes:
     # would show here. Distinct instants differ by at least one level.
     level = int((timestamp * 12) % 200) + 20
     return _jpeg(level)
+
+
+def test_probe_cells_keep_their_own_role_through_the_sort() -> None:
+    """Every role must stay attached to the instant it describes.
+
+    Probes land *inside* the motion span, so sorting the timestamps and leaving
+    the roles in insertion order silently pairs each role with the wrong cell. It
+    matters because `_nudge_uncovered_frames` treats `first`/`last`/`postroll` as
+    required and a probe as droppable -- so a mispaired role lets a frame the
+    sheet cannot be built without be discarded.
+
+    Tested on the pure helper, not through `async_build`: a mutation that sorted
+    the times while leaving roles in insertion order passed the whole suite when
+    the pairing lived inside the async method, because nothing observed the two
+    lists as a pair.
+    """
+
+    plan = EvidencePlan(
+        mode="review_six",
+        first_time=100.0,
+        last_time=160.0,
+        postroll_time=163.0,
+        selection_source="path_motion",
+        motion_times=(110.0, 130.0, 150.0),
+    )
+    # Two probes fall between motion picks, one after the last -- the arrangement
+    # that makes sorting dangerous.
+    times, roles = pair_times_with_roles(plan, (115.0, 135.0, 155.0))
+
+    assert len(times) == len(roles) == 9
+    assert list(times) == sorted(times)
+    expected = {
+        100.0: "first",
+        110.0: "motion",
+        115.0: "probe",
+        130.0: "motion",
+        135.0: "probe",
+        150.0: "motion",
+        155.0: "probe",
+        160.0: "last",
+        163.0: "postroll",
+    }
+    assert dict(zip(times, roles, strict=True)) == expected
+
+
+def test_contact_sheet_accepts_nine_cells_as_three_rows(tmp_path) -> None:
+    """Nine cells must lay out as 3x3, not be rejected or silently truncated.
+
+    Measured on the owner's labelled sheets: a nine-cell sheet answered direction
+    correctly 48% of the time against 28% for six cells (pooled over two models,
+    n=40), and the mechanism is not in doubt -- the three extra frames are chosen
+    by visible change and cut the worst unobserved gap from 17.1s to 11.5s, better
+    on 29 of 48 activities and worse on none.
+
+    The layout must follow the frame count rather than a fixed 2x3, or the extra
+    row would be dropped without error -- which is exactly how a malformed
+    nine-cell fixture of mine once produced an inflated result.
+    """
+    frames = []
+    for index in range(9):
+        path = tmp_path / f"n{index}.jpg"
+        path.write_bytes(_jpeg(index * 20))
+        frames.append(path)
+    output = tmp_path / "nine.jpg"
+    build_contact_sheet(frames, output, cell_size=(160, 90))
+    with Image.open(output) as sheet:
+        assert sheet.size == (480, 270), "three rows of 160x90 was expected"
+
+
+def test_contact_sheet_rejects_a_count_that_is_not_whole_rows(tmp_path) -> None:
+    """A partial row would silently drop frames, so it must fail loudly."""
+    frames = []
+    for index in range(7):
+        path = tmp_path / f"p{index}.jpg"
+        path.write_bytes(_jpeg(index * 20))
+        frames.append(path)
+    with pytest.raises(MediaError, match="invalid_frame_count"):
+        build_contact_sheet(frames, tmp_path / "bad.jpg", cell_size=(160, 90))
 
 
 def test_contact_sheet_validates_frames_and_dimensions(tmp_path) -> None:
@@ -457,6 +537,246 @@ def _motion_points() -> list[list[object]]:
     return [[[float(index), 0.0], 103.0 + index] for index in range(7)]
 
 
+async def test_review_builds_a_nine_cell_sheet_when_a_hole_can_be_probed(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """Nine cells = first | motion x3 | probed x3 | last | postroll.
+
+    The three extra cells are the whole point: they are chosen by visible change
+    rather than by where the person moved, which cuts the worst unobserved gap
+    from 17.1s to 11.5s (better on 29 of 48 activities, worse on none). A nine-cell
+    sheet is therefore not "six motion picks plus three more of the same" -- that
+    arrangement measured 16.4s and buys almost nothing.
+
+    Built from the measured 19:05 movement shape, whose clustered points are what
+    leaves a hole wide enough to probe at all.
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = ActivityRecord(
+        activity_id="review_entry_1_front_review_nine",
+        entry_id="entry_1",
+        source=ActivitySource.STANDALONE_REVIEW,
+        stage=ActivityStage.SEALED,
+        processing_mode=ProcessingMode.OBSERVE,
+        created_at=102,
+        updated_at=152,
+        camera="front",
+        review_ids=("review_nine",),
+        detection_ids=("event_1",),
+        finalization_deadline=152,
+    )
+    await store.async_create(record)
+
+    class Client:
+        def __init__(self) -> None:
+            self.snapshot_calls = 0
+
+        async def async_get_event(self, event_id: str, camera: str):
+            relative = (
+                (0.20, 0.0127),
+                (1.79, 0.0853),
+                (5.60, 0.0611),
+                (21.36, 0.0581),
+                (23.34, 0.0851),
+                (23.70, 0.0902),
+                (34.08, 0.0797),
+                (34.48, 0.0906),
+                (35.08, 0.1516),
+                (41.27, 0.1361),
+                (41.49, 0.0093),
+                (42.47, 0.1236),
+                (42.88, 0.0672),
+                (43.27, 0.0612),
+                (45.05, 0.0706),
+            )
+            points: list[list[object]] = [[[0.0, 0.0], 103.0]]
+            x = 0.0
+            for offset, distance in relative:
+                x += distance
+                points.append([[x, 0.0], 103.0 + offset])
+            return {
+                "id": event_id,
+                "camera": camera,
+                "label": "person",
+                "start_time": 103,
+                "end_time": 150,
+                "data": {"path_data": points},
+            }
+
+        async def async_get_recordings(self, camera: str, after: float, before: float):
+            return [{"start_time": after - 1, "end_time": before + 1}]
+
+        async def async_get_snapshot(self, camera: str, timestamp: float, height: int):
+            self.snapshot_calls += 1
+            return _changing_jpeg(timestamp)
+
+    client = Client()
+    manager = MediaManager(
+        hass, store, client, tmp_path, ZoneRoles(frozenset(), frozenset(), frozenset())
+    )
+    completed = await manager.async_build(record.activity_id)
+
+    assert completed.stage is ActivityStage.EVIDENCE_READY
+    assert len(completed.sample_times) == 9, (
+        f"a nine-cell sheet was expected: {completed.sample_times}"
+    )
+    assert list(completed.sample_times) == sorted(completed.sample_times)
+    assert len(set(completed.sample_times)) == 9, "no cell may repeat another"
+    with Image.open(completed.evidence_path) as sheet:
+        assert sheet.size == (640 * 3, 360 * 3), sheet.size
+
+
+async def test_review_keeps_six_cells_when_no_hole_is_wide_enough(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """A tightly covered activity stays at six -- nine is not unconditional.
+
+    Probing only applies where a hole exists. Every probe costs a snapshot fetch,
+    and a hole shorter than the shortest action worth seeing cannot hide one, so
+    the sheet must stay at its six-cell size rather than pad itself with frames
+    chosen for no reason.
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _standalone_record()
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id,
+                "camera": camera,
+                "label": "person",
+                "start_time": 103,
+                "end_time": 117,
+                "data": {"path_data": _motion_points()},
+            }
+
+        async def async_get_recordings(self, camera: str, after: float, before: float):
+            return [{"start_time": after - 1, "end_time": before + 1}]
+
+        async def async_get_snapshot(self, camera: str, timestamp: float, height: int):
+            return _changing_jpeg(timestamp)
+
+    manager = MediaManager(
+        hass,
+        store,
+        Client(),
+        tmp_path,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+    completed = await manager.async_build(record.activity_id)
+
+    assert completed.stage is ActivityStage.EVIDENCE_READY
+    assert len(completed.sample_times) == 6, completed.sample_times
+
+
+async def test_probe_cells_keep_their_role_aligned_with_their_time(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """A role must describe the frame it is paired with, after sorting.
+
+    `_nudge_uncovered_frames` reads `roles[index]` to decide which frames the
+    sheet cannot be built without -- `first`, `last` and `postroll` are required,
+    a probe is not. Probes land *inside* the motion span, so sorting the times
+    without carrying the roles along would pair a probe with a required cell's
+    role. The sheet would then survive a recording hole it cannot actually be
+    built from, or reject one it could.
+
+    Verified through the nudge report, which records the role of every frame it
+    had to move -- the one place the pairing becomes observable.
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = ActivityRecord(
+        activity_id="review_entry_1_front_review_roles",
+        entry_id="entry_1",
+        source=ActivitySource.STANDALONE_REVIEW,
+        stage=ActivityStage.SEALED,
+        processing_mode=ProcessingMode.OBSERVE,
+        created_at=102,
+        updated_at=152,
+        camera="front",
+        review_ids=("review_roles",),
+        detection_ids=("event_1",),
+        finalization_deadline=152,
+    )
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            relative = (
+                (0.20, 0.0127),
+                (1.79, 0.0853),
+                (5.60, 0.0611),
+                (21.36, 0.0581),
+                (23.34, 0.0851),
+                (23.70, 0.0902),
+                (34.08, 0.0797),
+                (34.48, 0.0906),
+                (35.08, 0.1516),
+                (41.27, 0.1361),
+                (41.49, 0.0093),
+                (42.47, 0.1236),
+                (42.88, 0.0672),
+                (43.27, 0.0612),
+                (45.05, 0.0706),
+            )
+            points: list[list[object]] = [[[0.0, 0.0], 103.0]]
+            x = 0.0
+            for offset, distance in relative:
+                x += distance
+                points.append([[x, 0.0], 103.0 + offset])
+            return {
+                "id": event_id,
+                "camera": camera,
+                "label": "person",
+                "start_time": 103,
+                "end_time": 150,
+                "data": {"path_data": points},
+            }
+
+        async def async_get_recordings(self, camera: str, after: float, before: float):
+            # A hole covering the last stretch only, so the postroll frame must be
+            # nudged and the report names its role.
+            return [
+                {"start_time": after - 1, "end_time": 149.0},
+                {"start_time": 152.0, "end_time": before + 1},
+            ]
+
+        async def async_get_snapshot(self, camera: str, timestamp: float, height: int):
+            return _changing_jpeg(timestamp)
+
+    manager = MediaManager(
+        hass,
+        store,
+        Client(),
+        tmp_path,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+    completed = await manager.async_build(record.activity_id)
+
+    assert completed.stage is ActivityStage.EVIDENCE_READY
+    assert len(completed.sample_times) == 9
+    # Every nudge the builder reported must name a role the sheet actually uses,
+    # which is only true if roles stayed paired with their own times through the
+    # sort. An unknown role would mean a frame was labelled with another's role.
+    metadata = (tmp_path / "entry_1" / f"{record.activity_id}.json").read_text()
+    payload = json.loads(metadata)
+    for nudge in payload["recording_nudges"]:
+        assert nudge["role"] in {
+            "first",
+            "last",
+            "postroll",
+            "motion",
+            "probe",
+        }, f"a frame carried another cell's role: {nudge}"
+    # And the sheet's own ordering must survive: nine strictly increasing cells.
+    assert list(completed.sample_times) == sorted(completed.sample_times)
+    assert len(set(completed.sample_times)) == 9
+
+
 async def test_review_probes_the_widest_hole_and_reselects(
     hass: HomeAssistant, tmp_path
 ) -> None:
@@ -552,7 +872,11 @@ async def test_review_probes_the_widest_hole_and_reselects(
     completed = await manager.async_build(record.activity_id)
 
     assert completed.stage is ActivityStage.EVIDENCE_READY
-    assert len(completed.sample_times) == 6
+    # Nine cells: the probe cells are *added* rather than replacing a motion pick,
+    # which is the change this test now covers. An earlier revision re-aimed the
+    # picks and stayed at six; that spent the extra evidence on nothing, since
+    # more motion picks measured 16.4s worst gap against 11.5s for probed cells.
+    assert len(completed.sample_times) == 9
     # Probing costs extra fetches; without them the count would be exactly six.
     assert client.snapshot_calls > 6, (
         "no probe was fetched, so the fill step never ran"
@@ -562,8 +886,7 @@ async def test_review_probes_the_widest_hole_and_reselects(
     # picks are 108.6, 124.4 and 137.1 -- the first two exactly at the hole's
     # edges -- so nothing observed the 15.8s in between. Asserting on the hole
     # rather than on a specific instant keeps this true wherever inside it the
-    # selector chooses to aim, since the flash also moves the scores and so the
-    # selection.
+    # probes land.
     assert any(112.0 < moment < 122.0 for moment in completed.sample_times), (
         f"the hole is still unobserved: {completed.sample_times}"
     )

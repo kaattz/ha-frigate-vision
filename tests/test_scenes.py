@@ -24,7 +24,7 @@ from custom_components.frigate_vision.scenes import (
 # `prompt_version` is half the analysis cache key, so leaving it alone after a
 # text change makes the deployment keep serving the old answers. Bump the version
 # and this digest in the same commit.
-REVIEW_SIX_PROMPT_DIGEST = "c1ecfc13b5c9"
+REVIEW_SIX_PROMPT_DIGEST = "3907c8609e2b"
 
 
 def test_every_scene_declares_what_it_can_answer() -> None:
@@ -310,6 +310,33 @@ def _render(mode: str, **signals: object) -> str:
     )
 
 
+def test_the_cell_description_does_not_hardcode_a_count() -> None:
+    """The prompt must describe the layout, not assert a cell count.
+
+    The sheet is 2x3 when no hole is wide enough to probe and 3x3 when one is, so
+    a prompt saying "六格" is wrong half the time -- and wrong in the direction
+    that matters, because it tells the model the last cell is the emptied scene
+    when three probed frames have been inserted before it. A model counting six
+    cells across nine would misread which frame is which.
+
+    The structure is identical in both sizes: the first cell is the person's first
+    frame, the last is the emptied scene, the one before it is the person's final
+    frame, and everything between is candidates, ordered in time. Describing that
+    keeps the prompt true at either size.
+    """
+    prompt = _render("review_six")
+    for wrong in ("六格", "九格", "六个格", "9格"):
+        assert wrong not in prompt, (
+            f"the prompt asserts a fixed cell count ({wrong}) that only holds for "
+            "one of the two sheet sizes"
+        )
+    # The structural anchors must still be stated, or the model loses the meaning
+    # of the first and last cells.
+    assert "首帧" in prompt and "末帧" in prompt and "后置" in prompt
+    # And the order must be given, since the grid is read as a sequence.
+    assert "顺序" in prompt or "依次" in prompt
+
+
 def test_every_offered_label_is_explained_to_the_model() -> None:
     """A label the prompt never defines is a label the model must guess.
 
@@ -467,7 +494,10 @@ def test_the_description_is_injected_before_the_rules() -> None:
         )
     )
     assert marker in prompt
-    assert prompt.index(marker) < prompt.index("六格依次是")
+    # Anchored on a rule from the template, not on its opening words: the layout
+    # sentence now describes structure rather than a fixed cell count, so a
+    # phrase-level anchor would break every time the wording is improved.
+    assert prompt.index(marker) < prompt.index("才可判断cleaning")
 
 
 def test_the_description_carries_no_authority_of_its_own() -> None:
@@ -568,4 +598,6 @@ def test_the_effective_version_is_a_valid_cache_key_component() -> None:
         assert analysis_key("activity_1", "review_six", version)
 
     assert effective_prompt_version("no_such_scene", "x") is None
+
+
 

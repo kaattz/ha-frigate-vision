@@ -191,3 +191,41 @@ def test_activity_rejects_unknown_selection_source() -> None:
         models.ActivityRecord.from_dict(
             _standalone_payload() | {"selection_source": "guessed"}
         )
+
+
+def test_activity_accepts_nine_sample_times() -> None:
+    """A nine-cell sheet stores nine sample times, not six.
+
+    The sheet grew from 2x3 to 3x3, so the stored evidence offsets grow with it.
+    A whitelist of {0, 3, 6} would reject the record outright -- and it does so at
+    read time, on every load, which would look like a corrupted store rather than
+    a schema that had not been updated.
+    """
+    times = [100.0 + index * 5 for index in range(9)]
+    record = models.ActivityRecord.from_dict(
+        _standalone_payload() | {"sample_times": times}
+    )
+    assert record.sample_times == tuple(times)
+    assert models.ActivityRecord.from_dict(record.to_dict()) == record
+
+
+def test_activity_still_rejects_a_count_that_cannot_be_a_sheet() -> None:
+    """The count must remain one a contact sheet can actually be built from."""
+    with pytest.raises(models.ModelValidationError, match="invalid_sample_times"):
+        models.ActivityRecord.from_dict(
+            _standalone_payload()
+            | {"sample_times": [100.0 + index * 5 for index in range(7)]}
+        )
+
+
+def test_activity_still_rejects_unsorted_or_duplicate_sample_times() -> None:
+    with pytest.raises(models.ModelValidationError, match="invalid_sample_times"):
+        models.ActivityRecord.from_dict(
+            _standalone_payload()
+            | {"sample_times": [110.0, 100.0, 120.0, 130.0, 140.0, 150.0]}
+        )
+    with pytest.raises(models.ModelValidationError, match="invalid_sample_times"):
+        models.ActivityRecord.from_dict(
+            _standalone_payload()
+            | {"sample_times": [100.0, 100.0, 120.0, 130.0, 140.0, 150.0]}
+        )
