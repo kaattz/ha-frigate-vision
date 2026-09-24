@@ -377,6 +377,192 @@ def test_motion_selection_spreads_picks_inside_a_quiet_window() -> None:
     assert min(gaps) >= 2.0, f"picks clustered on adjacent instants: {picked}"
 
 
+def test_gap_probe_targets_the_widest_unobserved_stretch() -> None:
+    """Probes must land in the sheet's largest hole, not spread everywhere.
+
+    Measured on this deployment: the three motion picks leave holes of 12-39s,
+    and every such hole that was probed contained real change (mean greyscale
+    difference 2.45-85.66, against the component's own threshold of 1.0). So the
+    holes are not empty corridors -- something happens in them that the sheet
+    never shows.
+
+    Cell count is fixed at six, so the hole cannot be closed by adding a cell;
+    the picks have to be re-aimed. That needs frames, and frames cost fetches,
+    so the probing has to be aimed at one place: the widest gap.
+    """
+    from custom_components.frigate_vision.pathing import probe_gap_times
+
+    # One clearly widest hole: 50.0 -> 80.0 (30s), against 5-10s elsewhere.
+    sheet = (0.0, 5.0, 15.0, 25.0, 50.0, 80.0)
+    probes = probe_gap_times(sheet, max_gap=12.0, probes=4)
+
+    assert len(probes) == 4
+    for moment in probes:
+        assert 50.0 < moment < 80.0, f"probe {moment} escaped the widest gap"
+    assert list(probes) == sorted(probes)
+
+
+def test_gap_probe_is_skipped_when_no_hole_is_wide_enough() -> None:
+    """A tightly covered sheet must cost nothing.
+
+    Every probe is a snapshot fetch, and most activities do not need any: a hole
+    shorter than the shortest action worth seeing cannot be hiding one. Returning
+    nothing is how the caller avoids the work.
+    """
+    from custom_components.frigate_vision.pathing import probe_gap_times
+
+    sheet = (0.0, 5.0, 9.0, 13.0, 17.0, 20.0)
+    assert probe_gap_times(sheet, max_gap=12.0, probes=4) == ()
+
+
+def test_gap_probe_ignores_the_stretch_beyond_the_activity() -> None:
+    """The gap after the person left is not a gap.
+
+    The sheet's last two cells are the person's final frame and the emptied
+    scene, which are *meant* to be far apart: nothing happens in between by
+    definition. Probing there would spend fetches on an empty corridor and could
+    displace a pick that was covering the activity itself.
+
+    The fixture makes that the *only* qualifying hole, so a version that ignored
+    `within` would probe the postroll stretch and this test would see it.
+    """
+    from custom_components.frigate_vision.pathing import probe_gap_times
+
+    # Activity 0..20 is tightly covered (<=8s holes); the postroll cell sits
+    # 40s later, creating a 40s hole that must not be probed.
+    sheet = (0.0, 6.0, 12.0, 20.0, 60.0)
+
+    # Without the bound, the postroll hole is the widest and would win.
+    unbounded = probe_gap_times(sheet, max_gap=12.0, probes=4)
+    assert unbounded and all(moment > 20.0 for moment in unbounded), (
+        "fixture no longer isolates the postroll stretch"
+    )
+
+    # With the activity bound, there is no hole wide enough, so nothing is
+    # fetched -- and crucially nothing beyond the activity is probed either.
+    assert probe_gap_times(sheet, max_gap=12.0, probes=4, within=(0.0, 20.0)) == ()
+
+
+def test_gap_probe_respects_the_activity_bound_when_a_hole_remains() -> None:
+    """A qualifying hole inside the activity is still found when bounded."""
+    from custom_components.frigate_vision.pathing import probe_gap_times
+
+    # A 25s hole between 10 and 35, inside an activity that ends at 40.
+    sheet = (0.0, 10.0, 35.0, 40.0, 90.0)
+    probes = probe_gap_times(sheet, max_gap=12.0, probes=4, within=(0.0, 40.0))
+
+    assert len(probes) == 4
+    assert all(10.0 < moment < 35.0 for moment in probes), probes
+
+
+def test_picks_can_be_re_aimed_at_probed_frames() -> None:
+    """Probing is pointless unless the picks can actually move into the hole.
+
+    The measured holes cover most of an activity -- 19:05's picks left a 17.0s
+    hole in a 52.0s window -- so closing one necessarily means giving up a pick
+    somewhere else. Offering the probed instants as extra candidates is what lets
+    the same worst-gap rule decide that trade, rather than a second heuristic
+    guessing which cell to sacrifice.
+    """
+    from custom_components.frigate_vision.pathing import MotionPath, select_motion_times
+
+    # Movements cluster at the start; the tail from 30s on has none.
+    points = [(100.0 + index * 0.5, index * 0.4, 0.0) for index in range(8)]
+    path = MotionPath(start_time=100.0, end_time=160.0, points=tuple(points))
+
+    without = select_motion_times([path], lower=100.0, upper=160.0)
+    assert without is not None
+
+    # Frames found by probing the hole the picks left, with the change each one
+    # showed. Higher change means more happened there.
+    extra = ((135.0, 12.0), (145.0, 30.0), (155.0, 8.0))
+    with_probes = select_motion_times(
+        [path], lower=100.0, upper=160.0, extra=extra
+    )
+    assert with_probes is not None
+
+    def worst(picks) -> float:
+        edges = [100.0, *picks, 160.0]
+        return max(b - a for a, b in zip(edges, edges[1:], strict=False))
+
+    assert worst(with_probes) < worst(without), (
+        f"probing did not close the hole: {worst(without):.1f}s -> "
+        f"{worst(with_probes):.1f}s"
+    )
+
+
+def test_relative_weights_make_two_sources_comparable() -> None:
+    """Each source is scaled within itself, not against the other.
+
+    A path movement is normalised frame coordinates (measured on this deployment
+    at 0.01-0.15) and a greyscale change is 0-255 (measured at 2-85), so raw
+    values from the two are not comparable. Scaling each source to its own
+    maximum makes "how much happened here" mean the same thing in both.
+
+    Tested directly because the ranking it feeds is a *tie-break*: the gap rule
+    decides first, and two candidate sets tie on gaps only when their gap
+    sequences are identical, which real float timestamps essentially never
+    produce. A test routed through `select_motion_times` would therefore be
+    asserting on a branch it cannot reach.
+    """
+    from custom_components.frigate_vision.pathing import _relative_weights
+
+    movements = [(1.0, 0.05), (2.0, 0.10), (3.0, 0.025)]
+    changes = [(1.0, 40.0), (2.0, 80.0), (3.0, 20.0)]
+
+    weights = _relative_weights(movements)
+    assert weights == {1.0: 0.5, 2.0: 1.0, 3.0: 0.25}
+
+    # The same *shape* in the other source yields the same weights, which is the
+    # point: 80 is to changes what 0.10 is to movements.
+    assert _relative_weights(changes) == weights
+
+    # A source where nothing happened must not divide by zero, and must not
+    # pretend some instant was more notable than another.
+    assert _relative_weights([(1.0, 0.0), (2.0, 0.0)]) == {1.0: 0.0, 2.0: 0.0}
+    assert _relative_weights([]) == {}
+
+
+def test_probed_instants_can_win_a_slot_on_coverage_merit() -> None:
+    """A probe is a candidate like any other, judged by the same gap rule.
+
+    This is what probing actually buys: the detector reports where the *person*
+    moved, and a door opening while the person stands still produces no movement
+    at all. Adding the probed instants as candidates lets the existing rule close
+    a hole it could not otherwise close.
+    """
+    from custom_components.frigate_vision.pathing import MotionPath, select_motion_times
+
+    # Movement only in the first quarter of the window.
+    points = [(100.0 + index * 2.0, index * 0.05, 0.0) for index in range(8)]
+    path = MotionPath(start_time=100.0, end_time=160.0, points=tuple(points))
+
+    without = select_motion_times([path], lower=100.0, upper=160.0)
+    assert without is not None
+
+    # Three instants found by probing the hole, with the visible change each
+    # showed. The most recent one is the strongest, so it should be preferred.
+    extra = ((130.0, 4.0), (140.0, 9.0), (150.0, 30.0))
+    with_probes = select_motion_times(
+        [path], lower=100.0, upper=160.0, extra=extra
+    )
+    assert with_probes is not None
+
+    def worst(picks) -> float:
+        edges = [100.0, *picks, 160.0]
+        return max(b - a for a, b in zip(edges, edges[1:], strict=False))
+
+    assert worst(with_probes) < worst(without), (
+        f"probing did not close the hole: {worst(without):.1f}s -> "
+        f"{worst(with_probes):.1f}s"
+    )
+    probed = {moment for moment, _ in extra}
+    assert probed & set(with_probes), (
+        f"no probed instant was selected, so the hole was closed by motion "
+        f"alone: {with_probes}"
+    )
+
+
 def test_motion_selection_reports_when_it_cannot_fill_every_pick() -> None:
     """Too few distinct instants must fall back rather than repeat a frame.
 

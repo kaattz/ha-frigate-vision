@@ -10,7 +10,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
@@ -26,6 +26,7 @@ from .pathing import (
     InvalidPathData,
     MotionPath,
     parse_path_data,
+    probe_gap_times,
     select_motion_times,
 )
 from .store import ActivityStore
@@ -338,6 +339,36 @@ def select_review_change_frames(
     return [(timestamp, path) for _, timestamp, path, _ in selected]
 
 
+def _change_scores(
+    frames: Sequence[tuple[float, Path]],
+) -> list[tuple[float, float]]:
+    """Score each frame by how much it differs from its predecessor.
+
+    The same measure the fallback selector uses, applied to a probed stretch
+    rather than to a whole review: a probe is worth taking where the picture
+    changed, and that is what this reports. The first frame has no predecessor
+    and is scored against the second, so every probe carries a number and none
+    is silently dropped for being first.
+
+    Returns (timestamp, score) in the order given. An unreadable frame is
+    skipped rather than failing the activity -- probing is an improvement
+    attempt, and the caller keeps its original picks if this yields nothing.
+    """
+    scored: list[tuple[float, float]] = []
+    previous: Image.Image | None = None
+    try:
+        for timestamp, path in frames:
+            current = _grayscale_signature(path)
+            if previous is None:
+                previous = current
+                continue
+            scored.append((timestamp, _mean_difference(previous, current)))
+            previous = current
+    except MediaError:
+        return []
+    return scored
+
+
 def build_contact_sheet(
     frame_paths: Sequence[Path],
     output_path: Path,
@@ -400,6 +431,24 @@ def validate_unique_frames(frame_paths: Sequence[Path]) -> None:
 # Two frames closer than this mean greyscale distance would tell the vision
 # model it saw two moments when it saw one.
 UNIQUE_FRAME_THRESHOLD = 1.0
+
+# The widest unobserved stretch the sheet will tolerate before probing it.
+#
+# Measured on this deployment: the motion picks leave holes of 12-39s, and every
+# hole wider than this that was probed contained real change (mean greyscale
+# difference 2.45-85.66, against a threshold of 1.0). So the holes are not empty
+# corridors, and the detector is not seeing what the camera is.
+#
+# The bound is the whole economy of the feature: every probe costs a snapshot
+# fetch, and a hole shorter than the shortest action worth seeing cannot be
+# hiding one. A door opening, a hand-off, or a turn takes a few seconds, so a
+# hole under this many seconds is already unlikely to swallow one whole.
+MAX_SAMPLE_GAP = 12.0
+
+# Instants tried inside the widest hole. Three probes span the hole without
+# inviting a search: they are scored by the same change measure the fallback
+# selector uses, and only the best-scoring ones can displace a motion pick.
+GAP_PROBE_COUNT = 3
 
 # Seconds between the last tracked person sample and the postroll frame. The
 # postroll frame must stay after this point to keep showing the emptied scene.
@@ -740,6 +789,46 @@ class MediaManager:
             min(requested) - MAX_RECORDING_NUDGE,
             max(requested) + MAX_RECORDING_NUDGE,
         )
+        # Look for evidence the path data cannot see, before anything is built.
+        #
+        # The detector reports where the *person* moved, and the middle cells are
+        # chosen from that. But a door opening while the person stands still
+        # moves no path point at all, so the sheet's largest hole can be exactly
+        # where the decisive moment is. Measured on this deployment, every hole
+        # wider than MAX_SAMPLE_GAP contained real change.
+        #
+        # Runs after the recordings are known (the probes fall inside the person
+        # window, so coverage already covers them) and before the sheet is
+        # assembled, because re-aiming a pick changes which frames are needed.
+        # The probes are fetched into their own directory first: they need a
+        # place to land, and the main temporary directory is created below.
+        if plan.motion_times:
+            probe_dir = Path(
+                await self._hass.async_add_executor_job(
+                    partial(tempfile.mkdtemp, dir=self._root)
+                )
+            )
+            try:
+                filled = await self._async_fill_widest_gap(
+                    record.camera,
+                    probe_dir,
+                    plan,
+                    recordings,
+                    motion_paths,
+                )
+            finally:
+                await self._hass.async_add_executor_job(
+                    shutil.rmtree, probe_dir, True
+                )
+            if filled is not None and filled != plan.motion_times:
+                plan = replace(plan, motion_times=filled)
+                times = (
+                    plan.first_time,
+                    *plan.motion_times,
+                    plan.last_time,
+                    plan.postroll_time,
+                )
+                requested = tuple(times)
         # A required frame inside a recording hole cannot be discarded the way a
         # change candidate can, so it is nudged to the nearest covered instant
         # first. Coverage is then checked on what actually must be present.
@@ -913,6 +1002,90 @@ class MediaManager:
             if role in {"first", "last", "postroll"}
         }
         return tuple(result), fixed, nudges
+
+    async def _async_fill_widest_gap(
+        self,
+        camera: str,
+        temporary: Path,
+        plan: EvidencePlan,
+        recordings: Sequence[Mapping[str, Any]],
+        motion_paths: Mapping[str, MotionPath] | None = None,
+    ) -> tuple[float, ...] | None:
+        """Re-aim the middle picks using evidence found inside the widest hole.
+
+        The sheet's middle cells come from the person's motion path. The detector
+        reports where the *person* moved, which is not where the *picture*
+        changed: a door opening while the person stands still produces no path
+        movement, and the moment the entry door opened on this deployment fell
+        inside a 33.3s hole exactly that way. The model, shown no frame of it,
+        called a person walking out a `home_arrival`.
+
+        This probes the widest hole for visible change and offers what it finds
+        back to the same selection rule, so the trade between covering the
+        activity and covering the moment is made by one rule rather than two.
+
+        Returns None when there is nothing to do -- no hole wide enough, no
+        frames retrievable, or no visible change in the hole. A failure here must
+        not lose the sheet: the caller keeps the original picks in every one of
+        those cases.
+        """
+        probes = probe_gap_times(
+            (plan.first_time, *plan.motion_times, plan.last_time),
+            max_gap=MAX_SAMPLE_GAP,
+            probes=GAP_PROBE_COUNT,
+            # The postroll cell sits beyond the activity on purpose, so the
+            # stretch before it is not a hole to fill.
+            within=(plan.first_time, plan.last_time),
+        )
+        if not probes:
+            return None
+
+        covered = self._coverage_intervals(recordings)
+        fetchable = [
+            moment
+            for moment in probes
+            if any(start <= moment <= end for start, end in covered)
+        ]
+        if len(fetchable) < 2:
+            # Fewer than two frames cannot show a change, and one is not worth
+            # the fetch.
+            return None
+
+        frames: list[tuple[float, Path]] = []
+        for index, moment in enumerate(fetchable):
+            try:
+                data = await self._client.async_get_snapshot(camera, moment, 360)
+            except (FrigateApiError, OSError):
+                continue
+            path = temporary / f"probe-{index}.jpg"
+            await self._hass.async_add_executor_job(path.write_bytes, data)
+            frames.append((moment, path))
+        if len(frames) < 2:
+            return None
+
+        changes = await self._hass.async_add_executor_job(_change_scores, frames)
+        if not changes:
+            return None
+
+        # A night-vision probe is not comparable to a colour one, so a hole that
+        # only yielded IR frames is left alone rather than trusted.
+        usable = [
+            (moment, score)
+            for moment, score in changes
+            if not await self._hass.async_add_executor_job(
+                frame_is_infrared, dict(frames)[moment]
+            )
+        ]
+        if not usable:
+            return None
+
+        return select_motion_times(
+            list(motion_paths.values()) if motion_paths else [],
+            count=len(plan.motion_times),
+            lower=plan.first_time,
+            upper=plan.last_time,
+            extra=usable,
+        )
 
     @staticmethod
     def _coverage_intervals(

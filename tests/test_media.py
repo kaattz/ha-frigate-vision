@@ -457,6 +457,183 @@ def _motion_points() -> list[list[object]]:
     return [[[float(index), 0.0], 103.0 + index] for index in range(7)]
 
 
+async def test_review_probes_the_widest_hole_and_reselects(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """The fill step must actually reach the sheet, not just exist.
+
+    The unit tests cover `probe_gap_times` and the `extra` candidates in
+    isolation. Neither proves the pipeline calls them: the earlier scene-
+    description work shipped a capability that was defined and then never wired,
+    and it failed silently for days.
+
+    The fixture gives the camera a scene that changes *only* in the stretch where
+    the person was not moving, which is the measured failure mode -- an entry
+    door opening while the detector had nothing to track. The path points stay
+    still, so only probing can find it.
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    # A window wide enough for the real 46s span: the hole only exists because
+    # the activity is long and the movements cluster in its first half.
+    record = ActivityRecord(
+        activity_id="review_entry_1_front_review_hole",
+        entry_id="entry_1",
+        source=ActivitySource.STANDALONE_REVIEW,
+        stage=ActivityStage.SEALED,
+        processing_mode=ProcessingMode.OBSERVE,
+        created_at=102,
+        updated_at=152,
+        camera="front",
+        review_ids=("review_hole",),
+        detection_ids=("event_1",),
+        finalization_deadline=152,
+    )
+    await store.async_create(record)
+
+    # Built from the measured movement list of activity 19:05 on this
+    # deployment, at its real 46s span. Compressing it into the record's usual
+    # 14s window destroys the very thing under test: the selector spreads picks
+    # to minimise the largest gap, so a short window simply has no hole left to
+    # probe. The hole only exists because the activity is long and the movements
+    # cluster early.
+    class Client:
+        snapshot_calls = 0
+        probed: list[float] = []
+
+        async def async_get_event(self, event_id: str, camera: str):
+            relative = (
+                (0.20, 0.0127),
+                (1.79, 0.0853),
+                (5.60, 0.0611),
+                (21.36, 0.0581),
+                (23.34, 0.0851),
+                (23.70, 0.0902),
+                (34.08, 0.0797),
+                (34.48, 0.0906),
+                (35.08, 0.1516),
+                (41.27, 0.1361),
+                (41.49, 0.0093),
+                (42.47, 0.1236),
+                (42.88, 0.0672),
+                (43.27, 0.0612),
+                (45.05, 0.0706),
+            )
+            points: list[list[object]] = [[[0.0, 0.0], 103.0]]
+            x = 0.0
+            for offset, distance in relative:
+                x += distance
+                points.append([[x, 0.0], 103.0 + offset])
+            return {
+                "id": event_id,
+                "camera": camera,
+                "label": "person",
+                "start_time": 103,
+                "end_time": 150,
+                "data": {"path_data": points},
+            }
+
+        async def async_get_recordings(self, camera: str, after: float, before: float):
+            return [{"start_time": after - 1, "end_time": before + 1}]
+
+        async def async_get_snapshot(self, camera: str, timestamp: float, height: int):
+            self.snapshot_calls += 1
+            # A flash standing for the entry door opening: the person was inside
+            # and still, so no path point reports it. It sits inside the hole the
+            # motion picks leave (roughly 108.6..124.4), which is the point.
+            if 110.0 < timestamp < 122.0:
+                return _jpeg(235)
+            return _changing_jpeg(timestamp)
+
+    client = Client()
+    manager = MediaManager(
+        hass, store, client, tmp_path, ZoneRoles(frozenset(), frozenset(), frozenset())
+    )
+    completed = await manager.async_build(record.activity_id)
+
+    assert completed.stage is ActivityStage.EVIDENCE_READY
+    assert len(completed.sample_times) == 6
+    # Probing costs extra fetches; without them the count would be exactly six.
+    assert client.snapshot_calls > 6, (
+        "no probe was fetched, so the fill step never ran"
+    )
+    # The property that matters, and the one the reported failure violated: some
+    # cell now sits strictly *inside* the hole. Without probing the three middle
+    # picks are 108.6, 124.4 and 137.1 -- the first two exactly at the hole's
+    # edges -- so nothing observed the 15.8s in between. Asserting on the hole
+    # rather than on a specific instant keeps this true wherever inside it the
+    # selector chooses to aim, since the flash also moves the scores and so the
+    # selection.
+    assert any(112.0 < moment < 122.0 for moment in completed.sample_times), (
+        f"the hole is still unobserved: {completed.sample_times}"
+    )
+
+
+async def test_review_keeps_its_picks_when_probing_finds_nothing(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """A failed probe must not lose the sheet.
+
+    Probing is an improvement attempt. When it yields nothing usable the original
+    motion picks have to survive intact -- a sheet built from a hole full of
+    static frames would be worse than one that never looked.
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _standalone_record()
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            relative = (
+                (0.20, 0.0127),
+                (1.79, 0.0853),
+                (5.60, 0.0611),
+                (21.36, 0.0581),
+                (23.34, 0.0851),
+                (34.08, 0.0797),
+                (35.08, 0.1516),
+                (41.27, 0.1361),
+                (42.47, 0.1236),
+                (45.05, 0.0706),
+            )
+            scale = 14.0 / 46.26
+            points: list[list[object]] = [[[0.0, 0.0], 103.0]]
+            x = 0.0
+            for offset, distance in relative:
+                x += distance
+                points.append([[x, 0.0], 103.0 + offset * scale])
+            return {
+                "id": event_id,
+                "camera": camera,
+                "label": "person",
+                "start_time": 103,
+                "end_time": 117,
+                "data": {"path_data": points},
+            }
+
+        async def async_get_recordings(self, camera: str, after: float, before: float):
+            return [{"start_time": after - 1, "end_time": before + 1}]
+
+        async def async_get_snapshot(self, camera: str, timestamp: float, height: int):
+            # Fail only the probes. The real cells are at the motion picks and at
+            # the window edges, so a band strictly inside the hole hits probes
+            # without touching a required frame.
+            if 105.0 < timestamp < 108.5:
+                raise OSError("no recording at this instant")
+            return _changing_jpeg(timestamp)
+
+    client = Client()
+    manager = MediaManager(
+        hass, store, client, tmp_path, ZoneRoles(frozenset(), frozenset(), frozenset())
+    )
+    completed = await manager.async_build(record.activity_id)
+
+    assert completed.stage is ActivityStage.EVIDENCE_READY
+    assert len(completed.sample_times) == 6
+    assert completed.selection_source == "path_motion"
+
+
 async def test_review_path_motion_downloads_exactly_six_frames(
     hass: HomeAssistant, tmp_path
 ) -> None:
