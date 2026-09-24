@@ -255,3 +255,12 @@ def test_a_classification_with_a_control_character_is_still_rejected() -> None:
         models.ActivityRecord.from_dict(
             _standalone_payload() | {"classification": "bad\x00label"}
         )
+    # C1 控制字符与 Unicode 行/段分隔符。U+2028/U+2029 是 JavaScript 的行
+    # 终止符，会真的终止 JS 语句，而分类值会流向 HA 前端与蓝图模板。
+    for bad in ("nel\u0085x", "ls\u2028x", "ps\u2029x"):
+        with pytest.raises(
+            models.ModelValidationError, match="invalid_classification"
+        ):
+            models.ActivityRecord.from_dict(
+                _standalone_payload() | {"classification": bad}
+            )
