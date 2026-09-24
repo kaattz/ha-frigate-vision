@@ -18,6 +18,7 @@ from homeassistant.config_entries import ConfigFlowResult
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.selector import SelectOptionDict
 from yarl import URL
 
 from .const import (
@@ -31,6 +32,8 @@ from .const import (
     CONF_LLM_BASE_URL,
     CONF_LLM_BASE_URL_DEFAULT,
     CONF_LLM_MODEL,
+    CONF_LLM_PROVIDER,
+    CONF_LLM_PROVIDER_DEFAULT,
     CONF_LLM_REASONING_EFFORT,
     CONF_LLM_THINKING,
     CONF_MQTT_TOPIC_PREFIX,
@@ -40,6 +43,7 @@ from .const import (
     CONF_TRANSITION_ZONES,
     DOMAIN,
     PROCESSING_MODES,
+    PROVIDER_PRESETS,
 )
 from .vision import (
     REASONING_EFFORTS,
@@ -130,6 +134,77 @@ def _options_schema() -> vol.Schema:
             ),
             vol.Required("analyze_night_unknown", default=True): bool,
             vol.Required("analyze_all_far_reviews", default=True): bool,
+        }
+    )
+
+
+# Text carried by each dropdown row. Keyed separately from the preset so a row's
+# wording can change without touching the URL it selects.
+_PROVIDER_LABELS = {
+    "deepseek": "DeepSeek（api.deepseek.com）",
+    "gemini": "Google Gemini（OpenAI 兼容接口）",
+    "glm": "智谱 GLM（open.bigmodel.cn）",
+    "openai": "OpenAI（api.openai.com）",
+}
+
+
+def _provider_options() -> list[SelectOptionDict]:
+    """Build the provider dropdown, labelled rather than keyed.
+
+    Labels carry text because an option labelled with the raw key renders as a
+    blank row in this deployment (the same reason the options menu passes a dict).
+    """
+    options: list[SelectOptionDict] = [
+        {"value": name, "label": _PROVIDER_LABELS.get(name, name)}
+        for name in PROVIDER_PRESETS
+    ]
+    options.append({"value": "custom", "label": "其他 / Other (type a URL)"})
+    return options
+
+
+def _preset_base_url(provider: str) -> str | None:
+    """The URL a chosen provider implies, or None when it implies nothing.
+
+    `custom` is deliberately absent from the presets: the URL field is free text,
+    and an unknown choice must leave whatever the user typed alone rather than
+    blanking a working endpoint.
+    """
+    preset = PROVIDER_PRESETS.get(provider)
+    return preset["base_url"] if preset else None
+
+
+def _llm_schema() -> vol.Schema:
+    """The provider step: a preset to pick, and a URL that stays editable.
+
+    The URL is the field most easily got wrong -- it must be the OpenAI-compatible
+    root, and providers disagree about the shape, so it is worth choosing from a
+    list. It remains free text because a local router or reverse proxy is a normal
+    deployment (this one runs that way), and a preset only pre-fills it.
+    """
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_LLM_PROVIDER, default=CONF_LLM_PROVIDER_DEFAULT
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=_provider_options())
+            ),
+            vol.Required(
+                CONF_LLM_BASE_URL, default=CONF_LLM_BASE_URL_DEFAULT
+            ): _text(),
+            vol.Required(CONF_LLM_API_KEY): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+            ),
+            vol.Required(CONF_LLM_MODEL): _text(),
+            vol.Required(
+                CONF_LLM_REASONING_EFFORT, default="default"
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=list(REASONING_EFFORTS))
+            ),
+            vol.Required(
+                CONF_LLM_THINKING, default="default"
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=list(THINKING_MODES))
+            ),
         }
     )
 
@@ -392,8 +467,35 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
+        suggestions: dict[str, Any] = {}
         if user_input is not None:
-            base_url = str(user_input.get(CONF_LLM_BASE_URL, "")).strip()
+            # A provider chosen on its own pre-fills the URL and returns the form,
+            # so the URL is filled in rather than typed from memory. Submitting the
+            # provider together with a URL means it is the final answer.
+            provider = str(user_input.get(CONF_LLM_PROVIDER, "")).strip()
+            preset_url = _preset_base_url(provider)
+            typed_url = str(user_input.get(CONF_LLM_BASE_URL, "")).strip()
+            wants_only_the_preset = (
+                preset_url is not None
+                and not typed_url
+                and not str(user_input.get(CONF_LLM_API_KEY, "")).strip()
+            )
+            if wants_only_the_preset:
+                return self.async_show_form(
+                    step_id="llmvision",
+                    data_schema=self.add_suggested_values_to_schema(
+                        _llm_schema(),
+                        {
+                            CONF_LLM_PROVIDER: provider,
+                            CONF_LLM_BASE_URL: preset_url,
+                        },
+                    ),
+                    errors=errors,
+                )
+            # A provider picked from the list is authoritative for the URL: the
+            # field is pre-filled, so leaving the old value in place would silently
+            # send requests to the previous provider.
+            base_url = typed_url or (preset_url or "")
             model = str(user_input.get(CONF_LLM_MODEL, "")).strip()
             api_key = str(user_input.get(CONF_LLM_API_KEY, "")).strip()
             if not base_url or not model:
@@ -413,29 +515,15 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
                     ),
                 }
                 return await self.async_step_options()
-        schema = vol.Schema(
-            {
-                vol.Required(
-                    CONF_LLM_BASE_URL, default=CONF_LLM_BASE_URL_DEFAULT
-                ): _text(),
-                vol.Required(CONF_LLM_API_KEY): selector.TextSelector(
-                    selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
-                ),
-                vol.Required(CONF_LLM_MODEL): _text(),
-                vol.Required(
-                    CONF_LLM_REASONING_EFFORT, default="default"
-                ): selector.SelectSelector(
-                    selector.SelectSelectorConfig(options=list(REASONING_EFFORTS))
-                ),
-                vol.Required(
-                    CONF_LLM_THINKING, default="default"
-                ): selector.SelectSelector(
-                    selector.SelectSelectorConfig(options=list(THINKING_MODES))
-                ),
+            suggestions = {
+                CONF_LLM_PROVIDER: provider,
+                CONF_LLM_BASE_URL: base_url,
+                CONF_LLM_MODEL: model,
             }
-        )
         return self.async_show_form(
-            step_id="llmvision", data_schema=schema, errors=errors
+            step_id="llmvision",
+            data_schema=self.add_suggested_values_to_schema(_llm_schema(), suggestions),
+            errors=errors,
         )
 
     async def async_step_options(

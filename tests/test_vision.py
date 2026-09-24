@@ -59,6 +59,60 @@ def test_a_direction_is_accepted_for_a_review_analysis() -> None:
     assert confidence == 74
 
 
+def test_a_prose_answer_in_the_household_format_is_rejected() -> None:
+    """A human-readable answer format cannot be stored, however good it reads.
+
+    Recorded because it is the obvious thing to try: a prompt whose output section
+    asks for `事件类型：回家` on one line and `事件描述：...` on the next, written in
+    Chinese with no JSON. That is a perfectly clear instruction for a person, and
+    the answers it produces are exactly the labels the integration wants -- but the
+    reply is not the three-field object the rest of the pipeline reads, so it fails
+    before any of that prose is looked at.
+
+    The rejection is deliberate rather than a gap: `confidence` has no place in a
+    prose format, and the notification, the stored record and the blueprint all key
+    off the classification enum. What is worth keeping from such a prompt is its
+    *content* -- the scene layout, the time order, the wording of the categories --
+    which can travel in the existing structure.
+    """
+    from custom_components.frigate_vision.vision import (
+        MODE_CLASSIFICATIONS,
+    )
+
+    review = MODE_CLASSIFICATIONS["review_six"]
+    prose = (
+        "事件类型：离家\n"
+        "事件描述：一名男子从左侧入户门走出，随后走向中央电梯。"
+    )
+    with pytest.raises(VisionError, match="invalid_llm_response"):
+        validate_response(_body(prose), review)
+
+
+def test_a_chinese_label_is_not_silently_mapped_to_an_enum() -> None:
+    """The category words must not be accepted in place of the stored values.
+
+    `回家` and `home_arrival` mean the same thing to a reader, and the prompt the
+    household wrote offers the Chinese forms. Accepting them would need a
+    translation table in the validator, and a wrong or missing entry there would
+    file an activity under the wrong label -- a silent, stored error rather than a
+    visible failure. So the mapping lives in the prompt (which tells the model
+    which value to emit) and the validator stays strict.
+    """
+    from custom_components.frigate_vision.vision import (
+        MODE_CLASSIFICATIONS,
+    )
+
+    review = MODE_CLASSIFICATIONS["review_six"]
+    with pytest.raises(VisionError, match="invalid_llm_response"):
+        validate_response(
+            _body(
+                '{"classification":"回家",'
+                '"description":"人物进入门内。","confidence":80}'
+            ),
+            review,
+        )
+
+
 def test_settings_entered_only_in_options_still_count_as_configured() -> None:
     """A UI-configured entry must produce a client.
 

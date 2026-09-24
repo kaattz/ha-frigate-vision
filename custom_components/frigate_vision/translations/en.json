@@ -32,10 +32,16 @@
       "llmvision": {
         "title": "Vision provider",
         "data": {
+          "llm_provider": "Provider",
           "llm_base_url": "Base URL",
           "llm_api_key": "API key",
           "llm_model": "Model",
-          "llm_thinking": "Reasoning"
+          "llm_reasoning_effort": "Reasoning effort",
+          "llm_thinking": "Reasoning mode"
+        },
+        "data_description": {
+          "llm_provider": "Picking a provider fills in its OpenAI-compatible base URL. The URL stays editable, for a local router or reverse proxy.",
+          "llm_reasoning_effort": "Lower effort cuts cost while keeping reasoning intact. Use Reasoning mode to turn it off entirely, but note that disabling it makes multi-step tasks fail."
         }
       },
       "options": {
