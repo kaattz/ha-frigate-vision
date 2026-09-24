@@ -142,7 +142,11 @@ Home Assistant 自定义集成（HACS）：把**任意受监控区域的活动**
 https://github.com/kaattz/ha-frigate-vision/blob/main/blueprints/automation/frigate_vision/activity_notification.yaml
 ```
 
-蓝图监听 `frigate_vision_activity` 事件，负责分类过滤、静音时段、标题正文格式、证据图与录像链接，并在动作执行后调用 `ack_delivery`。集成本身**不硬编码任何 notify 服务**。
+蓝图监听 `frigate_vision_activity` 事件，负责静音时段、标题正文格式、证据图与录像链接，并在动作执行后调用 `ack_delivery`。集成本身**不硬编码任何 notify 服务**。
+
+> **蓝图不按分类过滤。** 早期版本提供一个可勾选的分类白名单，但它是一份**分类列表的静态副本**：集成新增分类后，已保存的勾选不会自动更新。HA 的 `BlueprintInputs.validate()` 只拒绝*缺失*的 input，多出来的 input 不报错，于是事件照常分析、照常投递，却在蓝图里被**静默丢弃**——实测某天上午 5 条活动只送达 2 条，丢失的 2 条都是后来新增的分类。
+>
+> 现在只保留静音时段：集成本身已通过 `min_review_seconds` 与 `analyze_all_far_reviews` 决定什么值得分析，再放一份手工维护的清单只会多一条静默丢事件的路径。若你确实想按分类分流，请在自己的自动化动作里判断 `trigger.event.data.classification`。
 
 蓝图内附带的录像链接走 HA 自身的鉴权代理（`/api/frigate_vision/clip/<entry_id>/<activity_id>.mp4`），因此外网也能打开，且不会把 Frigate 暴露到公网。
 
