@@ -3,25 +3,6 @@ blueprint:
   domain: automation
   source_url: https://github.com/kaattz/ha-frigate-vision/blob/main/blueprints/automation/frigate_vision/activity_notification.yaml
   input:
-    classifications:
-      name: Classifications
-      default: []
-      selector:
-        select:
-          multiple: true
-          options:
-            - home_arrival
-            - home_departure
-            - short_roundtrip
-            - package_delivery
-            - food_delivery
-            - cleaning
-            - maintenance
-            - visitor
-            - elevator_activity
-            - suspicious_activity
-            - unknown_activity
-            - unable_to_confirm
     quiet_start:
       name: Quiet start
       default: "00:00:00"
@@ -54,7 +35,6 @@ trigger:
   - platform: event
     event_type: frigate_vision_activity
 variables:
-  allowed_classifications: !input classifications
   quiet_start: !input quiet_start
   quiet_end: !input quiet_end
   title_prefix: !input title_prefix
@@ -106,13 +86,21 @@ variables:
   # verdict that is already the best reading available.
   notification_message: >-
     {{ description if description | length > 0 else '（无文字描述）' }}
+  # Only the quiet window can suppress a notification. The classification is a
+  # label for the reader, never a gate: a whitelist here is a *copy* of the
+  # integration's classification list, and nothing updates that copy when the
+  # integration learns a new word. Measured on this deployment, one morning
+  # produced five person reviews and only two arrived -- both missing ones were
+  # `elevator_activity`, a classification the scene had gained after the
+  # whitelist was written. The event was analysed, delivered, and then dropped by
+  # a stale list, which is invisible from the user's side: the notification
+  # simply never comes.
   should_notify: >-
-    {% set classification_allowed = allowed_classifications | length == 0 or classification in allowed_classifications %}
-      {% set start = today_at(quiet_start) %}
-      {% set end = today_at(quiet_end) %}
+    {% set start = today_at(quiet_start) %}
+    {% set end = today_at(quiet_end) %}
     {% set outside_quiet = start == end or (not (start <= now() < end) if start < end
        else not (now() >= start or now() < end)) %}
-    {{ classification_allowed and outside_quiet }}
+    {{ outside_quiet }}
 action:
   - choose:
       - conditions:
