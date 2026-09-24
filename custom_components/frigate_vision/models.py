@@ -12,6 +12,9 @@ from typing import Any, Self
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,192}$")
 SAFE_SIDE_EFFECT_KEY = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+# 分类值允许中文：用户要能写「宠物」而不必被迫写 ASCII。
+# 比 SAFE_ID 宽，但仍拒绝控制字符与换行——那些会真的破坏通知显示和日志。
+SAFE_CLASSIFICATION = re.compile(r"^[^\x00-\x1f\x7f]{1,192}$")
 
 
 class ModelValidationError(ValueError):
@@ -340,7 +343,7 @@ class ActivityRecord:
             self.prompt_version
         ):
             raise ModelValidationError("invalid_prompt_version")
-        if self.classification is not None and not SAFE_ID.fullmatch(
+        if self.classification is not None and not SAFE_CLASSIFICATION.fullmatch(
             self.classification
         ):
             raise ModelValidationError("invalid_classification")

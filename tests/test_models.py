@@ -229,3 +229,29 @@ def test_activity_still_rejects_unsorted_or_duplicate_sample_times() -> None:
             _standalone_payload()
             | {"sample_times": [100.0, 100.0, 120.0, 130.0, 140.0, 150.0]}
         )
+
+
+def test_a_chinese_classification_is_accepted() -> None:
+    """标签名允许中文：用户要能写「宠物」而不是被迫写 `pet_only`。
+
+    实测：分类值只在 models.py 一处被 SAFE_ID 挡下，而它不进入任何存储键
+    （analysis_key 只用 activity_id/scene_mode/prompt_version），所以放宽它
+    不影响缓存与幂等，历史记录也不受影响。
+    """
+    record = models.ActivityRecord.from_dict(
+        _standalone_payload() | {"classification": "宠物"}
+    )
+    assert record.classification == "宠物"
+    assert models.ActivityRecord.from_dict(record.to_dict()) == record
+
+
+def test_a_classification_with_a_control_character_is_still_rejected() -> None:
+    """放宽字母表不等于允许任意字符串：换行与控制字符会破坏显示和日志。"""
+    with pytest.raises(models.ModelValidationError, match="invalid_classification"):
+        models.ActivityRecord.from_dict(
+            _standalone_payload() | {"classification": "宠物\n无人"}
+        )
+    with pytest.raises(models.ModelValidationError, match="invalid_classification"):
+        models.ActivityRecord.from_dict(
+            _standalone_payload() | {"classification": "bad\x00label"}
+        )
