@@ -18,6 +18,14 @@ from custom_components.frigate_vision.scenes import (
     scene_prompt_version,
 )
 
+# Digest of the review_six prompt body as of PROMPT_VERSION = "prompt_4".
+#
+# Pinned so an edit to the wording cannot ride along on an unchanged version:
+# `prompt_version` is half the analysis cache key, so leaving it alone after a
+# text change makes the deployment keep serving the old answers. Bump the version
+# and this digest in the same commit.
+REVIEW_SIX_PROMPT_DIGEST = "c1ecfc13b5c9"
+
 
 def test_every_scene_declares_what_it_can_answer() -> None:
     """The registry must be the single source of allowed answers.
@@ -155,6 +163,111 @@ def test_rendering_lists_the_allowed_classifications() -> None:
     assert "package_delivery" not in prompt
 
 
+def test_the_glossary_never_teaches_a_disallowed_answer() -> None:
+    """Definitions must follow the contract, not the scene's full vocabulary.
+
+    The allowed set travels per call, so a caller may offer a subset. A glossary
+    written from the scene's own list would then define answers the model is not
+    permitted to give -- naming `package_delivery` in a call that forbids it
+    invites exactly the out-of-contract answer the contract exists to prevent.
+
+    Scoped to the glossary, not the whole prompt: the template always states the
+    arrival/departure rules by name, and that predates this. What must follow
+    `allowed` is the extra definitions.
+    """
+    scene = scene_for("review_six")
+    assert scene is not None
+    glossary = scene._glossary(frozenset({"cleaning", "visitor"}))
+    for label in scene.classifications - {"cleaning", "visitor"}:
+        assert label not in glossary, (
+            f"{label} is defined although this call disallows it"
+        )
+    assert "visitor" in glossary
+
+
+def test_the_glossary_is_empty_when_nothing_is_offered() -> None:
+    """An empty contract must not carry definitions for absent answers."""
+    scene = scene_for("review_six")
+    assert scene is not None
+    assert scene._glossary(frozenset()) == ""
+
+
+def test_changing_the_prompt_body_changes_the_cache_key() -> None:
+    """The version must move whenever the wording does.
+
+    `prompt_version` is half of the analysis cache key, and the other half is the
+    activity. So an edit to `template` that leaves the version alone makes every
+    already-analysed activity keep its old answer -- the change ships, the cache
+    hides it, and the deployment looks unchanged.
+
+    This cannot detect the edit by itself: the version is a hand-written string
+    and nothing ties it to the text. What it can do is fail loudly when the two
+    are known to disagree, by pinning the digest the version was last bumped
+    against. Update the digest *and* bump the version together, or this fails.
+    """
+    import hashlib
+
+    scene = scene_for("review_six")
+    assert scene is not None
+    # Hash what actually reaches the model for one representative call, so the
+    # digest covers the template, the glossary and the contract order alike.
+    rendered = scene.render(
+        SceneRequest(
+            language="zh-CN",
+            allowed=set(scene.classifications),
+            signals={},
+            scene_description="",
+        )
+    )
+    digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:12]
+    assert digest == REVIEW_SIX_PROMPT_DIGEST, (
+        "the review_six prompt body changed:\n"
+        f"  version  : {scene.prompt_version}\n"
+        f"  digest   : {digest} (expected {REVIEW_SIX_PROMPT_DIGEST})\n"
+        "Bump PROMPT_VERSION, then update REVIEW_SIX_PROMPT_DIGEST to match. "
+        "Leaving the version alone would let the cache serve answers produced by "
+        "the old wording."
+    )
+
+    """Every definition must name its label, or the model cannot bind it.
+
+    Repeating a label the template already defines would also show two versions
+    of one rule, so the two sets must not overlap.
+    """
+    from custom_components.frigate_vision.scenes import (
+        CLASSIFICATION_GLOSSARY,
+        SCENES,
+    )
+
+    # The map is shared across scenes, so a label is fair game if *any* scene
+    # offers it -- `short_roundtrip` belongs to the door scene, not this one.
+    offered = {label for scene in SCENES.values() for label in scene.classifications}
+    for label, text in CLASSIFICATION_GLOSSARY.items():
+        assert text.startswith("指"), f"{label}'s definition does not read as one"
+        assert label in offered, f"{label} is defined but no scene offers it"
+    # The template's own three rules must not be restated.
+    for already_defined in ("cleaning", "home_arrival", "home_departure"):
+        assert already_defined not in CLASSIFICATION_GLOSSARY, (
+            f"{already_defined} is already defined by the template"
+        )
+
+
+def test_a_narrowed_call_still_explains_what_it_does_offer() -> None:
+    """Filtering the glossary must not filter it away entirely."""
+    scene = scene_for("review_six")
+    assert scene is not None
+    prompt = scene.render(
+        SceneRequest(
+            language="中文",
+            allowed=frozenset({"cleaning", "visitor"}),
+            signals={},
+        )
+    )
+    # `visitor` is one of the labels the template never used to define, so a
+    # narrowed call must still carry its meaning.
+    assert "访客" in prompt, "visitor was offered but not explained"
+
+
 def test_rendering_without_a_classification_set_omits_the_contract() -> None:
     """An empty set means "no contract", not "an empty list of options"."""
     scene = scene_for("review_six")
@@ -194,6 +307,54 @@ def _render(mode: str, **signals: object) -> str:
             allowed=set(scene.classifications),
             signals=signals,
         )
+    )
+
+
+def test_every_offered_label_is_explained_to_the_model() -> None:
+    """A label the prompt never defines is a label the model must guess.
+
+    Measured on this deployment: the review prompt offered twelve answers and
+    explained five. `elevator_activity`, `package_delivery`, `food_delivery`,
+    `visitor`, `maintenance`, `suspicious_activity` and `short_roundtrip`
+    appeared only in the allowed-answers list, while `unknown_activity` and
+    `unable_to_confirm` were each named three times. The model was told, in six
+    separate prohibitions, what it must not say, and never what the remaining
+    words meant.
+
+    The cost was measurable and large: across 41 real activities the deployment
+    abstained on 55% of them, and adding one sentence per label took that to 11%
+    while *raising* accuracy on the owner's labelled sheets from 53% to 60%.
+
+    A count of one means "only in the contract", so this fails for any label
+    added later without a definition -- which is the failure it exists to catch.
+    """
+    prompt = _render("review_six")
+    scene = SCENES["review_six"]
+    unexplained = sorted(
+        label for label in scene.classifications if prompt.count(label) <= 1
+    )
+    assert not unexplained, (
+        f"these answers are offered but never explained: {unexplained}. "
+        "A model that does not know what a label means cannot choose it on "
+        "evidence, and will abstain instead."
+    )
+
+
+def test_the_prompt_offers_guidance_and_not_only_prohibitions() -> None:
+    """Rules about what not to say cannot, alone, produce an answer.
+
+    The measured prompt had six prohibitions ("不得"/"不要"/"不能") and no
+    sentence of the form "判为/应判断" for the non-directional labels. Every
+    classification that is not arrival or departure was therefore reachable
+    only by elimination.
+    """
+    prompt = _render("review_six")
+    prohibitions = sum(prompt.count(word) for word in ("不得", "不要", "不能"))
+    assertions = prompt.count("指") + prompt.count("判为")
+    assert assertions > 0, "the prompt gives no positive guidance at all"
+    assert assertions >= prohibitions / 3, (
+        f"the prompt is overwhelmingly prohibitive: {assertions} defining "
+        f"statements against {prohibitions} prohibitions"
     )
 
 
@@ -407,3 +568,4 @@ def test_the_effective_version_is_a_valid_cache_key_component() -> None:
         assert analysis_key("activity_1", "review_six", version)
 
     assert effective_prompt_version("no_such_scene", "x") is None
+

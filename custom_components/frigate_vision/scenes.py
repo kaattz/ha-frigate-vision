@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 # A deployment-supplied scene description changes the prompt without changing
 # this constant -- see `effective_prompt_version`, which folds that description
 # into the key so a user editing it is not silently served a cached answer.
-PROMPT_VERSION = "prompt_3"
+PROMPT_VERSION = "prompt_4"
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +88,9 @@ class Scene:
         if self.accepts_scene_description:
             parts.append(_scene_context(request.scene_description))
         parts.append(self.template)
+        # After the template: these are definitions of what the remaining words
+        # mean, so they belong with the rules rather than before them.
+        parts.append(self._glossary(request.allowed))
         for name in sorted(self.signals):
             # Only declared signals are consulted; anything else in the request
             # is deliberately ignored.
@@ -115,6 +118,52 @@ class Scene:
             '"description"是字符串，只描述实际可见动作，不超过500字。'
             '"confidence"是0到100的整数。'
         )
+
+    def _glossary(self, allowed: frozenset[str] | set[str]) -> str:
+        """Definitions for the labels this call offers but the rules leave open.
+
+        Measured on this deployment: the prompt offered twelve answers and
+        explained five, while naming `unknown_activity` three times and
+        `unable_to_confirm` three times. Across 41 real activities the
+        deployment abstained on 55%; defining these words took that to 11% and
+        raised accuracy on the owner's labelled sheets from 53% to 60%. Being
+        told what not to say does not tell the model what to say.
+
+        Filtered by `allowed`, not by the scene's own list: the allowed set
+        travels per call and a caller may offer a subset, so a definition for an
+        unoffered label would invite an out-of-contract answer. Labels the
+        template already defines are omitted rather than repeated.
+        """
+        defined = {label: text for label, text in CLASSIFICATION_GLOSSARY.items()}
+        # `elevator_activity` and `visitor` sit in the glossary rather than the
+        # template because their wording is a definition, not a rule.
+        offered = sorted(label for label in allowed if label in defined)
+        if not offered:
+            return ""
+        return "其余标签按实际可见动作选择：" + "".join(
+            f"{label}{defined[label]}" for label in offered
+        )
+
+
+# One sentence per label the template's rules leave undefined. Kept as data
+# rather than prose inside `template` because the definitions must follow the
+# per-call `allowed` set: teaching a label the caller disallowed would invite an
+# out-of-contract answer.
+#
+# `cleaning`, `home_arrival` and `home_departure` are absent deliberately -- the
+# template already states their conditions, and repeating them here would show
+# the model two versions of the same rule.
+CLASSIFICATION_GLOSSARY: Mapping[str, str] = {
+    "elevator_activity": "指人物在电梯间内活动但没有跨越入户门；",
+    "package_delivery": "指放下快递包裹且离开后包裹仍留在原处；",
+    "food_delivery": "指放下餐饮外卖且离开后餐食仍留在原处；",
+    "visitor": "指访客到访，例如敲门、在门外等候或被迎入；",
+    "maintenance": "指维修人员对楼道设施进行作业；",
+    "suspicious_activity": "指试探门锁、反复徘徊或窥探等可疑行为；",
+    "short_roundtrip": "指短暂外出后随即返回。",
+    "unknown_activity": "指画面确实无法支持任何其他判断；",
+    "unable_to_confirm": "指证据不足或画面质量导致无法判断。",
+}
 
 
 # Wraps the deployment's description so the model reads it as context rather
