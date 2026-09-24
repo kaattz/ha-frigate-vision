@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 # A deployment-supplied scene description changes the prompt without changing
 # this constant -- see `effective_prompt_version`, which folds that description
 # into the key so a user editing it is not silently served a cached answer.
-PROMPT_VERSION = "prompt_5"
+PROMPT_VERSION = "prompt_6"
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +229,18 @@ _REVIEW_SIX = Scene(
         "无法看出门的开合或人物的进出方向时，不得据停留时长、出现顺序或"
         "是否携带物品推断方向，应选择unknown_activity或unable_to_confirm。"
         "若人物只是经过、在门前停留或整理物品而未跨越门，也不要判断回家或离家。"
+        # Guidance on writing the `description` field, which is the notification
+        # body the household reads. Placed after the classification rules and
+        # before the glossary so it cannot be read as one of them: it constrains
+        # prose, not conclusions. The "write that you cannot tell" clause matters
+        # because most of this deployment's night evidence is infrared and a
+        # distant figure has no visible clothing -- without it, "must describe the
+        # appearance" invites a fabricated outfit.
+        "描述人物时须写明可辨认的外貌（性别、发型、上下身衣着的颜色与款式）；"
+        "看不清就写明看不清，不得补足。"
+        "画面中没有清晰正面面部时，不得推断年龄，改用中性说法"
+        "（一名男子、一名女士或一名人员）。"
+        "描述须交代人物从何处来、往何处去，以及门与电梯的状态变化，动作要连贯。"
     ),
 )
 

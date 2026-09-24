@@ -24,7 +24,7 @@ from custom_components.frigate_vision.scenes import (
 # `prompt_version` is half the analysis cache key, so leaving it alone after a
 # text change makes the deployment keep serving the old answers. Bump the version
 # and this digest in the same commit.
-REVIEW_SIX_PROMPT_DIGEST = "3907c8609e2b"
+REVIEW_SIX_PROMPT_DIGEST = "e6c70a758822"
 
 
 def test_every_scene_declares_what_it_can_answer() -> None:
@@ -337,6 +337,76 @@ def test_the_cell_description_does_not_hardcode_a_count() -> None:
     assert "顺序" in prompt or "依次" in prompt
 
 
+def test_the_prompt_asks_for_a_recognisable_description_of_the_person() -> None:
+    """The description is the notification body, so it must identify who it was.
+
+    `description` is what the household actually reads: the blueprint sends it as
+    the notification message. A description that says only "a person walked past"
+    cannot be acted on -- the reader needs to know whether it was someone they
+    know, and for a delivery whether to expect a parcel.
+
+    The guidance is about *writing*, not about concluding, so it is checked for
+    the three things a useful description needs and nothing more.
+    """
+    prompt = _render("review_six")
+    assert "外貌" in prompt, "no guidance on describing the person's appearance"
+    assert "性别" in prompt and "发型" in prompt, (
+        "appearance guidance must name what to look at, or it is too vague to act on"
+    )
+    assert "来" in prompt and "去" in prompt, (
+        "the description must state where the person came from and went to"
+    )
+
+
+def test_the_prompt_forbids_guessing_an_age_without_a_face() -> None:
+    """A guessed age is a fabrication, and it reaches the reader as fact.
+
+    Infrared frames and distant figures carry no facial detail, so an age is not
+    observable from most of this deployment's evidence. An earlier prompt already
+    forbade guessing a *profession* from a uniform for the same reason; age is the
+    same failure with a different attribute.
+
+    The neutral wording is asserted too, because "do not guess" without an
+    alternative leaves the model with nothing to write.
+    """
+    prompt = _render("review_six")
+    assert "年龄" in prompt, "no guidance about inferring age"
+    assert "男子" in prompt or "人员" in prompt, (
+        "the rule must offer neutral wording to use instead"
+    )
+    # And the prohibition must be tied to the absence of a face, not absolute:
+    # with a clear face an age estimate is a reasonable observation.
+    assert "面部" in prompt or "正面" in prompt, (
+        "the rule must say when it applies, or it forbids an observable fact"
+    )
+
+
+def test_appearance_guidance_cannot_license_a_classification() -> None:
+    """Writing guidance must not read as a rule that permits a label.
+
+    The prompt has already been broken once by a rule that collapsed the answers
+    it was meant to sharpen. This addition constrains only how the `description`
+    field is written, so it must not read as narrowing or widening which
+    classifications are available -- and it is placed before the glossary, which
+    is where conclusions are defined.
+    """
+    prompt = _render("review_six")
+    addition = prompt.index("外貌")
+    glossary = prompt.index("其余标签按实际可见动作选择")
+    assert addition < glossary, (
+        "the writing guidance must come before the label definitions, so it "
+        "cannot read as one of them"
+    )
+    # The addition must not name any classification; a label mentioned here would
+    # attach a conclusion to a statement about prose.
+    for label in SCENES["review_six"].classifications:
+        segment = prompt[addition:glossary]
+        assert label not in segment, (
+            f"{label} appears inside the description-writing guidance, which "
+            "would tie a classification to how the text is written"
+        )
+
+
 def test_every_offered_label_is_explained_to_the_model() -> None:
     """A label the prompt never defines is a label the model must guess.
 
@@ -598,6 +668,7 @@ def test_the_effective_version_is_a_valid_cache_key_component() -> None:
         assert analysis_key("activity_1", "review_six", version)
 
     assert effective_prompt_version("no_such_scene", "x") is None
+
 
 
 
