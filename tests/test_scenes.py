@@ -670,5 +670,66 @@ def test_the_effective_version_is_a_valid_cache_key_component() -> None:
     assert effective_prompt_version("no_such_scene", "x") is None
 
 
+def test_scene_labels_parses_name_and_definition_pairs() -> None:
+    """每行一条「标签: 定义」——一个字段同时给出枚举和解释。
+
+    两者必须同源：契约要枚举、模型要定义，分开写就会出现「提示词教了一个
+    校验器不认的标签」，答案被静默丢弃。
+    """
+    from custom_components.frigate_vision.scenes import parse_scene_labels
+
+    parsed = parse_scene_labels("宠物: 画面中只有宠物\n无人: 画面中没有任何人物")
+    assert parsed == (("宠物", "画面中只有宠物"), ("无人", "画面中没有任何人物"))
+
+
+def test_scene_labels_rejects_an_empty_definition() -> None:
+    from custom_components.frigate_vision.scenes import parse_scene_labels
+
+    with pytest.raises(ValueError, match="label_definition_missing"):
+        parse_scene_labels("宠物:")
+
+
+def test_scene_labels_rejects_duplicates() -> None:
+    from custom_components.frigate_vision.scenes import parse_scene_labels
+
+    with pytest.raises(ValueError, match="label_duplicate"):
+        parse_scene_labels("宠物: 甲\n宠物: 乙")
+
+
+def test_scene_labels_rejects_a_line_without_a_colon() -> None:
+    from custom_components.frigate_vision.scenes import parse_scene_labels
+
+    with pytest.raises(ValueError, match="label_malformed"):
+        parse_scene_labels("宠物 画面中只有宠物")
+
+
+def test_scene_labels_enforces_the_limits() -> None:
+    from custom_components.frigate_vision.scenes import parse_scene_labels
+
+    too_many = "\n".join(f"label_{i}: 定义" for i in range(31))
+    with pytest.raises(ValueError, match="too_many_labels"):
+        parse_scene_labels(too_many)
+    with pytest.raises(ValueError, match="label_definition_too_long"):
+        parse_scene_labels("宠物: " + "很长" * 101)
+    with pytest.raises(ValueError, match="label_name_too_long"):
+        parse_scene_labels("x" * 193 + ": 定义")
+
+
+def test_scene_labels_ignores_blank_lines() -> None:
+    """用户会在段落之间留空行；空行不该报错，也不该产生空标签。"""
+    from custom_components.frigate_vision.scenes import parse_scene_labels
+
+    parsed = parse_scene_labels("宠物: 只有宠物\n\n\n无人: 没有任何人物\n  \n")
+    assert parsed == (("宠物", "只有宠物"), ("无人", "没有任何人物"))
+
+
+def test_scene_labels_accepts_a_definition_containing_a_colon() -> None:
+    """定义里可能有冒号（例如英文解释）。只有第一个冒号是分隔符。"""
+    from custom_components.frigate_vision.scenes import parse_scene_labels
+
+    parsed = parse_scene_labels("pet: a cat: or a dog")
+    assert parsed == (("pet", "a cat: or a dog"),)
+
+
 
 

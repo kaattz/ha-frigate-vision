@@ -72,3 +72,11 @@ CONF_SCENE_DESCRIPTION = "scene_description"
 # Bounded so a pasted essay cannot crowd out the frames' own description; a
 # couple of sentences is what the prompt is written to expect.
 MAX_SCENE_DESCRIPTION_LENGTH = 500
+
+# 每个 entry 可自定义的标签集与提示词。上限的目的是拦截误粘的超长文本，
+# 不是设计约束——现默认 11 个标签、提示词约 1400 字。
+CONF_SCENE_LABELS = "scene_labels"
+CONF_PROMPT_OVERRIDE = "prompt_override"
+MAX_SCENE_LABELS = 30
+MAX_LABEL_DEFINITION_LENGTH = 200
+MAX_PROMPT_OVERRIDE_LENGTH = 4000

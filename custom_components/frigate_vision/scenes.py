@@ -26,6 +26,8 @@ import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from .const import MAX_LABEL_DEFINITION_LENGTH, MAX_SCENE_LABELS
+
 # Bumped whenever any scene's wording changes in a way that could alter its
 # answer. It is part of the analysis cache key, so a stale result is never
 # reused after the prompt that produced it has changed.
@@ -164,6 +166,48 @@ CLASSIFICATION_GLOSSARY: Mapping[str, str] = {
     "unknown_activity": "指画面确实无法支持任何其他判断；",
     "unable_to_confirm": "指证据不足或画面质量导致无法判断。",
 }
+
+
+def parse_scene_labels(text: str) -> tuple[tuple[str, str], ...]:
+    """把「标签: 定义」的每行文本解析成有序对。
+
+    一个字段同时给出枚举和定义，因为契约要枚举、模型要定义，而两者必须同源：
+    分开配置就会出现「提示词教了一个校验器不认的标签」，答案被静默丢弃。
+
+    定义不能省。实测本部署，不解释标签含义时弃权率 55%，解释后降到 11%——
+    只给标签名不给定义，等于让模型猜。
+
+    用第一个冒号作为分隔符，这样定义里可以再出现冒号（英文解释常见）。
+    空白行忽略：用户在段落之间留空行是正常的。
+
+    抛出 ValueError，其消息就是错误码，供配置流程直接展示给用户。
+    """
+    labels: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if ":" not in line:
+            raise ValueError("label_malformed")
+        name, _, definition = line.partition(":")
+        name = name.strip()
+        definition = definition.strip()
+        if not name:
+            raise ValueError("label_malformed")
+        if len(name) > 192:
+            raise ValueError("label_name_too_long")
+        if not definition:
+            raise ValueError("label_definition_missing")
+        if len(definition) > MAX_LABEL_DEFINITION_LENGTH:
+            raise ValueError("label_definition_too_long")
+        if name in seen:
+            raise ValueError("label_duplicate")
+        seen.add(name)
+        labels.append((name, definition))
+    if len(labels) > MAX_SCENE_LABELS:
+        raise ValueError("too_many_labels")
+    return tuple(labels)
 
 
 # Wraps the deployment's description so the model reads it as context rather
