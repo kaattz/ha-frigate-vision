@@ -582,6 +582,83 @@ async def test_media_failure_during_stop_keeps_activity_sealed(
     assert store.get("activity_1").stage is ActivityStage.SEALED  # type: ignore[union-attr]
 
 
+async def test_a_provider_502_abandons_the_activity_without_retrying(
+    hass: HomeAssistant,
+) -> None:
+    """A 502 from the provider discards the activity instead of trying again.
+
+    This is the behaviour that decides which vision model is safe to deploy, so it
+    is pinned here rather than left to be re-derived.
+
+    Measured on this deployment's proxy: the slowest models time out upstream and
+    return `provider_http_502` on 15-50% of calls while the fastest returns none.
+    The retry path covers only `SAFE_ANALYSIS_PRECHECK_ERRORS`
+    (`vision_not_configured`, `provider_unavailable`), so a 502 is recorded and the
+    loop returns -- the activity is never analysed and nothing ever tells the user
+    it was skipped.
+
+    That makes a model's failure rate as important as its accuracy: a model that is
+    70% accurate when it answers, but answers 65% of the time, delivers less than
+    one that is 40% accurate and always answers.
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = ActivityRecord(
+        activity_id="activity_http_502",
+        entry_id="entry_1",
+        source=ActivitySource.STANDALONE_REVIEW,
+        stage=ActivityStage.EVIDENCE_READY,
+        # LIVE, not OBSERVE: an observe-mode activity short-circuits before the
+        # provider is ever called, so it could not test the retry policy at all.
+        processing_mode=ProcessingMode.LIVE,
+        created_at=100,
+        updated_at=120,
+        camera="front",
+        detection_ids=("event_1",),
+        finalization_deadline=time.time() + 60,
+    )
+    await store.async_create(record)
+
+    class Vision:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def async_analyze(self, activity_id: str):
+            self.calls += 1
+            raise runtime_module.VisionError("provider_http_502")
+
+    vision = Vision()
+
+    async def handler(message: object) -> None:
+        return None
+
+    runtime = IntegrationRuntime(
+        hass=hass,
+        store=store,
+        queue=EntryRuntime(queue_size=1, handler=handler),
+        # analysis_tasks defaults to None, and `_schedule_analysis` returns at once
+        # when it is None (production sets `{}` at construction). Passing it here
+        # is what makes the analysis path reachable at all.
+        analysis_tasks={},
+    )
+    runtime.vision = vision  # type: ignore[assignment]
+    entry = _entry({})
+    entry.add_to_hass(hass)
+
+    runtime._schedule_analysis(entry, record)
+    await asyncio.gather(*(runtime.analysis_tasks or {}).values())
+
+    assert vision.calls == 1, (
+        "a 502 must not be retried -- if this became >1 the retry policy changed "
+        "and the model comparison's conclusions need revisiting"
+    )
+    assert runtime.last_error is not None
+    assert "502" in str(runtime.last_error)
+    # The activity is left where it was: sealed evidence, no classification. It
+    # will not be picked up again, which is why the failure rate matters.
+    assert store.get(record.activity_id).classification is None  # type: ignore[union-attr]
+
+
 async def test_runtime_loads_without_door_configuration(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
