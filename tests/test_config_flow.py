@@ -1472,3 +1472,109 @@ def test_an_entry_that_never_saved_them_still_uses_the_builtin_scene() -> None:
     assert config.scene_labels == ""
     assert config.prompt_override == ""
 
+
+def test_the_initial_flow_has_labels_for_every_option_field() -> None:
+    """初始配置流渲染的是同一个 _options_schema()，也要有全部字段标签。
+
+    config.step.options 此前只有 9/18，缺的字段在界面显示成原始键名
+    （例如 scene_labels），读起来像集成出了 bug。
+    """
+    import json
+    from pathlib import Path
+
+    from custom_components.frigate_vision import config_flow
+
+    root = Path(config_flow.__file__).parent
+    fields = {
+        getattr(m, "schema", None) for m in config_flow._options_schema().schema
+    }
+    fields.discard(None)
+    for name in ("strings.json", "translations/en.json", "translations/zh-Hans.json"):
+        payload = json.loads((root / name).read_text("utf-8"))
+        labelled = set(
+            payload["config"]["step"]["options"].get("data", {})
+        )
+        missing = sorted(fields - labelled)
+        assert not missing, f"{name} 的初始流缺少标签：{missing}"
+
+
+def test_every_label_error_code_has_a_translation() -> None:
+    """标签解析抛出的每个错误码都要有译文，否则用户看到 label_malformed 原始键。
+
+    错误码是 parse_scene_labels 的 ValueError 消息，会经
+    errors[CONF_SCENE_LABELS] 直接显示在表单上。
+    """
+    import json
+    import re
+    from pathlib import Path
+
+    from custom_components.frigate_vision import config_flow
+
+    source = Path(config_flow.__file__).parent.joinpath("scenes.py").read_text(
+        "utf-8"
+    )
+    codes = set(re.findall(r'raise ValueError\("([a-z_]+)"\)', source))
+    assert codes, "没有从 scenes.py 里找到任何错误码——正则可能过期了"
+    # 闭环：光有正则不算数，抓到的每个码都必须是解析器**真的**会抛出来的。
+    # 缺了这步，正则写错（例如只抓到一半）也会静默通过。
+    from custom_components.frigate_vision.scenes import parse_scene_labels
+
+    probes = {
+        # 冒号缺失
+        "label_malformed": ["没有冒号"],
+        "label_name_too_long": ["a" * 193 + ": 定义"],
+        # 制表符（\x09）落在 SAFE_CLASSIFICATION 排除的控制字符区间里；用内部
+        # 制表符而不是换行——换行会被 splitlines 先切开，反而报 label_malformed。
+        "label_name_invalid": ["坏\t名: 定义"],
+        "label_definition_missing": ["宠物:"],
+        "label_definition_too_long": ["宠物: " + "定" * 201],
+        "label_duplicate": ["宠物: 甲\n宠物: 乙"],
+        "too_many_labels": [f"标签{i}: 定义" for i in range(31)],
+    }
+    assert set(probes) == codes, (
+        f"实测错误码与正则抓到的不一致：probes={sorted(probes)} codes={sorted(codes)}"
+    )
+    for code, lines in probes.items():
+        with pytest.raises(ValueError) as caught:
+            parse_scene_labels("\n".join(lines))
+        assert str(caught.value) == code
+    for name in ("strings.json", "translations/en.json", "translations/zh-Hans.json"):
+        payload = json.loads(
+            Path(config_flow.__file__).parent.joinpath(name).read_text("utf-8")
+        )
+        translated = set(payload["options"].get("error", {}))
+        missing = sorted(codes - translated)
+        assert not missing, f"{name} 缺少错误码译文：{missing}"
+
+
+def test_the_label_errors_are_translated_where_each_flow_reads_them() -> None:
+    """两个流读的是**不同**的翻译路径，两端都要有译文。
+
+    前端把「字段级」错误按 flowType 解析到不同的键（实测 home-assistant/frontend
+    的 show-dialog-config-flow.ts 与 show-dialog-options-flow.ts）：
+
+      * 初始配置流 -> `component.<domain>.config.error.<code>`
+      * 选项流     -> `component.<domain>.options.error.<code>`
+
+    两条路径都**不含 step_id**——所以把错误码只挂在某个 step 下是查不到的。
+    这条断言覆盖初始流的那个渲染点：`errors[CONF_SCENE_LABELS]` 正是在
+    `step_id="options"` 的初始流表单上抛出的。
+    """
+    import json
+    import re
+    from pathlib import Path
+
+    from custom_components.frigate_vision import config_flow
+
+    source = Path(config_flow.__file__).parent.joinpath("scenes.py").read_text(
+        "utf-8"
+    )
+    codes = set(re.findall(r'raise ValueError\("([a-z_]+)"\)', source))
+    for name in ("strings.json", "translations/en.json", "translations/zh-Hans.json"):
+        payload = json.loads(
+            Path(config_flow.__file__).parent.joinpath(name).read_text("utf-8")
+        )
+        translated = set(payload["config"].get("error", {}))
+        missing = sorted(codes - translated)
+        assert not missing, f"{name} 的初始流缺少错误码译文：{missing}"
+
