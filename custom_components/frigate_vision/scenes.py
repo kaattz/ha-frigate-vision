@@ -105,10 +105,10 @@ class Scene:
         else:
             parts.append(self.template)
         # 标签定义：自定义优先，否则用内置的。覆盖不影响这一选择——只写规则
-        # 时内置定义仍要出现。
+        # 时内置定义仍要出现：定义与「用什么规则判断」是正交的两件事。
         if request.scene_labels:
             parts.append(_custom_glossary(request.scene_labels))
-        elif not override:
+        else:
             parts.append(self._glossary(request.allowed))
         for name in sorted(self.signals):
             # Only declared signals are consulted; anything else in the request

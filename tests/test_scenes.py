@@ -864,8 +864,14 @@ def test_a_definition_that_already_ends_in_punctuation_is_not_doubled() -> None:
 def test_an_override_alone_still_states_the_custom_labels() -> None:
     """只写规则、不写标签时，内置标签定义仍应附加（否则模型不知道标签含义）。
 
-    实测本部署：不解释标签含义时弃权率 55%，解释后降到 11%。
+    实测本部署：不解释标签含义时弃权率 55%，解释后降到 11%。标签定义与
+    「用什么规则判断」是正交的两件事——覆盖规则不该顺带删掉定义。
+
+    断言的是**定义正文**而不是标签名：标签名也出现在契约的枚举列表里，所以
+    断言名字即使在定义缺失时也会通过，测不出这个行为。
     """
+    from custom_components.frigate_vision.scenes import CLASSIFICATION_GLOSSARY
+
     scene = SCENES["review_six"]
     prompt = scene.render(
         SceneRequest(
@@ -875,7 +881,10 @@ def test_an_override_alone_still_states_the_custom_labels() -> None:
             prompt_override="自定义规则：只按可见动作判断。",
         )
     )
-    assert "elevator_activity" in prompt, "没有自定义标签时，内置定义必须仍在"
+    definition = CLASSIFICATION_GLOSSARY["elevator_activity"]
+    assert definition in prompt, (
+        "自定义规则不该移除标签定义：模型仍需知道每个标签的含义"
+    )
 
 
 
