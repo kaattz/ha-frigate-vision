@@ -97,6 +97,16 @@ def _options_schema() -> vol.Schema:
             # Provider settings live in options rather than data so they can be
             # changed from the UI at any time; changing the credential should
             # not require removing and re-adding the integration.
+            #
+            # The dropdown belongs here as much as on the initial step: switching
+            # provider is what this dialog is for, and without it the only way to
+            # switch was to delete the entry and add it again. Same options and
+            # same label text as `_llm_schema()`, so one field does not read as two.
+            vol.Optional(
+                CONF_LLM_PROVIDER, default=CONF_LLM_PROVIDER_DEFAULT
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=_provider_options())
+            ),
             vol.Optional(CONF_LLM_BASE_URL, default=CONF_LLM_BASE_URL_DEFAULT): _text(),
             vol.Optional(CONF_LLM_API_KEY): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
@@ -741,20 +751,67 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
+        suggestions: Mapping[str, Any] = self.config_entry.options
         if user_input is not None:
+            # 与初始流的 `async_step_llmvision` 同一套交互：只换服务商时，把该服务
+            # 商的地址预填进表单再渲染一次，而不是立刻保存。换供应商正是这个对话框
+            # 最自然的用途，不预填就等于让用户自己背地址——而地址正是最容易填错的
+            # 一项（必须是 OpenAI 兼容根路径，各家还不一样）。
+            #
+            # 与初始流不同的是，这里的 URL 输入框带 default，而 HA 在调用本步骤之前
+            # 会先用表单 schema 校验提交内容，所以「没动过」的输入框不会以空串到达：
+            # 它到达的是表单上显示的那个值，或在存储里没有该键时 schema 自己的默认
+            # 值。两者都算「用户没有自己填」，否则只有先手动清空输入框的人才享受得
+            # 到预填。
+            provider = str(user_input.get(CONF_LLM_PROVIDER, "")).strip()
+            preset_url = _preset_base_url(provider)
+            typed_url = str(user_input.get(CONF_LLM_BASE_URL, "")).strip()
+            shown_url = str(suggestions.get(CONF_LLM_BASE_URL, "")).strip()
+            url_untouched = typed_url in {"", CONF_LLM_BASE_URL_DEFAULT, shown_url}
+            # 服务商必须确实被改过：否则「什么都不改直接保存」也会重新渲染，并按当前
+            # 服务商覆盖掉用户自建的地址——本地路由器/反向代理部署下那是能用的地址，
+            # 换掉就等同于把可用的端点改坏（初始流里 `custom` 一行即为此设）。
+            provider_changed = provider != str(
+                suggestions.get(CONF_LLM_PROVIDER, CONF_LLM_PROVIDER_DEFAULT)
+            ).strip()
+            # 已存的密钥回填后原样提交，同样不算「用户这次填了 key」。
+            key_untouched = str(user_input.get(CONF_LLM_API_KEY, "")).strip() in {
+                "",
+                str(suggestions.get(CONF_LLM_API_KEY, "")).strip(),
+            }
+            wants_only_the_preset = (
+                preset_url is not None
+                and provider_changed
+                and url_untouched
+                and key_untouched
+            )
+            if wants_only_the_preset:
+                # 这个选项流是整体替换，重新渲染时必须回填用户这次提交的内容，否则
+                # 他填的其他字段会被清空。以存储为底、叠加本次提交，再强制写入预填
+                # 地址：缺了前一半，提交里没出现的字段（例如标签、判断规则）会退回
+                # schema 默认值。
+                return self.async_show_form(
+                    step_id="settings",
+                    data_schema=self.add_suggested_values_to_schema(
+                        _options_schema(),
+                        {**suggestions, **user_input, CONF_LLM_BASE_URL: preset_url},
+                    ),
+                    errors=errors,
+                )
             # 保存时就校验标签格式：这个选项流是整体替换，填错了会被直接存进去，
             # 之后每次分析都失败，而用户只看到「没有通知」——错误发生在离原因
             # 很远的地方。校验与初始流共用 `_label_errors`，两个流不会各漂各的。
             errors = _label_errors(user_input)
             if not errors:
                 return self.async_create_entry(data=user_input)
-        # 校验失败时回填用户这次提交的内容，否则表单会清空他填的一切。
-        schema = self.add_suggested_values_to_schema(
-            _options_schema(),
-            user_input if user_input is not None else self.config_entry.options,
-        )
+            # 校验失败时回填用户这次提交的内容，否则表单会清空他填的一切。
+            suggestions = user_input
         return self.async_show_form(
-            step_id="settings", data_schema=schema, errors=errors
+            step_id="settings",
+            data_schema=self.add_suggested_values_to_schema(
+                _options_schema(), suggestions
+            ),
+            errors=errors,
         )
 
     async def async_step_test_connection(

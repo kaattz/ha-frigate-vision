@@ -48,6 +48,7 @@
         "title": "Behavior",
         "data": {
           "processing_mode": "Processing mode",
+          "llm_provider": "Provider",
           "llm_base_url": "Base URL",
           "llm_api_key": "API key",
           "llm_model": "Model",
@@ -67,6 +68,7 @@
           "analyze_all_far_reviews": "Analyze all far-zone reviews"
         },
         "data_description": {
+          "llm_provider": "Picking a provider fills in its OpenAI-compatible base URL. The URL stays editable, for a local router or reverse proxy.",
           "scene_labels": "One per line as `name: definition`, with a half-width colon (not the full-width `：` that a Chinese IME types by default). Leave empty to use the built-in set. Always give a definition: without one the model can only guess, and abstention rose from 11% to 55% when definitions were missing.",
           "prompt_override": "Leave empty to use the built-in judgement rules. The output contract and the scene description are still appended automatically, because both the parser and the rules depend on them."
         }
@@ -132,6 +134,7 @@
         "title": "Behavior",
         "data": {
           "processing_mode": "Processing mode",
+          "llm_provider": "Provider",
           "llm_base_url": "Base URL",
           "llm_api_key": "API key",
           "llm_model": "Model",
@@ -151,6 +154,7 @@
           "analyze_all_far_reviews": "Analyze all far-zone reviews"
         },
         "data_description": {
+          "llm_provider": "Picking a provider fills in its OpenAI-compatible base URL. The URL stays editable, for a local router or reverse proxy.",
           "scene_labels": "One per line as `name: definition`, with a half-width colon (not the full-width `：` that a Chinese IME types by default). Leave empty to use the built-in set. Always give a definition: without one the model can only guess, and abstention rose from 11% to 55% when definitions were missing.",
           "prompt_override": "Leave empty to use the built-in judgement rules. The output contract and the scene description are still appended automatically, because both the parser and the rules depend on them."
         }

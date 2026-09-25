@@ -466,6 +466,107 @@ async def test_options_flow_updates_behavior_settings(hass: HomeAssistant) -> No
     assert result["data"]["max_tokens"] == 20000
 
 
+def test_the_options_form_also_offers_the_provider_dropdown() -> None:
+    """服务商下拉必须在选项表单里也有，否则换供应商只能删掉集成重加。
+
+    它原先只加在 _llm_schema()（初始配置流），而「行为选项」用的是
+    _options_schema()，用户在那里看不到任何下拉项——而换供应商正是那个
+    对话框最自然的用途。
+    """
+    from custom_components.frigate_vision import config_flow
+    from custom_components.frigate_vision.const import PROVIDER_PRESETS
+
+    schema = config_flow._options_schema()
+    fields = {getattr(m, "schema", None) for m in schema.schema}
+    assert "llm_provider" in fields, "选项表单缺少服务商下拉"
+    assert "llm_base_url" in fields, "URL 仍须可编辑"
+
+    for marker, selector in schema.schema.items():
+        if getattr(marker, "schema", None) == "llm_provider":
+            offered = {o["value"] for o in selector.config["options"]}
+            assert set(PROVIDER_PRESETS) <= offered
+            # 标签必须有文字，否则渲染成空行。
+            for option in selector.config["options"]:
+                assert option["label"]
+            break
+
+
+async def test_choosing_a_provider_in_the_options_flow_prefills_the_url(
+    hass: HomeAssistant,
+) -> None:
+    """在选项流里选服务商，也要像初始流那样把 URL 预填进去。
+
+    注意选项流是整体替换，所以重新渲染时必须回填用户这次提交的内容，
+    否则他填的其他字段会被清空。
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"processing_mode": "observe", "llm_base_url": "http://old/v1"},
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings"}
+    )
+    assert result["step_id"] == "settings"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"llm_provider": "gemini", "processing_mode": "observe"},
+    )
+    # 只选服务商 -> 表单重新渲染并把 URL 预填为 gemini 的地址，而不是保存。
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "settings"
+    marker = next(
+        m
+        for m in result["data_schema"].schema
+        if getattr(m, "schema", None) == "llm_base_url"
+    )
+    description = marker.description
+    suggested = (
+        description.get("suggested_value")
+        if isinstance(description, dict)
+        else description
+    )
+    assert suggested == "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+async def test_the_options_flow_still_saves_normally(hass: HomeAssistant) -> None:
+    """加了 provider 交互之后，正常的保存路径必须仍然工作。"""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"processing_mode": "observe"},
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            "processing_mode": "shadow",
+            "target_width": 768,
+            "max_tokens": 20000,
+            "output_language": "zh-CN",
+            "history_retention_days": 30,
+            "media_retention_days": 7,
+            "queue_size": 10,
+            "llm_base_url": "https://api.deepseek.com/v1",
+            "llm_api_key": "k",
+            "llm_model": "m",
+            "llm_provider": "deepseek",
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"]["processing_mode"] == "shadow"
+    assert result["data"]["llm_provider"] == "deepseek"
+
+
 async def test_connection_test_reports_a_missing_key(hass: HomeAssistant) -> None:
     """The check must name what is missing rather than failing vaguely."""
     entry = MockConfigEntry(
