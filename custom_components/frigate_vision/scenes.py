@@ -384,38 +384,57 @@ def scene_prompt_version(mode: str) -> str | None:
 
 
 def effective_prompt_version(
-    mode: str, scene_description: str = ""
+    mode: str,
+    scene_description: str = "",
+    *,
+    scene_labels: tuple[tuple[str, str], ...] = (),
+    prompt_override: str = "",
 ) -> str | None:
-    """Return the version to key an analysis on, for a mode and a description.
+    """Return the version to key an analysis on.
 
-    The base version is a module constant, so it cannot reflect a description
-    the deployment supplies from its own options. Without folding that
-    description in, editing it would leave the cache key untouched and the next
-    analysis of an activity would be answered from the *previous* prompt's
-    stored result -- the change would look like it had no effect at all. This
-    project has already lost a feature to exactly that shape of failure twice
-    (a blueprint silently rewritten by Home Assistant, and a template value
-    that stopped being a string), so the version is derived from the content
-    rather than trusted to be bumped by hand.
+    三个可配置输入都要折进键里。基础版本是模块常量，反映不了部署自己的配置；
+    不折进去的话，改了配置而键不变，下一次分析会直接返回**上一次提示词**的存储
+    结果，改动看起来完全没生效。本项目已因这种形状丢过功能两次，所以版本内容
+    派生，不靠手改版本号。
+
+    未配置任何东西时返回裸的基础版本，既有部署的缓存和行为完全不变。
+
+    注意早返回只针对**现场布局**：`accepts_scene_description` 的语义是「这个
+    场景是否接受布局描述」，不代表「是否接受自定义标签」。门锁场景不接受布局，
+    但它的标签和规则改了同样必须换键，否则会拿到旧答案。
 
     Returns None for an unregistered mode, matching `scene_prompt_version`.
 
-    The digest is eight hex characters, which keeps the result inside the
+    Each digest is eight hex characters, which keeps the result inside the
     `SAFE_ID` alphabet that `analysis_key` validates. Eight characters is far
-    more than enough to distinguish the handful of descriptions a deployment
-    would ever write, and it is a cache key rather than a security boundary.
+    more than enough to distinguish the handful of inputs a deployment would
+    ever write, and it is a cache key rather than a security boundary.
     """
     scene = SCENES.get(mode)
     if scene is None:
         return None
     base = scene.prompt_version
-    if not scene.accepts_scene_description:
-        return base
-    text = scene_description.strip()
-    if not text:
+    parts: list[str] = []
+    # A description only counts for a scene that declares it accepts one; the
+    # labels and the override below are not gated on that flag.
+    if scene.accepts_scene_description:
+        text = scene_description.strip()
+        if text:
+            parts.append(text)
+    if scene_labels:
+        # 名字和定义都参与：只改定义也会改变模型看到的内容。
+        parts.append(
+            "\n".join(f"{name}:{definition}" for name, definition in scene_labels)
+        )
+    override = prompt_override.strip()
+    if override:
+        parts.append(override)
+    if not parts:
         # Nothing was configured, so the prompt is exactly the base one and the
-        # key must stay exactly the base key. Deployments that never set a
-        # description keep their existing cache and behaviour untouched.
+        # key must stay exactly the base key. Deployments that never configure
+        # anything keep their existing cache and behaviour untouched.
         return base
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
-    return f"{base}-{digest}"
+    digests = [
+        hashlib.sha256(part.encode("utf-8")).hexdigest()[:8] for part in parts
+    ]
+    return base + "".join(f"-{digest}" for digest in digests)

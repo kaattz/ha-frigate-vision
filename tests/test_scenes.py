@@ -887,5 +887,100 @@ def test_an_override_alone_still_states_the_custom_labels() -> None:
     )
 
 
+def test_changing_the_labels_changes_the_cache_key() -> None:
+    """改了标签就必须换键，否则旧答案会被当成新配置的结果返回。
 
+    本项目已因「改了文本但没换 key」丢过功能两次，所以版本必须内容派生。
+    """
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+
+    base = effective_prompt_version("review_six", "")
+    with_labels = effective_prompt_version(
+        "review_six", "", scene_labels=(("宠物", "画面中只有宠物"),)
+    )
+    assert with_labels != base
+    assert with_labels.startswith("prompt_6")
+
+
+def test_changing_the_prompt_override_changes_the_cache_key() -> None:
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+
+    base = effective_prompt_version("review_six", "")
+    a = effective_prompt_version("review_six", "", prompt_override="规则甲")
+    b = effective_prompt_version("review_six", "", prompt_override="规则乙")
+    assert a != b, "不同的规则必须得到不同的键"
+    assert a != base, "有覆盖时必须与无覆盖不同"
+
+
+def test_changing_only_a_label_definition_changes_the_cache_key() -> None:
+    """只改定义文字（标签名不变）也要换键——模型看到的内容变了。"""
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+
+    a = effective_prompt_version(
+        "review_six", "", scene_labels=(("宠物", "只有宠物"),)
+    )
+    b = effective_prompt_version(
+        "review_six", "", scene_labels=(("宠物", "只有宠物或小孩"),)
+    )
+    assert a != b
+
+
+def test_all_three_inputs_compose_into_the_key() -> None:
+    """三个输入各自贡献一段摘要，任一改变都改变整个键。"""
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+
+    combined = effective_prompt_version(
+        "review_six",
+        "布局",
+        scene_labels=(("宠物", "只有宠物"),),
+        prompt_override="规则甲",
+    )
+    assert combined.startswith("prompt_6-")
+    assert combined.count("-") == 3, f"三段摘要应各自出现：{combined}"
+
+
+def test_the_key_stays_a_safe_id() -> None:
+    """analysis_key 会校验字母表，键必须落在 SAFE_ID 内。"""
+    from custom_components.frigate_vision.models import SAFE_ID
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+
+    key = effective_prompt_version(
+        "review_six",
+        "布局",
+        scene_labels=(("宠物", "只有宠物"),),
+        prompt_override="规则",
+    )
+    assert key is not None
+    assert SAFE_ID.fullmatch(key), key
+
+
+def test_nothing_configured_keeps_the_bare_base_version() -> None:
+    """什么都没配时必须返回裸的基础版本，既有部署的缓存与行为完全不变。"""
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+
+    assert effective_prompt_version("review_six", "") == "prompt_6"
+    assert effective_prompt_version("review_six", "", scene_labels=()) == "prompt_6"
+    assert effective_prompt_version("review_six", "", prompt_override="") == "prompt_6"
+    blank = effective_prompt_version("review_six", "", prompt_override="   ")
+    assert blank == "prompt_6"
+
+
+def test_door_scenes_still_key_on_custom_labels() -> None:
+    """门锁场景不接受「现场布局」，但仍必须让标签参与缓存键。
+
+    早返回 `if not scene.accepts_scene_description: return base` 的语义是
+    「这个场景是否接受现场布局描述」，不代表「是否接受自定义标签」。若把新输入
+    接在那个早返回之后，门锁场景改标签就不会换键，用户会拿到上一次提示词的
+    存储结果——这正是本项目已踩过两次的失败形状。
+    """
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+
+    for mode in ("door_single", "door_roundtrip"):
+        base = effective_prompt_version(mode, "")
+        with_labels = effective_prompt_version(
+            mode, "", scene_labels=(("短暂外出", "出门后很快返回"),)
+        )
+        assert with_labels != base, f"{mode} 的标签没有参与缓存键"
+        with_override = effective_prompt_version(mode, "", prompt_override="自定义规则")
+        assert with_override != base, f"{mode} 的提示词覆盖没有参与缓存键"
 
