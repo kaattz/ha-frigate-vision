@@ -126,11 +126,13 @@
       "init": {
         "title": "Behavior",
         "menu_options": {
-          "settings": "Configure settings",
-          "test_connection": "Test vision provider connection"
+          "settings": "Configure settings"
         }
       },
       "settings": {
+        "title": "Configure settings"
+      },
+      "settings_form": {
         "title": "Behavior",
         "data": {
           "processing_mode": "Processing mode",

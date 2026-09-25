@@ -781,6 +781,27 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
             menu_options={
                 "settings": "配置参数 / Configure settings",
                 "provider": f"切换服务商（当前：{label}）",
+            },
+        )
+
+    async def async_step_settings(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Group the settings form with the connection test that exercises it.
+
+        The two were siblings in the top-level menu, which read as though the test
+        were unrelated to the settings it tests. Home Assistant's form offers only
+        one action -- the submit button -- so a button inside the form is not
+        possible; a submenu expresses the same grouping with the mechanism the flow
+        already uses.
+
+        Labels are literal text because a dict `menu_options` value is rendered
+        verbatim, with no translation lookup.
+        """
+        return self.async_show_menu(
+            step_id="settings",
+            menu_options={
+                "settings_form": "修改参数 / Edit settings",
                 "test_connection": "测试视觉模型连通性 / Test provider connection",
             },
         )
@@ -830,7 +851,7 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
         if preset is not None and preset["models"]:
             suggestions[CONF_LLM_MODEL] = preset["models"][0]
         return self.async_show_form(
-            step_id="settings",
+            step_id="settings_form",
             data_schema=self.add_suggested_values_to_schema(
                 _options_schema(), suggestions
             ),
@@ -861,7 +882,7 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
     ) -> ConfigFlowResult:
         return await self._async_apply_provider("custom")
 
-    async def async_step_settings(
+    async def async_step_settings_form(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
@@ -884,7 +905,7 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
             # 校验失败时回填用户这次提交的内容，否则表单会清空他填的一切。
             suggestions = user_input
         return self.async_show_form(
-            step_id="settings",
+            step_id="settings_form",
             data_schema=self.add_suggested_values_to_schema(
                 _options_schema(), suggestions
             ),

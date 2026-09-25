@@ -438,13 +438,18 @@ async def test_options_flow_updates_behavior_settings(hass: HomeAssistant) -> No
     result = await hass.config_entries.options.async_init(entry.entry_id)
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "init"
-    # The menu routes to settings, the provider switch or a connectivity check,
-    # so provider fields can be changed without re-adding the integration.
-    assert set(result["menu_options"]) == {"settings", "provider", "test_connection"}
+    # The menu routes to settings or the provider switch. The connectivity check
+    # lives inside「配置参数」now: it tests the settings, so listing it as a
+    # sibling made it read as unrelated to them.
+    assert set(result["menu_options"]) == {"settings", "provider"}
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"next_step_id": "settings"}
     )
-    assert result["step_id"] == "settings"
+    # 「配置参数」是子菜单：表单在它里面，要多走一层。
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings_form"}
+    )
+    assert result["step_id"] == "settings_form"
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         {
@@ -484,6 +489,9 @@ async def test_the_options_flow_still_saves_normally(hass: HomeAssistant) -> Non
         result["flow_id"], {"next_step_id": "settings"}
     )
     result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings_form"}
+    )
+    result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         {
             "processing_mode": "shadow",
@@ -512,6 +520,10 @@ async def test_connection_test_reports_a_missing_key(hass: HomeAssistant) -> Non
     )
     entry.add_to_hass(hass)
     result = await hass.config_entries.options.async_init(entry.entry_id)
+    # 连通性测试现在在「配置参数」子菜单里，顶层已无此项。
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings"}
+    )
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"next_step_id": "test_connection"}
     )
@@ -547,6 +559,9 @@ async def test_connection_test_reports_success_with_details(
 
     with patch.object(config_flow, "async_test_connection", fake_test):
         result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"next_step_id": "settings"}
+        )
         result = await hass.config_entries.options.async_configure(
             result["flow_id"], {"next_step_id": "test_connection"}
         )
@@ -1172,6 +1187,9 @@ async def test_options_flow_round_trips_the_scene_description(
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"next_step_id": "settings"}
     )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings_form"}
+    )
     description = "入户门在画面左侧画外；画面中央是电梯门，走廊远端通往另一部画外电梯。"
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
@@ -1257,7 +1275,7 @@ def test_every_options_field_has_a_translated_label() -> None:
     fields.discard(None)
     for name in ("strings.json", "translations/en.json", "translations/zh-Hans.json"):
         payload = json.loads((root / name).read_text("utf-8"))
-        labelled = set(payload["options"]["step"]["settings"].get("data", {}))
+        labelled = set(payload["options"]["step"]["settings_form"].get("data", {}))
         missing = sorted(fields - labelled)
         assert not missing, f"{name} 缺少标签：{missing}"
 
@@ -1278,7 +1296,7 @@ def test_the_label_field_explains_the_halfwidth_colon() -> None:
     root = Path(config_flow.__file__).parent
     for name in ("translations/en.json", "translations/zh-Hans.json"):
         payload = json.loads((root / name).read_text("utf-8"))
-        descriptions = payload["options"]["step"]["settings"].get(
+        descriptions = payload["options"]["step"]["settings_form"].get(
             "data_description", {}
         )
         text = descriptions.get(CONF_SCENE_LABELS, "")
@@ -1314,7 +1332,10 @@ async def test_saving_bad_labels_shows_an_error_instead_of_storing_them(
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"next_step_id": "settings"}
     )
-    assert result["step_id"] == "settings"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings_form"}
+    )
+    assert result["step_id"] == "settings_form"
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],

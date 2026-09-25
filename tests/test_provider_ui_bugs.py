@@ -139,7 +139,7 @@ async def test_choosing_gemini_returns_the_form_with_the_url_filled_in(
         result["flow_id"], {"next_step_id": "provider_gemini"}
     )
     assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "settings"
+    assert result["step_id"] == "settings_form"
     assert _suggested_for(result["data_schema"], "llm_base_url") == (
         "https://generativelanguage.googleapis.com/v1beta/openai"
     )
@@ -236,6 +236,60 @@ async def test_the_settings_form_no_longer_has_a_provider_field(
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"next_step_id": "settings"}
     )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings_form"}
+    )
     fields = {getattr(m, "schema", None) for m in result["data_schema"].schema}
     assert "llm_provider" not in fields
     assert "llm_base_url" in fields, "地址仍须可编辑"
+
+
+async def test_the_settings_menu_groups_the_form_with_the_connection_test(
+    hass: HomeAssistant,
+) -> None:
+    """「配置参数」应是子菜单，把表单与连通性测试放在一起。
+
+    用户指出这两项在顶层并列时，测试看起来与配置无关。HA 的表单放不了第二个
+    按钮（表单只有一个「提交」动作），所以用菜单层级表达归属。
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN, title="Front Door", data={}, options=dict(LIVE)
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert set(result["menu_options"]) == {"settings", "provider"}, (
+        "顶层不应再有 test_connection —— 它属于配置参数"
+    )
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings"}
+    )
+    assert result["type"] is FlowResultType.MENU, "「配置参数」应是子菜单"
+    assert set(result["menu_options"]) == {"settings_form", "test_connection"}
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings_form"}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert "llm_base_url" in {
+        getattr(m, "schema", None) for m in result["data_schema"].schema
+    }
+
+
+async def test_the_connection_test_is_reachable_from_inside_the_settings_menu(
+    hass: HomeAssistant,
+) -> None:
+    """连通性测试仍能到达（只是位置变了），别把它弄丢。"""
+    entry = MockConfigEntry(
+        domain=DOMAIN, title="Front Door", data={}, options=dict(LIVE)
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "test_connection"}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "test_connection"
