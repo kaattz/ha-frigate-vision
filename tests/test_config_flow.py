@@ -438,9 +438,9 @@ async def test_options_flow_updates_behavior_settings(hass: HomeAssistant) -> No
     result = await hass.config_entries.options.async_init(entry.entry_id)
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "init"
-    # The menu routes to settings or a connectivity check, so provider fields
-    # can be changed without re-adding the integration.
-    assert set(result["menu_options"]) == {"settings", "test_connection"}
+    # The menu routes to settings, the provider switch or a connectivity check,
+    # so provider fields can be changed without re-adding the integration.
+    assert set(result["menu_options"]) == {"settings", "provider", "test_connection"}
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"next_step_id": "settings"}
     )

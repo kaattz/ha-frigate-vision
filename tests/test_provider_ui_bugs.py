@@ -158,3 +158,41 @@ async def test_bug2b_a_no_op_save_does_not_hijack_the_url(
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"]["llm_base_url"] == LIVE["llm_base_url"]
     assert result["data"]["prompt_override"] == "只按可见动作判断。"
+
+
+async def test_the_menu_shows_the_current_provider(hass: HomeAssistant) -> None:
+    """菜单项要带上当前服务商，否则用户无法在不打开表单的情况下确认状态。
+
+    `llm_provider` 不存储（真相在 URL 里），所以这个显示值是从 URL 推导的。
+    本部署的地址是本地路由器，匹配不到任何预设，应显示「其他」——而且必须是有
+    可读文字的回退值，不能把 'custom' 这个内部键名直接显示出来。
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN, title="Front Door", data={}, options=dict(LIVE)
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.MENU
+    labels = result["menu_options"]
+    assert isinstance(labels, dict), "dict 形式才能带自定义文字"
+    assert "provider" in labels, "菜单里要有切换服务商这一项"
+    item = labels["provider"]
+    assert "其他" in item, f"应显示可读的「其他」，实际：{item!r}"
+    assert "custom" not in item, f"内部键名不该显示给用户：{item!r}"
+
+
+async def test_the_menu_shows_a_preset_name_when_the_url_matches(
+    hass: HomeAssistant,
+) -> None:
+    """地址匹配某个预设时，菜单显示那个预设的名字而不是「其他」。"""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options=dict(LIVE, llm_base_url="https://api.deepseek.com/v1"),
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    item = result["menu_options"]["provider"]
+    assert "DeepSeek" in item, f"实际：{item!r}"
+    assert "其他" not in item, f"不该回退到「其他」：{item!r}"

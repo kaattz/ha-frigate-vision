@@ -783,10 +783,22 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
         # rows rendered without text in this deployment even though the step
         # title resolved, leaving two unlabelled entries; the dict form carries
         # its own labels and needs no translation lookup.
+        #
+        # The current provider is folded into the menu label because switching it
+        # is the whole point of this dialog, and a user who cannot see which one
+        # is active has to open the form to find out. `llm_provider` is not
+        # stored -- the URL is the truth -- so it is derived from the stored URL.
+        # `_PROVIDER_LABELS` has no `custom` key and this deployment's router URL
+        # resolves to exactly that, so the fallback has to be readable text:
+        # showing the raw key would defeat the point of showing it at all.
+        options = self.config_entry.options
+        current = _provider_for_url(str(options.get(CONF_LLM_BASE_URL, "")))
+        label = _PROVIDER_LABELS.get(current, "其他 / Other")
         return self.async_show_menu(
             step_id="init",
             menu_options={
                 "settings": "配置参数 / Configure settings",
+                "provider": f"切换服务商（当前：{label}）",
                 "test_connection": "测试视觉模型连通性 / Test provider connection",
             },
         )
