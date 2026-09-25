@@ -491,13 +491,15 @@ def test_the_options_form_also_offers_the_provider_dropdown() -> None:
             break
 
 
-async def test_choosing_a_provider_in_the_options_flow_prefills_the_url(
+async def test_choosing_a_provider_in_the_options_flow_writes_the_url_at_once(
     hass: HomeAssistant,
 ) -> None:
-    """在选项流里选服务商，也要像初始流那样把 URL 预填进去。
+    """在选项流里选服务商，地址必须在这一次提交就写进去并保存。
 
-    注意选项流是整体替换，所以重新渲染时必须回填用户这次提交的内容，
-    否则他填的其他字段会被清空。
+    不能靠「重新渲染表单让前端显示预填值」：HA 的原生表单只在**提交**时跑服务端
+    代码，在下拉里选中一项不会触发任何请求，所以服务端无法在选中瞬间改地址。前一
+    版实现就是这样，结果是用户选了 Gemini、点提交，什么都没保存、地址也没变——看
+    起来完全没反应。
     """
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -516,21 +518,12 @@ async def test_choosing_a_provider_in_the_options_flow_prefills_the_url(
         result["flow_id"],
         {"llm_provider": "gemini", "processing_mode": "observe"},
     )
-    # 只选服务商 -> 表单重新渲染并把 URL 预填为 gemini 的地址，而不是保存。
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "settings"
-    marker = next(
-        m
-        for m in result["data_schema"].schema
-        if getattr(m, "schema", None) == "llm_base_url"
+    # 一次提交就完成保存，地址被写成 gemini 的地址。
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert (
+        result["data"]["llm_base_url"]
+        == "https://generativelanguage.googleapis.com/v1beta/openai"
     )
-    description = marker.description
-    suggested = (
-        description.get("suggested_value")
-        if isinstance(description, dict)
-        else description
-    )
-    assert suggested == "https://generativelanguage.googleapis.com/v1beta/openai"
 
 
 async def test_the_options_flow_still_saves_normally(hass: HomeAssistant) -> None:

@@ -87,14 +87,19 @@ async def test_bug1b_a_preset_url_still_shows_its_own_provider(
     assert _suggested_for(result["data_schema"], "llm_provider") == "deepseek"
 
 
-async def test_bug2_switching_provider_prefills_the_url_on_submit(
+async def test_bug2_switching_provider_writes_the_url_in_one_submit(
     hass: HomeAssistant,
 ) -> None:
-    """Selecting Gemini and submitting must return the form with Gemini's URL.
+    """Selecting Gemini and submitting must save Gemini's URL immediately.
 
-    Submits the full displayed form (as the browser does), not a minimal dict:
-    the URL is not empty, it carries the value the form showed. A guard that
-    treats "non-empty" as "the user typed this" never fires here.
+    One submit, not two. Home Assistant's native form runs no server code when a
+    dropdown is *selected* -- only on submit -- so a design that re-rendered the
+    form to show a prefilled URL did nothing visible: the user picked Gemini,
+    submitted, and neither the URL nor the entry changed.
+
+    Submits the full displayed form (as the browser does), with the URL left at
+    the value shown, because the schema carries a default and an untouched box
+    never arrives empty.
     """
     entry, result = await _open_settings(hass, dict(LIVE))
     submitted = dict(entry.options)
@@ -102,11 +107,35 @@ async def test_bug2_switching_provider_prefills_the_url_on_submit(
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], submitted
     )
-    assert result["type"] is FlowResultType.FORM, (
-        "the form must come back so the user sees the filled-in URL"
+    assert result["type"] is FlowResultType.CREATE_ENTRY, (
+        "the save must complete in this submit, not come back as a form"
     )
-    assert _suggested_for(result["data_schema"], "llm_base_url") == (
+    assert result["data"]["llm_base_url"] == (
         "https://generativelanguage.googleapis.com/v1beta/openai"
+    )
+    assert result["data"]["llm_provider"] == "gemini"
+
+
+async def test_bug2c_a_hand_typed_url_survives_a_provider_change(
+    hass: HomeAssistant,
+) -> None:
+    """A URL the user typed must not be replaced by the preset.
+
+    Picking a provider is a shortcut for filling the URL in, not an override: on
+    this deployment the URL points at a local router, and rewriting it to a public
+    endpoint would break a working setup. The user typed a URL that differs from
+    what the form showed, which is the signal that it is theirs.
+    """
+    entry, result = await _open_settings(hass, dict(LIVE))
+    submitted = dict(entry.options)
+    submitted["llm_provider"] = "gemini"
+    submitted["llm_base_url"] = "http://10.0.0.9:9999/v1"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], submitted
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"]["llm_base_url"] == "http://10.0.0.9:9999/v1", (
+        "a hand-typed URL must win over the preset"
     )
 
 
