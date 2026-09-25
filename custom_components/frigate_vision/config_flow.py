@@ -88,6 +88,22 @@ def _parse_base_url(value: str) -> URL:
     return parsed
 
 
+def _provider_suggestions(options: Mapping[str, Any]) -> dict[str, Any]:
+    """Fill in `llm_provider` from the stored URL when the entry has no such key.
+
+    The dropdown postdates existing entries, so the key is simply absent for them.
+    Left absent, the field falls back to the schema default and the dialog claims
+    DeepSeek for an entry on a local router. Deriving it from the URL keeps the
+    dialog honest, and leaves a stored value untouched when there is one.
+    """
+    if options.get(CONF_LLM_PROVIDER):
+        return dict(options)
+    return {
+        **options,
+        CONF_LLM_PROVIDER: _provider_for_url(str(options.get(CONF_LLM_BASE_URL, ""))),
+    }
+
+
 def _options_schema() -> vol.Schema:
     return vol.Schema(
         {
@@ -196,6 +212,29 @@ def _preset_base_url(provider: str) -> str | None:
     """
     preset = PROVIDER_PRESETS.get(provider)
     return preset["base_url"] if preset else None
+
+
+def _provider_for_url(base_url: str) -> str:
+    """The provider a stored URL belongs to, or `custom` when none matches.
+
+    The dropdown is backed by a stored value that older entries do not have -- it
+    did not exist when they were created -- so without this the field fell through
+    to the schema default and the dialog claimed "DeepSeek" for an entry pointed at
+    a local router. A dialog that names the wrong provider is worse than no
+    dropdown: the next save would adopt that claim and rewrite the endpoint.
+
+    This deployment is exactly that case (`http://192.168.166.50:7864/v1`), which is
+    why `custom` exists as a choice at all.
+    """
+    text = base_url.strip().rstrip("/")
+    if not text:
+        return CONF_LLM_PROVIDER_DEFAULT
+    for name, preset in PROVIDER_PRESETS.items():
+        # Compare with the trailing slash ignored, since both forms are reasonable
+        # things to have typed.
+        if preset["base_url"].rstrip("/") == text:
+            return name
+    return "custom"
 
 
 def _llm_schema() -> vol.Schema:
@@ -585,8 +624,13 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
                 ),
                 errors=errors,
             )
-        return self.async_show_form(step_id="options", data_schema=_options_schema())
-
+        return self.async_show_form(
+            step_id="options",
+            data_schema=self.add_suggested_values_to_schema(
+                _options_schema(),
+                _provider_suggestions(self._data.get("llm") or {}),
+            ),
+        )
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -809,7 +853,7 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
         return self.async_show_form(
             step_id="settings",
             data_schema=self.add_suggested_values_to_schema(
-                _options_schema(), suggestions
+                _options_schema(), _provider_suggestions(suggestions)
             ),
             errors=errors,
         )
