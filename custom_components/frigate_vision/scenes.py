@@ -52,6 +52,10 @@ class SceneRequest:
     # The deployment's own description of what the camera looks at. Injected
     # only into scenes that declare `accepts_scene_description`.
     scene_description: str = ""
+    # 该 entry 自定义的标签与定义，有序。空表示用场景内置的标签集。
+    scene_labels: tuple[tuple[str, str], ...] = ()
+    # 该 entry 自定义的规则全文。空表示用场景内置的 template。
+    prompt_override: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,10 +80,16 @@ class Scene:
     def render(self, request: SceneRequest) -> str:
         """Return the prompt for this scene.
 
-        The response contract is appended rather than embedded, because the
-        allowed set is supplied per call: the endpoint rejects
-        `response_format: json_schema`, so the model only knows the permitted
-        values if the prompt lists them.
+        契约与布局总是自动附加：前者是解析器依赖的格式，去掉答案就无法解析；
+        后者是该摄像头视野的事实，规则里引用「入户门」等词依赖它。
+
+        自定义配置只替换**规则那一段**——内置的 template + 标签定义，或用户的
+        覆盖文本。这是「整段覆盖」的含义：用户写自己的判断依据，而不是在默认
+        规则上追加。
+
+        覆盖与自定义标签是正交的：只写覆盖时，内置标签定义仍会附加（不解释
+        标签含义会让弃权率从 11% 升到 55%）；只写标签时，内置 template 仍会
+        附加。两者都没写时，行为与加这个功能之前完全一致。
         """
         parts = [self._common(request.language)]
         if request.allowed:
@@ -89,10 +99,17 @@ class Scene:
         # told which door that is before it is told how to reason about it.
         if self.accepts_scene_description:
             parts.append(_scene_context(request.scene_description))
-        parts.append(self.template)
-        # After the template: these are definitions of what the remaining words
-        # mean, so they belong with the rules rather than before them.
-        parts.append(self._glossary(request.allowed))
+        override = request.prompt_override.strip()
+        if override:
+            parts.append(override)
+        else:
+            parts.append(self.template)
+        # 标签定义：自定义优先，否则用内置的。覆盖不影响这一选择——只写规则
+        # 时内置定义仍要出现。
+        if request.scene_labels:
+            parts.append(_custom_glossary(request.scene_labels))
+        elif not override:
+            parts.append(self._glossary(request.allowed))
         for name in sorted(self.signals):
             # Only declared signals are consulted; anything else in the request
             # is deliberately ignored.
@@ -208,6 +225,26 @@ def parse_scene_labels(text: str) -> tuple[tuple[str, str], ...]:
     if len(labels) > MAX_SCENE_LABELS:
         raise ValueError("too_many_labels")
     return tuple(labels)
+
+
+def _custom_glossary(labels: tuple[tuple[str, str], ...]) -> str:
+    """用该 entry 自己的定义渲染标签说明。
+
+    与 `_glossary` 同形，但不过滤：自定义标签集就是用户为这个摄像头写的全部
+    答案，没有「场景定义了但这次没提供」的情况。
+
+    定义末尾没有标点时补一个「；」——用户手写时通常不带，不补的话相邻两条定义
+    会黏成一句。已经有标点（「。」或「；」）时不重复添加。
+    """
+    if not labels:
+        return ""
+    parts: list[str] = []
+    for name, definition in labels:
+        text = definition.strip()
+        if text and text[-1] not in "。；;.":
+            text += "；"
+        parts.append(f"{name}{text}")
+    return "其余标签按实际可见动作选择：" + "".join(parts)
 
 
 # Wraps the deployment's description so the model reads it as context rather

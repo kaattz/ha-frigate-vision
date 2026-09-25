@@ -731,5 +731,152 @@ def test_scene_labels_accepts_a_definition_containing_a_colon() -> None:
     assert parsed == (("pet", "a cat: or a dog"),)
 
 
+def test_empty_custom_config_reproduces_todays_prompt_byte_for_byte() -> None:
+    """两个选项都空时，提示词必须与今天逐字节相同——零回归。
+
+    这是整个改动的地基：既有部署不配置任何东西，行为就不能变。
+    """
+    scene = SCENES["review_six"]
+    today = scene.render(
+        SceneRequest(language="中文", allowed=scene.classifications, signals={})
+    )
+    with_empty = scene.render(
+        SceneRequest(
+            language="中文",
+            allowed=scene.classifications,
+            signals={},
+            scene_labels=(),
+            prompt_override="",
+        )
+    )
+    assert with_empty == today
+
+
+def test_custom_labels_replace_the_builtin_glossary() -> None:
+    """自定义标签的定义必须进提示词，内置定义必须消失。"""
+    scene = SCENES["review_six"]
+    labels = (("宠物", "画面中只有宠物"), ("无人", "画面中没有任何人物"))
+    prompt = scene.render(
+        SceneRequest(
+            language="中文",
+            allowed={name for name, _ in labels},
+            signals={},
+            scene_labels=labels,
+        )
+    )
+    assert "宠物" in prompt and "画面中只有宠物" in prompt
+    assert "elevator_activity" not in prompt, "内置标签不该出现在自定义配置里"
+
+
+def test_the_contract_lists_exactly_the_custom_labels() -> None:
+    """契约枚举必须恰好是自定义标签，一个不多一个不少。"""
+    scene = SCENES["review_six"]
+    labels = (("宠物", "画面中只有宠物"), ("无人", "画面中没有任何人物"))
+    prompt = scene.render(
+        SceneRequest(
+            language="中文",
+            allowed={name for name, _ in labels},
+            signals={},
+            scene_labels=labels,
+        )
+    )
+    contract = prompt.split("必须严格取以下之一：")[1].split("。")[0]
+    assert set(contract.split("、")) == {"宠物", "无人"}
+
+
+def test_prompt_override_replaces_the_rules_but_keeps_contract_and_layout() -> None:
+    """覆盖只换「规则+标签定义」那一段；契约和布局必须仍在，否则答案无法解析。"""
+    scene = SCENES["review_six"]
+    prompt = scene.render(
+        SceneRequest(
+            language="中文",
+            allowed=scene.classifications,
+            signals={},
+            scene_description="现场布局：测试布局",
+            prompt_override="自定义规则：只按可见动作判断。",
+        )
+    )
+    assert "自定义规则：只按可见动作判断。" in prompt
+    assert "JSON必须且只能包含三个字段" in prompt, "契约必须仍在"
+    assert "测试布局" in prompt, "布局必须仍在"
+    assert "关于回家与离家" not in prompt, "内置规则必须消失"
+
+
+def test_override_and_custom_labels_can_be_used_together() -> None:
+    """用户同时写规则和标签时，两者都要生效，且内置定义不出现。"""
+    scene = SCENES["review_six"]
+    labels = (("宠物", "画面中只有宠物"),)
+    prompt = scene.render(
+        SceneRequest(
+            language="中文",
+            allowed={"宠物"},
+            signals={},
+            prompt_override="自定义规则：只判断有没有宠物。",
+            scene_labels=labels,
+        )
+    )
+    assert "自定义规则：只判断有没有宠物。" in prompt
+    assert "宠物" in prompt
+    assert "画面中只有宠物" in prompt
+    assert "elevator_activity" not in prompt
+
+
+def test_a_definition_without_a_terminator_gets_one() -> None:
+    """用户手写的定义通常不带结尾标点，渲染时要补上，否则句子会黏在一起。"""
+    scene = SCENES["review_six"]
+    prompt = scene.render(
+        SceneRequest(
+            language="中文",
+            allowed={"宠物", "无人"},
+            signals={},
+            scene_labels=(("宠物", "画面中只有宠物"), ("无人", "画面中没有任何人物")),
+        )
+    )
+    assert "画面中只有宠物；" in prompt
+    assert "画面中没有任何人物；" in prompt
+
+
+def test_a_definition_that_already_ends_in_punctuation_is_not_doubled() -> None:
+    """已经带结尾标点的定义不能再补一个，否则出现「。。；」这样的重复标点。
+
+    内置 glossary 的值自带结尾标点（elevator_activity 以「；」结尾，
+    short_roundtrip 以「。」结尾），而 _glossary 不追加标点。用户手写时两种
+    都可能出现，所以两条路径都要正确。
+    """
+    scene = SCENES["review_six"]
+    prompt = scene.render(
+        SceneRequest(
+            language="中文",
+            allowed={"宠物", "无人"},
+            signals={},
+            scene_labels=(
+                ("宠物", "画面中只有宠物。"),
+                ("无人", "画面中没有任何人物；"),
+            ),
+        )
+    )
+    assert "画面中只有宠物。；" not in prompt, "结尾是「。」时不该再补「；」"
+    assert "画面中没有任何人物；；" not in prompt, "结尾是「；」时不该再补「；」"
+    assert "画面中只有宠物。" in prompt
+    assert "画面中没有任何人物；" in prompt
+
+
+def test_an_override_alone_still_states_the_custom_labels() -> None:
+    """只写规则、不写标签时，内置标签定义仍应附加（否则模型不知道标签含义）。
+
+    实测本部署：不解释标签含义时弃权率 55%，解释后降到 11%。
+    """
+    scene = SCENES["review_six"]
+    prompt = scene.render(
+        SceneRequest(
+            language="中文",
+            allowed=scene.classifications,
+            signals={},
+            prompt_override="自定义规则：只按可见动作判断。",
+        )
+    )
+    assert "elevator_activity" in prompt, "没有自定义标签时，内置定义必须仍在"
+
+
 
 
