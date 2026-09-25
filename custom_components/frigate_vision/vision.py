@@ -42,9 +42,21 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from PIL import Image, UnidentifiedImageError
 
-from .const import CONF_SCENE_DESCRIPTION, MAX_SCENE_DESCRIPTION_LENGTH
+from .const import (
+    CONF_PROMPT_OVERRIDE,
+    CONF_SCENE_DESCRIPTION,
+    CONF_SCENE_LABELS,
+    MAX_PROMPT_OVERRIDE_LENGTH,
+    MAX_SCENE_DESCRIPTION_LENGTH,
+)
 from .models import ActivityRecord, ActivityStage, analysis_key
-from .scenes import SCENES, SceneRequest, effective_prompt_version, scene_for
+from .scenes import (
+    SCENES,
+    SceneRequest,
+    effective_prompt_version,
+    parse_scene_labels,
+    scene_for,
+)
 from .store import ActivityStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -108,6 +120,9 @@ class VisionConfig:
     # and empty means the prompt is byte-for-byte what it was before this
     # option existed.
     scene_description: str = ""
+    # 该 entry 自定义的标签与提示词覆盖，原样来自选项。空表示用场景内置的。
+    scene_labels: str = ""
+    prompt_override: str = ""
 
     def endpoint(self) -> str:
         """Return the chat-completions URL for this base URL.
@@ -235,6 +250,10 @@ def vision_config_from(
         scene_description=pick(CONF_SCENE_DESCRIPTION)[
             :MAX_SCENE_DESCRIPTION_LENGTH
         ],
+        scene_labels=pick(CONF_SCENE_LABELS, ""),
+        prompt_override=pick(CONF_PROMPT_OVERRIDE, "")[
+            :MAX_PROMPT_OVERRIDE_LENGTH
+        ],
     )
 
 
@@ -285,13 +304,26 @@ class VisionClient:
         scene = scene_for(record.evidence_mode)
         if scene is None:
             raise VisionError("unsupported_evidence_mode")
-        allowed = set(scene.classifications)
+        # 解析一次，同一份有序列表同时喂给提示词渲染和缓存键。两者若拿到
+        # 不同的顺序，键会漂移（只是多一次缓存未命中，不会拿到过期答案），
+        # 但没必要冒这个风险。
+        custom_labels = parse_scene_labels(self._config.scene_labels)
+        # 契约枚举与答案校验必须用同一个集合：改了一边而另一边不认，答案会被
+        # invalid_llm_response 静默丢弃，用户只看到「没有通知」。
+        allowed = (
+            {name for name, _ in custom_labels}
+            if custom_labels
+            else set(scene.classifications)
+        )
 
         key = analysis_key(
             activity_id,
             record.evidence_mode,
             effective_prompt_version(
-                record.evidence_mode, self._config.scene_description
+                record.evidence_mode,
+                self._config.scene_description,
+                scene_labels=custom_labels,
+                prompt_override=self._config.prompt_override,
             )
             or scene.prompt_version,
         )
@@ -471,9 +503,11 @@ async def async_analyze(
     scene = scene_for(evidence_mode)
     if scene is None:
         raise VisionError("unsupported_evidence_mode")
+    custom_labels = parse_scene_labels(config.scene_labels)
     prompt = scene.render(
         SceneRequest(
             language=config.language,
+            # 这里的 allowed 由调用方派生，与答案校验用的是同一个集合。
             allowed=allowed,
             # Only the signals this scene declared are passed on; the rest are
             # dropped here rather than filtered inside the scene, so an
@@ -483,6 +517,8 @@ async def async_analyze(
                 "opening_side": opening_side,
             },
             scene_description=config.scene_description,
+            scene_labels=custom_labels,
+            prompt_override=config.prompt_override,
         )
     )
     image_bytes = await asyncio.get_running_loop().run_in_executor(
@@ -506,9 +542,17 @@ async def async_analyze(
         classification,
     )
     # The effective version, not the bare scene one: the caller stores this and
-    # the store rebuilds the claimed key from it. See the docstring.
+    # the store rebuilds the claimed key from it. See the docstring. It must come
+    # from the same three inputs -- and the same label order -- as the key the
+    # caller claimed, or the analysis fails with `side_effect_key_mismatch`
+    # after the provider has already been billed.
     version = (
-        effective_prompt_version(evidence_mode, config.scene_description)
+        effective_prompt_version(
+            evidence_mode,
+            config.scene_description,
+            scene_labels=custom_labels,
+            prompt_override=config.prompt_override,
+        )
         or scene.prompt_version
     )
     return classification, description, confidence, version

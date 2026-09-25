@@ -625,3 +625,183 @@ async def test_connection_probe_sends_the_thinking_toggle() -> None:
     session = _FakeSession()
     await async_test_connection(session, _config(thinking="default"))  # type: ignore[arg-type]
     assert "thinking" not in session.payloads[0]
+
+
+def test_a_custom_label_is_accepted_and_a_builtin_one_is_not() -> None:
+    """自定义标签必须被校验器接受，内置标签必须被拒绝。
+
+    这是整个功能的核心不变量：契约渲染与答案校验用同一个 allowed 集合。
+    若两者不一致，模型按自定义标签回答而校验器只认内置标签，答案会被
+    invalid_llm_response 静默丢弃，用户只看到「没有通知」。
+    """
+    from custom_components.frigate_vision.vision import validate_response
+
+    allowed = {"宠物", "无人"}
+    got, _d, _c = validate_response(
+        _body('{"classification":"宠物","description":"只有一只猫。","confidence":80}'),
+        allowed,
+    )
+    assert got == "宠物"
+    with pytest.raises(VisionError, match="invalid_llm_response"):
+        validate_response(
+            _body(
+                '{"classification":"elevator_activity",'
+                '"description":"x","confidence":80}'
+            ),
+            allowed,
+        )
+
+
+def test_the_config_carries_custom_labels_and_override() -> None:
+    """配置对象必须能携带这两个新设置，否则接线无处可接。"""
+    from custom_components.frigate_vision.vision import VisionConfig
+
+    config = VisionConfig(
+        base_url="https://api.example.com/v1",
+        api_key="k",
+        model="m",
+        scene_labels="宠物: 只有宠物",
+        prompt_override="自定义规则。",
+    )
+    assert config.scene_labels == "宠物: 只有宠物"
+    assert config.prompt_override == "自定义规则。"
+
+
+def test_vision_config_from_reads_both_new_options() -> None:
+    """两个新选项必须从 entry 的 options/data 里读出来。"""
+    from custom_components.frigate_vision.vision import vision_config_from
+
+    config = vision_config_from(
+        {},
+        {
+            "llm_base_url": "https://api.example.com/v1",
+            "llm_api_key": "k",
+            "llm_model": "m",
+            "scene_labels": "宠物: 只有宠物",
+            "prompt_override": "自定义规则。",
+        },
+    )
+    assert config.scene_labels == "宠物: 只有宠物"
+    assert config.prompt_override == "自定义规则。"
+
+
+def test_vision_config_from_defaults_the_new_options_to_empty() -> None:
+    """没配置时必须是空字符串——空意味着「用内置场景」，零回归。"""
+    from custom_components.frigate_vision.vision import vision_config_from
+
+    config = vision_config_from(
+        {},
+        {
+            "llm_base_url": "https://api.example.com/v1",
+            "llm_api_key": "k",
+            "llm_model": "m",
+        },
+    )
+    assert config.scene_labels == ""
+    assert config.prompt_override == ""
+
+
+def test_the_prompt_override_is_capped_at_the_configured_limit() -> None:
+    """超长文本要在读入时截断，避免误粘一整篇文档把提示词撑爆。"""
+    from custom_components.frigate_vision.const import MAX_PROMPT_OVERRIDE_LENGTH
+    from custom_components.frigate_vision.vision import vision_config_from
+
+    config = vision_config_from(
+        {},
+        {
+            "llm_base_url": "https://api.example.com/v1",
+            "llm_api_key": "k",
+            "llm_model": "m",
+            "prompt_override": "x" * (MAX_PROMPT_OVERRIDE_LENGTH + 500),
+        },
+    )
+    assert len(config.prompt_override) == MAX_PROMPT_OVERRIDE_LENGTH
+
+
+async def test_a_configured_entry_analyses_and_completes_its_claim(
+    hass: HomeAssistant,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """配上自定义标签后，整条 claim -> analyse -> complete 必须仍然走通。
+
+    这是接线的端到端护栏，也是三个各自独立的失效点合流的地方：
+
+    1. 校验器：模型答的是自定义标签，所以 `allowed` 必须来自 entry 的配置。
+       若仍用 `scene.classifications`，这一格答案会被 invalid_llm_response
+       静默丢弃，用户只看到「没有通知」。
+    2. 缓存键：`VisionClient` 认领副作用时把配置折进了键。
+    3. 返回的版本：模块级函数必须用**同样三个输入**算出 effective version
+       返回，否则 store 重建出的键与认领的键不符，分析在**已经计费之后**
+       以 side_effect_key_mismatch 失败。
+
+    这三处各自都有单测通过、合起来却全断的先例（见
+    `test_client_completes_the_analysis_it_claimed` 的 docstring），所以必须
+    用一次真实调用把它们串起来验证。
+    """
+    from custom_components.frigate_vision.models import (
+        ActivityRecord,
+        ActivitySource,
+        ActivityStage,
+        ProcessingMode,
+    )
+    from custom_components.frigate_vision.store import ActivityStore
+    from custom_components.frigate_vision.vision import VisionClient
+
+    sheet = tmp_path / "activity.png"
+    sheet.write_bytes(_png(640, 240))
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="activity_1",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.EVIDENCE_READY,
+            processing_mode=ProcessingMode.SHADOW,
+            created_at=1,
+            updated_at=1,
+            camera="front",
+            evidence_mode="review_six",
+            evidence_path=str(sheet),
+        )
+    )
+
+    reply = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "classification": "猫",
+                                "description": "画面里只有一只猫。",
+                                "confidence": 71,
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+    )
+    session = _FakeSession(body=reply)
+    monkeypatch.setattr(
+        "custom_components.frigate_vision.vision.async_get_clientsession",
+        lambda _hass: session,
+    )
+
+    config = _config(scene_labels="猫: 只有一只猫", prompt_override="只看猫。")
+    client = VisionClient(hass, store, config)
+    done = await client.async_analyze("activity_1")
+
+    assert done.stage is ActivityStage.ANALYSIS_DONE
+    # 内置标签集里没有「猫」，所以这一格能到 ANALYSIS_DONE，就证明校验器
+    # 用的确实是 entry 自己的 `allowed`。
+    assert done.classification == "猫"
+    assert done.confidence == 71
+    # 提示词契约里枚举的必须就是模型答出来的那个标签。
+    content = session.payloads[0]["messages"][0]["content"]
+    prompt = content[0]["text"]
+    assert "猫" in prompt
+    assert "elevator_activity" not in prompt
