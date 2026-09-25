@@ -115,15 +115,24 @@
           "llm_base_url": "Base URL",
           "llm_api_key": "API key",
           "llm_model": "Model",
+          "llm_reasoning_effort": "Reasoning effort",
           "llm_thinking": "Reasoning",
           "target_width": "Image width",
           "max_tokens": "Maximum tokens",
           "output_language": "Output language",
+          "scene_description": "Scene description",
+          "scene_labels": "Labels",
+          "prompt_override": "Judgement rules",
           "history_retention_days": "History retention days",
           "media_retention_days": "Media retention days",
           "queue_size": "Queue size",
+          "min_review_seconds": "Minimum activity length (seconds)",
           "analyze_night_unknown": "Analyze unknown night activity",
           "analyze_all_far_reviews": "Analyze all far-zone reviews"
+        },
+        "data_description": {
+          "scene_labels": "One per line as `name: definition`, with a half-width colon (not the full-width `：` that a Chinese IME types by default). Leave empty to use the built-in set. Always give a definition: without one the model can only guess, and abstention rose from 11% to 55% when definitions were missing.",
+          "prompt_override": "Leave empty to use the built-in judgement rules. The output contract and the scene description are still appended automatically, because both the parser and the rules depend on them."
         }
       },
       "test_connection": {

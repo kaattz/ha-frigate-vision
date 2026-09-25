@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from aiohttp import InvalidURL, web
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
@@ -1185,4 +1186,116 @@ async def test_a_long_scene_description_is_truncated_not_rejected(
 
     config = vision_config_from({}, {"scene_description": "长" * 2000})
     assert len(config.scene_description) == MAX_SCENE_DESCRIPTION_LENGTH
+
+
+def test_the_options_form_offers_labels_and_a_prompt_override() -> None:
+    """两个新字段必须在表单上，否则用户改不了。"""
+    from custom_components.frigate_vision import config_flow
+    from custom_components.frigate_vision.const import (
+        CONF_PROMPT_OVERRIDE,
+        CONF_SCENE_LABELS,
+    )
+
+    schema = config_flow._options_schema()
+    fields = {getattr(m, "schema", None) for m in schema.schema}
+    assert CONF_SCENE_LABELS in fields
+    assert CONF_PROMPT_OVERRIDE in fields
+
+
+def test_every_options_field_has_a_translated_label() -> None:
+    """选项表单上每个字段都要有标签，否则界面显示原始键名。
+
+    scene_description 此前在三份文件里都缺标签，llm_reasoning_effort 与
+    min_review_seconds 在 en.json 里也缺——用户看到的是 `scene_description`
+    这样的原始键，读起来像集成出了 bug。
+    """
+    import json
+    from pathlib import Path
+
+    from custom_components.frigate_vision import config_flow
+
+    root = Path(config_flow.__file__).parent
+    fields = {
+        getattr(m, "schema", None) for m in config_flow._options_schema().schema
+    }
+    fields.discard(None)
+    for name in ("strings.json", "translations/en.json", "translations/zh-Hans.json"):
+        payload = json.loads((root / name).read_text("utf-8"))
+        labelled = set(payload["options"]["step"]["settings"].get("data", {}))
+        missing = sorted(fields - labelled)
+        assert not missing, f"{name} 缺少标签：{missing}"
+
+
+def test_the_label_field_explains_the_halfwidth_colon() -> None:
+    """字段说明必须写明用半角冒号——中文输入法默认打全角，会报格式错误。
+
+    实测 `parse_scene_labels("宠物：只有宠物")`（全角冒号 U+FF1A）抛
+    label_malformed。中文用户按默认输入法打字就会踩到，所以提示是必需的，
+    不是客套话。
+    """
+    import json
+    from pathlib import Path
+
+    from custom_components.frigate_vision import config_flow
+    from custom_components.frigate_vision.const import CONF_SCENE_LABELS
+
+    root = Path(config_flow.__file__).parent
+    for name in ("translations/en.json", "translations/zh-Hans.json"):
+        payload = json.loads((root / name).read_text("utf-8"))
+        descriptions = payload["options"]["step"]["settings"].get(
+            "data_description", {}
+        )
+        text = descriptions.get(CONF_SCENE_LABELS, "")
+        assert text, f"{name} 没有为 {CONF_SCENE_LABELS} 写字段说明"
+        assert ":" in text, (
+            f"{name} 的说明必须展示半角冒号的格式示例，"
+            "否则中文输入法用户不知道要用半角"
+        )
+
+
+def test_an_invalid_label_line_is_rejected_when_saving() -> None:
+    """保存时就报错，而不是等到分析失败——那时用户只看到「没有通知」。"""
+    from custom_components.frigate_vision.scenes import parse_scene_labels
+
+    with pytest.raises(ValueError, match="label_malformed"):
+        parse_scene_labels("宠物 没有冒号")
+
+
+async def test_saving_bad_labels_shows_an_error_instead_of_storing_them(
+    hass: HomeAssistant,
+) -> None:
+    """畸形标签必须挡在保存之前，且表单要保留用户已填的其他内容。"""
+    from custom_components.frigate_vision.const import CONF_SCENE_LABELS
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"processing_mode": "observe", "scene_labels": ""},
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings"}
+    )
+    assert result["step_id"] == "settings"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            "processing_mode": "observe",
+            "target_width": 768,
+            "max_tokens": 20000,
+            "output_language": "zh-CN",
+            "history_retention_days": 30,
+            "media_retention_days": 7,
+            "queue_size": 10,
+            CONF_SCENE_LABELS: "宠物 没有冒号",
+        },
+    )
+    # 表单重新显示并带上错误，而不是创建条目。
+    assert result["type"] is FlowResultType.FORM
+    assert CONF_SCENE_LABELS in result.get("errors", {}), (
+        "畸形标签必须在保存时报错"
+    )
 

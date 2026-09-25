@@ -39,12 +39,15 @@ from .const import (
     CONF_MQTT_TOPIC_PREFIX,
     CONF_NAME,
     CONF_NEAR_ZONES,
+    CONF_PROMPT_OVERRIDE,
     CONF_SCENE_DESCRIPTION,
+    CONF_SCENE_LABELS,
     CONF_TRANSITION_ZONES,
     DOMAIN,
     PROCESSING_MODES,
     PROVIDER_PRESETS,
 )
+from .scenes import parse_scene_labels
 from .vision import (
     REASONING_EFFORTS,
     THINKING_MODES,
@@ -117,6 +120,16 @@ def _options_schema() -> vol.Schema:
             # Optional. Empty keeps the prompt exactly as it was, so a
             # deployment that does not need this is unaffected.
             vol.Optional(CONF_SCENE_DESCRIPTION, default=""): selector.TextSelector(
+                selector.TextSelectorConfig(multiline=True)
+            ),
+            # 该摄像头自己的标签集，每行一条「标签: 定义」。留空表示用内置场景
+            # 的标签（出厂默认即电梯厅那套）。
+            vol.Optional(CONF_SCENE_LABELS, default=""): selector.TextSelector(
+                selector.TextSelectorConfig(multiline=True)
+            ),
+            # 该摄像头自己的判断规则。留空表示用内置规则；契约与现场布局仍会
+            # 自动附加，因为解析器和规则都依赖它们。
+            vol.Optional(CONF_PROMPT_OVERRIDE, default=""): selector.TextSelector(
                 selector.TextSelectorConfig(multiline=True)
             ),
             vol.Required("history_retention_days", default=30): vol.All(
@@ -698,12 +711,25 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
     async def async_step_settings(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
         if user_input is not None:
-            return self.async_create_entry(data=user_input)
+            # 保存时就校验标签格式：这个选项流是整体替换，填错了会被直接存进去，
+            # 之后每次分析都失败，而用户只看到「没有通知」——错误发生在离原因
+            # 很远的地方。
+            try:
+                parse_scene_labels(str(user_input.get(CONF_SCENE_LABELS, "")))
+            except ValueError as exc:
+                errors[CONF_SCENE_LABELS] = str(exc)
+            else:
+                return self.async_create_entry(data=user_input)
+        # 校验失败时回填用户这次提交的内容，否则表单会清空他填的一切。
         schema = self.add_suggested_values_to_schema(
-            _options_schema(), self.config_entry.options
+            _options_schema(),
+            user_input if user_input is not None else self.config_entry.options,
         )
-        return self.async_show_form(step_id="settings", data_schema=schema)
+        return self.async_show_form(
+            step_id="settings", data_schema=schema, errors=errors
+        )
 
     async def async_step_test_connection(
         self, user_input: dict[str, Any] | None = None
