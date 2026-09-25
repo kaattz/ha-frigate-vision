@@ -43,6 +43,8 @@ from .const import (
     CONF_SCENE_DESCRIPTION,
     CONF_SCENE_LABELS,
     CONF_TRANSITION_ZONES,
+    DEFAULT_PROMPT_OVERRIDE,
+    DEFAULT_SCENE_LABELS,
     DOMAIN,
     PROCESSING_MODES,
     PROVIDER_PRESETS,
@@ -122,16 +124,16 @@ def _options_schema() -> vol.Schema:
             vol.Optional(CONF_SCENE_DESCRIPTION, default=""): selector.TextSelector(
                 selector.TextSelectorConfig(multiline=True)
             ),
-            # 该摄像头自己的标签集，每行一条「标签: 定义」。留空表示用内置场景
-            # 的标签（出厂默认即电梯厅那套）。
-            vol.Optional(CONF_SCENE_LABELS, default=""): selector.TextSelector(
-                selector.TextSelectorConfig(multiline=True)
-            ),
-            # 该摄像头自己的判断规则。留空表示用内置规则；契约与现场布局仍会
-            # 自动附加，因为解析器和规则都依赖它们。
-            vol.Optional(CONF_PROMPT_OVERRIDE, default=""): selector.TextSelector(
-                selector.TextSelectorConfig(multiline=True)
-            ),
+            # 该摄像头自己的标签集，每行一条「标签: 定义」。预填出厂默认的电梯厅
+            # 那套，用户在此基础上改；留空表示用内置场景的标签。
+            vol.Optional(
+                CONF_SCENE_LABELS, default=DEFAULT_SCENE_LABELS
+            ): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
+            # 该摄像头自己的判断规则。预填内置规则原文，用户在此基础上改；留空表示
+            # 用内置规则。契约与现场布局仍会自动附加，因为解析器和规则都依赖它们。
+            vol.Optional(
+                CONF_PROMPT_OVERRIDE, default=DEFAULT_PROMPT_OVERRIDE
+            ): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
             vol.Required("history_retention_days", default=30): vol.All(
                 int, vol.Range(1, 365)
             ),

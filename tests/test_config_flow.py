@@ -1299,3 +1299,78 @@ async def test_saving_bad_labels_shows_an_error_instead_of_storing_them(
         "畸形标签必须在保存时报错"
     )
 
+
+def test_the_label_field_is_prefilled_with_all_eleven_lobby_labels() -> None:
+    """预填必须列出全部 11 个标签，不能只有术语表里的 8 个。
+
+    scene_labels 非空时会**替换** allowed 集合。cleaning / home_arrival /
+    home_departure 的定义在规则正文里而不在术语表里，所以只填 8 个会让回家/离家
+    永远无法报出——且没有任何报错，静默失效。
+    """
+    from custom_components.frigate_vision.const import DEFAULT_SCENE_LABELS
+    from custom_components.frigate_vision.scenes import SCENES, parse_scene_labels
+
+    parsed = parse_scene_labels(DEFAULT_SCENE_LABELS)
+    offered = {name for name, _ in parsed}
+    builtin = set(SCENES["review_six"].classifications)
+    assert offered == builtin, (
+        f"预填标签与内置标签集不一致：缺 {sorted(builtin - offered)}，"
+        f"多 {sorted(offered - builtin)}"
+    )
+    # 且每个定义都不能为空——空定义会让模型只能猜。
+    for name, definition in parsed:
+        assert definition.strip(), f"{name} 的定义是空的"
+
+
+def test_the_prompt_override_is_prefilled_with_the_builtin_rules() -> None:
+    """规则预填必须与内置 template 逐字节相同，否则预填就成了另一套规则。"""
+    from custom_components.frigate_vision.const import DEFAULT_PROMPT_OVERRIDE
+    from custom_components.frigate_vision.scenes import SCENES
+
+    assert DEFAULT_PROMPT_OVERRIDE == SCENES["review_six"].template
+
+
+def test_the_option_defaults_are_the_prefilled_lobby_text() -> None:
+    """两个字段的表单默认值必须是预填文本，界面才会显示出来。"""
+    from custom_components.frigate_vision import config_flow
+    from custom_components.frigate_vision.const import (
+        CONF_PROMPT_OVERRIDE,
+        CONF_SCENE_LABELS,
+        DEFAULT_PROMPT_OVERRIDE,
+        DEFAULT_SCENE_LABELS,
+    )
+
+    schema = config_flow._options_schema()
+    found = {}
+    for marker, _selector in schema.schema.items():
+        name = getattr(marker, "schema", None)
+        if name not in (CONF_SCENE_LABELS, CONF_PROMPT_OVERRIDE):
+            continue
+        # voluptuous 把默认值包成无参工厂：`vol.Optional.__init__` 里写的是
+        # `self.default = default_factory(default)`，所以 `marker.default` 永远
+        # 是函数而不是字面值，取默认值必须调用它。
+        default = marker.default
+        found[name] = default() if callable(default) else default
+    assert found[CONF_SCENE_LABELS] == DEFAULT_SCENE_LABELS
+    assert found[CONF_PROMPT_OVERRIDE] == DEFAULT_PROMPT_OVERRIDE
+
+
+def test_an_entry_that_never_saved_them_still_uses_the_builtin_scene() -> None:
+    """存储里没有值时必须仍然走内置场景——预填只影响界面，不改变既有行为。
+
+    这是零回归的关键：线上 entry 的两个字段都是空的，加预填之后它的提示词必须
+    逐字节不变。
+    """
+    from custom_components.frigate_vision.vision import vision_config_from
+
+    config = vision_config_from(
+        {},
+        {
+            "llm_base_url": "https://api.example.com/v1",
+            "llm_api_key": "k",
+            "llm_model": "m",
+        },
+    )
+    assert config.scene_labels == ""
+    assert config.prompt_override == ""
+
