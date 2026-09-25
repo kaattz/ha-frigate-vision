@@ -715,6 +715,70 @@ def test_scene_labels_enforces_the_limits() -> None:
         parse_scene_labels("x" * 193 + ": 定义")
 
 
+def test_a_label_name_with_a_control_character_is_rejected() -> None:
+    r"""标签名的字符集必须与存储层一致，不能只校验长度。
+
+    `ActivityRecord.classification` 用 `SAFE_CLASSIFICATION` 校验，而解析器此前
+    只看长度。实测后果链：`a\tb: 定义` 被解析器接受 → 进入 allowed 集合 →
+    进入契约枚举 → 模型返回 `a\tb` 时 `validate_response` 也接受（它只查是否在
+    allowed 里）→ 写入时 `ActivityRecord` 抛 `ModelValidationError`。那个异常继承
+    自 ValueError 而不是 VisionError，于是落到 runtime 的通用 `except Exception`
+    分支：**provider 已经计费**，活动卡在非终态 `ANALYSIS_STARTED`，没有精确错误
+    码，也不可重试。
+    """
+    from custom_components.frigate_vision.scenes import parse_scene_labels
+
+    with pytest.raises(ValueError, match="label_name_invalid"):
+        parse_scene_labels("a\tb: 定义")
+
+
+@pytest.mark.parametrize(
+    ("label", "accepted"),
+    [
+        ("宠物", True),
+        ("无人", True),
+        ("visitor", True),
+        ("x" * 192, True),
+        ("x" * 193, False),
+        ("a\tb", False),
+        ("a\x00b", False),
+        ("a\x7fb", False),
+        ("a\x9fb", False),
+    ],
+    ids=[
+        "chinese",
+        "chinese-two",
+        "ascii",
+        "192-chars",
+        "193-chars",
+        "tab",
+        "nul",
+        "del",
+        "c1",
+    ],
+)
+def test_the_label_alphabet_matches_the_storage_alphabet(
+    label: str, accepted: bool
+) -> None:
+    """解析器接受的标签名，写入时必须也能被接受。
+
+    两边各写一份字符集就会漂移，而漂移的后果不在解析处显现：它要到写入时才抛
+    错，那时 provider 已经计费。所以这里断言的不是「某个字符被拒绝」，而是两边
+    的判定**逐例相同**。
+    """
+    from custom_components.frigate_vision.models import SAFE_CLASSIFICATION
+    from custom_components.frigate_vision.scenes import parse_scene_labels
+
+    # 存储层的判定就是基准，不接受与否由它定义。
+    assert bool(SAFE_CLASSIFICATION.fullmatch(label)) is accepted
+    if accepted:
+        assert parse_scene_labels(f"{label}: 定义") == ((label, "定义"),)
+    else:
+        with pytest.raises(ValueError) as raised:
+            parse_scene_labels(f"{label}: 定义")
+        assert str(raised.value) in {"label_name_invalid", "label_name_too_long"}
+
+
 def test_scene_labels_ignores_blank_lines() -> None:
     """用户会在段落之间留空行；空行不该报错，也不该产生空标签。"""
     from custom_components.frigate_vision.scenes import parse_scene_labels

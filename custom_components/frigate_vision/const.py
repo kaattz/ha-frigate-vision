@@ -89,9 +89,14 @@ MAX_PROMPT_OVERRIDE_LENGTH = 4000
 # （`vision_config_from` 用 `pick(..., "")`），所以既有 entry 的提示词逐字节
 # 不变——预填不会把内置场景复制进它们的配置里。
 #
-# 标签必须列全部 11 个，不能只列术语表里的 8 个：scene_labels 非空时会**替换**
-# allowed 集合，而 cleaning / home_arrival / home_departure 的定义写在规则正文里、
-# 不在术语表里。只填 8 个会让回家/离家变成永远无法报出，且没有任何报错。
+# 标签必须列**全场景的并集**，不能只列电梯厅那 11 个：scene_labels 非空时会
+# **全局替换** allowed 集合，不区分场景。door_roundtrip 的 short_roundtrip 只属于
+# 它自己，漏掉的话门锁场景的「短暂外出」永远无法报出，且没有任何报错——预填是
+# 默认值，用户不会意识到自己删掉了一个标签。
+#
+# 并集 = 12 个。其中 8 个的定义来自 `CLASSIFICATION_GLOSSARY`，
+# cleaning / home_arrival / home_departure 的定义写在 `review_six` 的 template
+# 正文里（术语表刻意不重复它们），short_roundtrip 的定义同样取自术语表。
 # 顺序按标签名字母序，与 `_glossary` 里的 `sorted()` 一致。
 DEFAULT_SCENE_LABELS = (
     "cleaning: 指连续清楚出现清扫、扫地、拖地或擦拭动作；\n"
@@ -101,6 +106,7 @@ DEFAULT_SCENE_LABELS = (
     "home_departure: 指人物从入户门内走出并远离该门；\n"
     "maintenance: 指维修人员对楼道设施进行作业；\n"
     "package_delivery: 指放下快递包裹且离开后包裹仍留在原处；\n"
+    "short_roundtrip: 指短暂外出后随即返回。\n"
     "suspicious_activity: 指试探门锁、反复徘徊或窥探等可疑行为；\n"
     "unable_to_confirm: 指证据不足或画面质量导致无法判断；\n"
     "unknown_activity: 指画面确实无法支持任何其他判断；\n"

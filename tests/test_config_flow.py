@@ -1300,25 +1300,27 @@ async def test_saving_bad_labels_shows_an_error_instead_of_storing_them(
     )
 
 
-def test_the_label_field_is_prefilled_with_all_eleven_lobby_labels() -> None:
-    """预填必须列出全部 11 个标签，不能只有术语表里的 8 个。
+def test_the_label_prefill_covers_every_scene_not_just_the_lobby() -> None:
+    """预填必须覆盖所有场景的标签并集，不能只列电梯厅的 11 个。
 
-    scene_labels 非空时会**替换** allowed 集合。cleaning / home_arrival /
-    home_departure 的定义在规则正文里而不在术语表里，所以只填 8 个会让回家/离家
-    永远无法报出——且没有任何报错，静默失效。
+    scene_labels 非空时会**全局替换** allowed 集合，不区分场景。door_roundtrip
+    的 short_roundtrip 只属于它自己，若预填漏掉，门锁场景的「短暂外出」就永远
+    无法报出——而且没有任何报错。
     """
     from custom_components.frigate_vision.const import DEFAULT_SCENE_LABELS
     from custom_components.frigate_vision.scenes import SCENES, parse_scene_labels
 
-    parsed = parse_scene_labels(DEFAULT_SCENE_LABELS)
-    offered = {name for name, _ in parsed}
-    builtin = set(SCENES["review_six"].classifications)
-    assert offered == builtin, (
-        f"预填标签与内置标签集不一致：缺 {sorted(builtin - offered)}，"
-        f"多 {sorted(offered - builtin)}"
+    offered = {name for name, _ in parse_scene_labels(DEFAULT_SCENE_LABELS)}
+    union = {label for scene in SCENES.values() for label in scene.classifications}
+    assert offered == union, (
+        f"预填标签与全场景并集不一致：缺 {sorted(union - offered)}，"
+        f"多 {sorted(offered - union)}"
     )
-    # 且每个定义都不能为空——空定义会让模型只能猜。
-    for name, definition in parsed:
+    # 每个场景自己独有的标签都必须在里面。
+    for mode, scene in SCENES.items():
+        missing = sorted(set(scene.classifications) - offered)
+        assert not missing, f"{mode} 的标签 {missing} 不在预填里"
+    for name, definition in parse_scene_labels(DEFAULT_SCENE_LABELS):
         assert definition.strip(), f"{name} 的定义是空的"
 
 

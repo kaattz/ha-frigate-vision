@@ -27,6 +27,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from .const import MAX_LABEL_DEFINITION_LENGTH, MAX_SCENE_LABELS
+from .models import MAX_CLASSIFICATION_LENGTH, SAFE_CLASSIFICATION
 
 # Bumped whenever any scene's wording changes in a way that could alter its
 # answer. It is part of the analysis cache key, so a stale result is never
@@ -197,6 +198,12 @@ def parse_scene_labels(text: str) -> tuple[tuple[str, str], ...]:
     用第一个冒号作为分隔符，这样定义里可以再出现冒号（英文解释常见）。
     空白行忽略：用户在段落之间留空行是正常的。
 
+    标签名用 `SAFE_CLASSIFICATION` 校验，而不是只数长度：这个标签会进 allowed
+    集合、进契约枚举，模型照契约回它，最后写入 `ActivityRecord.classification`。
+    解析器比存储层宽就会漂移，而漂移在这里不报错——它要到写入时才炸，那时
+    provider 已经计费，异常还不是 `VisionError`，于是变成不可重试的
+    `analysis_outcome_unknown`。两边同源，就不会有这段距离。
+
     抛出 ValueError，其消息就是错误码，供配置流程直接展示给用户。
     """
     labels: list[tuple[str, str]] = []
@@ -212,8 +219,12 @@ def parse_scene_labels(text: str) -> tuple[tuple[str, str], ...]:
         definition = definition.strip()
         if not name:
             raise ValueError("label_malformed")
-        if len(name) > 192:
+        # 长度先报，再报字符集：193 个 ASCII 字符同时违反两条，但「太长」是
+        # 用户更能直接照做的那个提示。
+        if len(name) > MAX_CLASSIFICATION_LENGTH:
             raise ValueError("label_name_too_long")
+        if not SAFE_CLASSIFICATION.fullmatch(name):
+            raise ValueError("label_name_invalid")
         if not definition:
             raise ValueError("label_definition_missing")
         if len(definition) > MAX_LABEL_DEFINITION_LENGTH:

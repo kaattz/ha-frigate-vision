@@ -12,12 +12,25 @@ from typing import Any, Self
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,192}$")
 SAFE_SIDE_EFFECT_KEY = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+# 分类值的最大长度。与下面的正则同源，不在别处再写一遍字面量：`scenes.py` 的
+# 标签名校验要用同一个界，两处各写一个数字就会漂移。
+#
+# 刻意不复用 `SAFE_ID` 的 192——那两个数字只是碰巧相等，收紧其中一个不应该
+# 牵动另一个。
+MAX_CLASSIFICATION_LENGTH = 192
 # 分类值允许中文：用户要能写「宠物」而不必被迫写 ASCII。
 # 比 SAFE_ID 宽，但仍拒绝控制字符与各类行终止符——那些会真的破坏通知显示和
 # 日志。除 ASCII 控制字符（含 DEL）外还要排除 C1 区（\x7f-\x9f）与 U+2028/
 # U+2029：后两者是 JavaScript 的行终止符，会真的终止 JS 语句，而分类值会
 # 流向 HA 前端模板与蓝图 Jinja2 模板。
-SAFE_CLASSIFICATION = re.compile(r"^[^\x00-\x1f\x7f-\x9f\u2028\u2029]{1,192}$")
+#
+# 这是分类值的**唯一**字符集定义：`parse_scene_labels` 直接引用它，所以解析器
+# 接受的标签名与存储层接受的值不会漂移。漂移的后果不在解析处显现——畸形标签要
+# 等到写入 `ActivityRecord` 时才抛错，那时 provider 已经计费，而且这个异常不是
+# `VisionError`，会落进通用分支变成 `analysis_outcome_unknown`。
+SAFE_CLASSIFICATION = re.compile(
+    rf"^[^\x00-\x1f\x7f-\x9f\u2028\u2029]{{1,{MAX_CLASSIFICATION_LENGTH}}}$"
+)
 
 
 class ModelValidationError(ValueError):
