@@ -88,22 +88,6 @@ def _parse_base_url(value: str) -> URL:
     return parsed
 
 
-def _provider_suggestions(options: Mapping[str, Any]) -> dict[str, Any]:
-    """Fill in `llm_provider` from the stored URL when the entry has no such key.
-
-    The dropdown postdates existing entries, so the key is simply absent for them.
-    Left absent, the field falls back to the schema default and the dialog claims
-    DeepSeek for an entry on a local router. Deriving it from the URL keeps the
-    dialog honest, and leaves a stored value untouched when there is one.
-    """
-    if options.get(CONF_LLM_PROVIDER):
-        return dict(options)
-    return {
-        **options,
-        CONF_LLM_PROVIDER: _provider_for_url(str(options.get(CONF_LLM_BASE_URL, ""))),
-    }
-
-
 def _options_schema() -> vol.Schema:
     return vol.Schema(
         {
@@ -114,15 +98,13 @@ def _options_schema() -> vol.Schema:
             # changed from the UI at any time; changing the credential should
             # not require removing and re-adding the integration.
             #
-            # The dropdown belongs here as much as on the initial step: switching
-            # provider is what this dialog is for, and without it the only way to
-            # switch was to delete the entry and add it again. Same options and
-            # same label text as `_llm_schema()`, so one field does not read as two.
-            vol.Optional(
-                CONF_LLM_PROVIDER, default=CONF_LLM_PROVIDER_DEFAULT
-            ): selector.SelectSelector(
-                selector.SelectSelectorConfig(options=_provider_options())
-            ),
+            # `llm_provider` is deliberately not a field here. It used to be, and
+            # it was the source of the "I switched provider and nothing happened"
+            # report: the form showed a value derived from the URL while the
+            # submit-time guard compared against the stored one, so the two could
+            # disagree and the switch silently did nothing. Choosing a provider is
+            # now a menu tap that prefills this form, so there is nothing left for
+            # a dropdown here to do.
             vol.Optional(CONF_LLM_BASE_URL, default=CONF_LLM_BASE_URL_DEFAULT): _text(),
             vol.Optional(CONF_LLM_API_KEY): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
@@ -628,7 +610,7 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
             step_id="options",
             data_schema=self.add_suggested_values_to_schema(
                 _options_schema(),
-                _provider_suggestions(self._data.get("llm") or {}),
+                self._data.get("llm") or {},
             ),
         )
     async def async_step_reconfigure(
@@ -803,37 +785,96 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
             },
         )
 
+    async def async_step_provider(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Offer the providers as a menu.
+
+        A menu rather than a dropdown on the settings form, because a menu tap is a
+        real round trip: the settings form is then rebuilt from the server's answer,
+        so it arrives with the URL and model already filled in. Selecting a dropdown
+        entry sends nothing -- server code only runs on submit -- which is why the
+        earlier dropdown left the URL untouched and read as "nothing happened".
+
+        The labels are literal text rather than translation keys because a dict
+        `menu_options` value is rendered verbatim, with no translation lookup.
+        """
+        return self.async_show_menu(
+            step_id="provider",
+            menu_options={
+                **{
+                    f"provider_{name}": _PROVIDER_LABELS.get(name, name)
+                    for name in PROVIDER_PRESETS
+                },
+                "provider_custom": "其他 / Other (type a URL)",
+            },
+        )
+
+    async def _async_apply_provider(self, provider: str) -> ConfigFlowResult:
+        """Show the settings form with this provider's URL and model filled in.
+
+        The URL and the first preset model are passed as suggested values, which the
+        frontend prefers over the schema defaults when it rebuilds the form. Both
+        stay editable, so this is a starting point rather than a commitment --
+        switching provider is a shortcut for filling the fields in, not a lock.
+
+        `custom` fills in nothing: the user picked it precisely because they intend
+        to type their own endpoint, and overwriting a working one is worse than
+        leaving it alone.
+        """
+        suggestions: dict[str, Any] = dict(self.config_entry.options)
+        preset_url = _preset_base_url(provider)
+        preset = PROVIDER_PRESETS.get(provider)
+        if preset_url is not None:
+            suggestions[CONF_LLM_BASE_URL] = preset_url
+        if preset is not None and preset["models"]:
+            suggestions[CONF_LLM_MODEL] = preset["models"][0]
+        return self.async_show_form(
+            step_id="settings",
+            data_schema=self.add_suggested_values_to_schema(
+                _options_schema(), suggestions
+            ),
+        )
+
+    async def async_step_provider_deepseek(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        return await self._async_apply_provider("deepseek")
+
+    async def async_step_provider_gemini(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        return await self._async_apply_provider("gemini")
+
+    async def async_step_provider_glm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        return await self._async_apply_provider("glm")
+
+    async def async_step_provider_openai(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        return await self._async_apply_provider("openai")
+
+    async def async_step_provider_custom(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        return await self._async_apply_provider("custom")
+
     async def async_step_settings(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
         suggestions: Mapping[str, Any] = self.config_entry.options
         if user_input is not None:
-            # 选定服务商后，地址在这一步就写进去并保存，不依赖「重新渲染表单让前端
-            # 显示预填值」。
+            # 地址替换只发生在用户明确点了某个服务商时（见 `_async_apply_provider`），
+            # 这里不再猜「地址有没有被改过」。
             #
-            # 原因是 HA 的原生表单只在**提交**时跑服务端代码：在下拉里选中一项不会
-            # 触发任何请求，所以「选中即自动填入」在服务端做不到。前一版实现靠重新
-            # 渲染来预填，结果是用户选了 Gemini、点提交，什么都没保存、地址也没变
-            # ——看起来完全没反应。
+            # 那套猜测是上一版的实现，也是「切换服务商看不出是否成功」的根源：它要
+            # 比较表单显示值与存储值来判断用户意图，而表单显示值是从 URL 推导的、
+            # 存储值却可能是另一个，两者不一致时判断就静默失效。现在选服务商是一次
+            # 真正的服务端往返，地址在那一步就填进表单，用户看得见、也能改。
             #
-            # 现在的行为：选了服务商 → 提交 → 地址被写成该服务商的地址并保存。
-            #
-            # 只在「地址没被用户动过」时替换。地址框带 default，而 HA 会先用表单
-            # schema 校验提交内容，所以没动过的框到达的是表单上显示的那个值（或
-            # 存储里没有该键时 schema 的默认值），不是空串——两者都算没动过。
-            provider = str(user_input.get(CONF_LLM_PROVIDER, "")).strip()
-            preset_url = _preset_base_url(provider)
-            typed_url = str(user_input.get(CONF_LLM_BASE_URL, "")).strip()
-            shown_url = str(suggestions.get(CONF_LLM_BASE_URL, "")).strip()
-            url_untouched = typed_url in {"", CONF_LLM_BASE_URL_DEFAULT, shown_url}
-            provider_changed = provider != str(
-                suggestions.get(CONF_LLM_PROVIDER, CONF_LLM_PROVIDER_DEFAULT)
-            ).strip()
-            if preset_url is not None and provider_changed and url_untouched:
-                # 用户自己填过地址就不覆盖：本地路由器/反向代理的地址在这个部署里
-                # 是能用的，换掉等同于把可用端点改坏。
-                user_input = {**user_input, CONF_LLM_BASE_URL: preset_url}
             # 保存时就校验标签格式：这个选项流是整体替换，填错了会被直接存进去，
             # 之后每次分析都失败，而用户只看到「没有通知」——错误发生在离原因
             # 很远的地方。校验与初始流共用 `_label_errors`，两个流不会各漂各的。
@@ -845,7 +886,7 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
         return self.async_show_form(
             step_id="settings",
             data_schema=self.add_suggested_values_to_schema(
-                _options_schema(), _provider_suggestions(suggestions)
+                _options_schema(), suggestions
             ),
             errors=errors,
         )

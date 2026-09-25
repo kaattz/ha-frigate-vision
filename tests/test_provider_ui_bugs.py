@@ -1,10 +1,9 @@
-"""Reproduce the two reported bugs through the real flow.
+"""Tests for the provider switch, driven through the real flow.
 
-Both are reported from the UI, so this drives the options flow the way the
-frontend does -- submitting every field the form displayed, with the URL left at
-its shown value -- rather than a minimal hand-built dict. A minimal dict can pass
-while the real submission fails, because the schema injects defaults for absent
-keys and that injection is what the guard keys off.
+Reported from the UI, so these drive the options flow the way the frontend does --
+tapping menu entries and submitting whole forms -- rather than calling helpers
+directly. The reported symptom was that switching provider "did nothing", and the
+cause lived in the round trips between steps, which only a real flow reproduces.
 """
 
 from __future__ import annotations
@@ -42,17 +41,6 @@ LIVE = {
 }
 
 
-async def _open_settings(hass: HomeAssistant, options: dict):
-    entry = MockConfigEntry(domain=DOMAIN, title="Front Door", data={}, options=options)
-    entry.add_to_hass(hass)
-    result = await hass.config_entries.options.async_init(entry.entry_id)
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"], {"next_step_id": "settings"}
-    )
-    assert result["step_id"] == "settings"
-    return entry, result
-
-
 def _suggested_for(schema, field: str):
     for marker, _selector in schema.schema.items():
         if getattr(marker, "schema", None) == field:
@@ -63,101 +51,25 @@ def _suggested_for(schema, field: str):
     raise AssertionError(f"{field} not in schema")
 
 
-async def test_bug1_the_form_shows_the_provider_that_matches_the_stored_url(
-    hass: HomeAssistant,
-) -> None:
-    """A local-router URL matches no preset, so the form must show "custom".
+def test_the_provider_inferred_from_a_url_is_used_by_the_menu() -> None:
+    """`_provider_for_url` 仍在使用中（菜单靠它显示当前服务商），必须继续正确。
 
-    `llm_provider` was never stored (it did not exist when this entry was made),
-    so the field falls back to the schema default `deepseek` and the dialog claims
-    a provider the entry is not using.
+    它此前服务于表单里的下拉框；下拉框删掉后唯一的调用点是菜单标签。这里直接测
+    这个函数本身，因为它现在没有第二个观察面——菜单那两条测试只覆盖了本部署的
+    两个具体取值，推断本身的边界（每个预设、空地址）只能在这里守住。
     """
-    _entry, result = await _open_settings(hass, dict(LIVE))
-    assert _suggested_for(result["data_schema"], "llm_provider") == "custom", (
-        "the stored URL is a local router, matching no preset"
-    )
+    for name, preset in config_flow.PROVIDER_PRESETS.items():
+        assert config_flow._provider_for_url(preset["base_url"]) == name  # noqa: SLF001
 
+    # 末尾斜杠两种写法都合理，不该改变判断结果。
+    deepseek = config_flow.PROVIDER_PRESETS["deepseek"]["base_url"]
+    assert config_flow._provider_for_url(f"{deepseek}/") == "deepseek"  # noqa: SLF001
 
-async def test_bug1b_a_preset_url_still_shows_its_own_provider(
-    hass: HomeAssistant,
-) -> None:
-    """The inference must not break the normal case."""
-    options = dict(LIVE, llm_base_url="https://api.deepseek.com/v1")
-    _entry, result = await _open_settings(hass, options)
-    assert _suggested_for(result["data_schema"], "llm_provider") == "deepseek"
+    # 匹配不到任何预设就是「其他」：本部署的本地路由器正是这一类。
+    assert config_flow._provider_for_url(LIVE["llm_base_url"]) == "custom"  # noqa: SLF001
 
-
-async def test_bug2_switching_provider_writes_the_url_in_one_submit(
-    hass: HomeAssistant,
-) -> None:
-    """Selecting Gemini and submitting must save Gemini's URL immediately.
-
-    One submit, not two. Home Assistant's native form runs no server code when a
-    dropdown is *selected* -- only on submit -- so a design that re-rendered the
-    form to show a prefilled URL did nothing visible: the user picked Gemini,
-    submitted, and neither the URL nor the entry changed.
-
-    Submits the full displayed form (as the browser does), with the URL left at
-    the value shown, because the schema carries a default and an untouched box
-    never arrives empty.
-    """
-    entry, result = await _open_settings(hass, dict(LIVE))
-    submitted = dict(entry.options)
-    submitted["llm_provider"] = "gemini"
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"], submitted
-    )
-    assert result["type"] is FlowResultType.CREATE_ENTRY, (
-        "the save must complete in this submit, not come back as a form"
-    )
-    assert result["data"]["llm_base_url"] == (
-        "https://generativelanguage.googleapis.com/v1beta/openai"
-    )
-    assert result["data"]["llm_provider"] == "gemini"
-
-
-async def test_bug2c_a_hand_typed_url_survives_a_provider_change(
-    hass: HomeAssistant,
-) -> None:
-    """A URL the user typed must not be replaced by the preset.
-
-    Picking a provider is a shortcut for filling the URL in, not an override: on
-    this deployment the URL points at a local router, and rewriting it to a public
-    endpoint would break a working setup. The user typed a URL that differs from
-    what the form showed, which is the signal that it is theirs.
-    """
-    entry, result = await _open_settings(hass, dict(LIVE))
-    submitted = dict(entry.options)
-    submitted["llm_provider"] = "gemini"
-    submitted["llm_base_url"] = "http://10.0.0.9:9999/v1"
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"], submitted
-    )
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["data"]["llm_base_url"] == "http://10.0.0.9:9999/v1", (
-        "a hand-typed URL must win over the preset"
-    )
-
-
-async def test_bug2b_a_no_op_save_does_not_hijack_the_url(
-    hass: HomeAssistant,
-) -> None:
-    """Saving without touching the provider must keep the local-router URL.
-
-    Otherwise any unrelated edit would rewrite the endpoint to whatever provider
-    the inferred field happens to hold -- turning a working local endpoint into a
-    public one.
-    """
-    entry, result = await _open_settings(hass, dict(LIVE))
-    submitted = dict(entry.options)
-    submitted["llm_provider"] = "custom"
-    submitted["prompt_override"] = "只按可见动作判断。"
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"], submitted
-    )
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["data"]["llm_base_url"] == LIVE["llm_base_url"]
-    assert result["data"]["prompt_override"] == "只按可见动作判断。"
+    # 空地址回退到默认服务商，而不是「其他」——这是既有行为，不要改。
+    assert config_flow._provider_for_url("") == "deepseek"  # noqa: SLF001
 
 
 async def test_the_menu_shows_the_current_provider(hass: HomeAssistant) -> None:
@@ -196,3 +108,134 @@ async def test_the_menu_shows_a_preset_name_when_the_url_matches(
     item = result["menu_options"]["provider"]
     assert "DeepSeek" in item, f"实际：{item!r}"
     assert "其他" not in item, f"不该回退到「其他」：{item!r}"
+
+
+async def test_choosing_gemini_returns_the_form_with_the_url_filled_in(
+    hass: HomeAssistant,
+) -> None:
+    """选 Gemini 后，配置表单里地址必须已经是 Gemini 的。
+
+    这是本功能的核心：用户点一下就能看到地址变了，不必先提交再猜。
+    菜单点击是真正的服务端往返，所以服务端有机会把 suggested_value 填好。
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN, title="Front Door", data={}, options=dict(LIVE)
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "provider"}
+    )
+    assert result["type"] is FlowResultType.MENU, "应先显示服务商菜单"
+    assert set(result["menu_options"]) == {
+        "provider_deepseek",
+        "provider_gemini",
+        "provider_glm",
+        "provider_openai",
+        "provider_custom",
+    }
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "provider_gemini"}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "settings"
+    assert _suggested_for(result["data_schema"], "llm_base_url") == (
+        "https://generativelanguage.googleapis.com/v1beta/openai"
+    )
+
+
+async def test_choosing_gemini_also_fills_in_the_model_name(
+    hass: HomeAssistant,
+) -> None:
+    """模型名必须一起换。
+
+    否则地址指向 Gemini 而模型名仍是 Deepseek 的，Gemini 不认那个名字 ——
+    地址对了照样调不通，用户更难看出问题在哪。
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN, title="Front Door", data={}, options=dict(LIVE)
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "provider"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "provider_gemini"}
+    )
+    assert _suggested_for(result["data_schema"], "llm_model") == "gemini-3.8-flash"
+
+
+async def test_choosing_custom_changes_neither_url_nor_model(
+    hass: HomeAssistant,
+) -> None:
+    """「其他」不预填任何东西：地址保持当前值，模型不动。
+
+    选它的用户本来就打算自己填；替他改地址只会破坏一个能用的端点。
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN, title="Front Door", data={}, options=dict(LIVE)
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "provider"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "provider_custom"}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert _suggested_for(result["data_schema"], "llm_base_url") == LIVE["llm_base_url"]
+    assert _suggested_for(result["data_schema"], "llm_model") == LIVE["llm_model"]
+
+
+async def test_confirming_after_choosing_gemini_saves_both(
+    hass: HomeAssistant,
+) -> None:
+    """选完 Gemini 再提交，地址与模型名都要存下来。"""
+    entry = MockConfigEntry(
+        domain=DOMAIN, title="Front Door", data={}, options=dict(LIVE)
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "provider"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "provider_gemini"}
+    )
+    submitted = {
+        **LIVE,
+        "llm_base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "llm_model": "gemini-3.8-flash",
+    }
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], submitted
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"]["llm_base_url"] == (
+        "https://generativelanguage.googleapis.com/v1beta/openai"
+    )
+    assert result["data"]["llm_model"] == "gemini-3.8-flash"
+
+
+async def test_the_settings_form_no_longer_has_a_provider_field(
+    hass: HomeAssistant,
+) -> None:
+    """服务商不再是配置表单里的字段，只存在于菜单。
+
+    它留在表单里正是「以为没改」的根源：表单显示的当前值是从 URL 推导的，而提交
+    时判断「有没有改过」用的是存储里的原始值，两者不一致时会静默失效。
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN, title="Front Door", data={}, options=dict(LIVE)
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings"}
+    )
+    fields = {getattr(m, "schema", None) for m in result["data_schema"].schema}
+    assert "llm_provider" not in fields
+    assert "llm_base_url" in fields, "地址仍须可编辑"
