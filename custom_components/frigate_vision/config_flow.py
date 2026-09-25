@@ -324,6 +324,20 @@ def _door_suggestions(door: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _label_errors(user_input: Mapping[str, Any]) -> dict[str, str]:
+    """Return form errors for the labels field, or an empty dict when valid.
+
+    Both flows must validate: the labels are stored verbatim and a malformed line
+    fails every later analysis, where the user only sees "no notification" -- an
+    error far from its cause.
+    """
+    try:
+        parse_scene_labels(str(user_input.get(CONF_SCENE_LABELS, "")))
+    except ValueError as exc:
+        return {CONF_SCENE_LABELS: str(exc)}
+    return {}
+
+
 async def async_validate_frigate(
     hass: HomeAssistant,
     base_url: str,
@@ -545,8 +559,21 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         if user_input is not None:
-            return self.async_create_entry(
-                title=self._data[CONF_NAME], data=self._data, options=user_input
+            # 初始流也要校验，与选项流共用同一个 helper：标签会被原样存下，填错
+            # 了之后每次分析都失败，而用户只看到「没有通知」。两个流的校验一旦各
+            # 写一份，就会有一个先漂移。
+            errors = _label_errors(user_input)
+            if not errors:
+                return self.async_create_entry(
+                    title=self._data[CONF_NAME], data=self._data, options=user_input
+                )
+            # 校验失败时回填用户这次提交的内容，否则表单会清空他填的一切。
+            return self.async_show_form(
+                step_id="options",
+                data_schema=self.add_suggested_values_to_schema(
+                    _options_schema(), user_input
+                ),
+                errors=errors,
             )
         return self.async_show_form(step_id="options", data_schema=_options_schema())
 
@@ -717,12 +744,9 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
         if user_input is not None:
             # 保存时就校验标签格式：这个选项流是整体替换，填错了会被直接存进去，
             # 之后每次分析都失败，而用户只看到「没有通知」——错误发生在离原因
-            # 很远的地方。
-            try:
-                parse_scene_labels(str(user_input.get(CONF_SCENE_LABELS, "")))
-            except ValueError as exc:
-                errors[CONF_SCENE_LABELS] = str(exc)
-            else:
+            # 很远的地方。校验与初始流共用 `_label_errors`，两个流不会各漂各的。
+            errors = _label_errors(user_input)
+            if not errors:
                 return self.async_create_entry(data=user_input)
         # 校验失败时回填用户这次提交的内容，否则表单会清空他填的一切。
         schema = self.add_suggested_values_to_schema(

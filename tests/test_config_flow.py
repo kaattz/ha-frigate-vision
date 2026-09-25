@@ -1300,6 +1300,102 @@ async def test_saving_bad_labels_shows_an_error_instead_of_storing_them(
     )
 
 
+async def _drive_the_initial_flow_to_the_options_step(hass: HomeAssistant) -> str:
+    """把初始配置流开到 options 这一步，返回 flow_id。
+
+    初始流是 user → door → llmvision → options 四步，只有最后一步碰标签。把驱动
+    过程抽出来是为了让每个断言只讲它要讲的事，而不是把 30 行表单填写抄一遍。
+    """
+    with patch.object(
+        config_flow,
+        "async_validate_frigate",
+        AsyncMock(return_value="0.17.2"),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                "name": "Front Door",
+                "base_url": "http://frigate.local:5000",
+                "auth_mode": "none",
+                "mqtt_topic_prefix": "frigate",
+                "camera": "front_door",
+                "near_zones": "home_door",
+                "transition_zones": "bench",
+                "far_zones": "elevator",
+            },
+        )
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                "llm_base_url": "https://api.deepseek.com/v1",
+                "llm_api_key": "test-key",
+                "llm_model": "vision-model",
+                "llm_thinking": "disabled",
+            },
+        )
+    assert result["step_id"] == "options"
+    return result["flow_id"]
+
+
+_OPTIONS_PAYLOAD = {
+    "processing_mode": "observe",
+    "target_width": 768,
+    "max_tokens": 300,
+    "output_language": "zh-CN",
+    "history_retention_days": 30,
+    "media_retention_days": 7,
+    "queue_size": 10,
+}
+
+
+async def test_the_initial_flow_rejects_malformed_labels_too(
+    hass: HomeAssistant,
+) -> None:
+    """初始流也必须校验标签，否则畸形配置会被静默存下。
+
+    选项流有校验，初始流此前直接 `async_create_entry`。实测：初始流填入畸形标签
+    → 静默存下 → 之后每次分析都失败，而用户只看到「没有通知」——错误发生在离
+    原因很远的地方，而且已经存进 entry，不会因为重开表单就消失。
+    """
+    from custom_components.frigate_vision.const import CONF_SCENE_LABELS
+
+    flow_id = await _drive_the_initial_flow_to_the_options_step(hass)
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {**_OPTIONS_PAYLOAD, CONF_SCENE_LABELS: "宠物 没有冒号"}
+    )
+
+    assert result["type"] is FlowResultType.FORM, (
+        "畸形标签必须重新显示表单，而不是创建 entry"
+    )
+    assert result["step_id"] == "options"
+    assert CONF_SCENE_LABELS in result.get("errors", {}), "畸形标签必须报错"
+    # 关键：entry 不能被创建。只看返回值不够——静默存下才是这个缺陷的形态。
+    assert hass.config_entries.async_entries(DOMAIN) == [], (
+        "表单报错时 entry 不该被创建"
+    )
+
+
+async def test_the_initial_flow_still_creates_an_entry_with_valid_labels(
+    hass: HomeAssistant,
+) -> None:
+    """校验不能误伤正常路径：合法标签必须照常建 entry。"""
+    from custom_components.frigate_vision.const import DEFAULT_SCENE_LABELS
+
+    flow_id = await _drive_the_initial_flow_to_the_options_step(hass)
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {**_OPTIONS_PAYLOAD, "scene_labels": DEFAULT_SCENE_LABELS}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["options"]["scene_labels"] == DEFAULT_SCENE_LABELS
+
+
 def test_the_label_prefill_covers_every_scene_not_just_the_lobby() -> None:
     """预填必须覆盖所有场景的标签并集，不能只列电梯厅的 11 个。
 
