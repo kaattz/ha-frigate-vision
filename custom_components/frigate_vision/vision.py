@@ -307,7 +307,13 @@ class VisionClient:
         # 解析一次，同一份有序列表同时喂给提示词渲染和缓存键。两者若拿到
         # 不同的顺序，键会漂移（只是多一次缓存未命中，不会拿到过期答案），
         # 但没必要冒这个风险。
-        custom_labels = parse_scene_labels(self._config.scene_labels)
+        try:
+            custom_labels = parse_scene_labels(self._config.scene_labels)
+        except ValueError as exc:
+            # 标签格式是用户在选项里填的，写错了要给一个能看懂的错误码，
+            # 而不是落到通用分支变成 analysis_outcome_unknown。这里在 claim
+            # 与 provider 调用之前，所以不会产生费用。
+            raise VisionError(str(exc)) from exc
         # 契约枚举与答案校验必须用同一个集合：改了一边而另一边不认，答案会被
         # invalid_llm_response 静默丢弃，用户只看到「没有通知」。
         allowed = (
@@ -503,7 +509,12 @@ async def async_analyze(
     scene = scene_for(evidence_mode)
     if scene is None:
         raise VisionError("unsupported_evidence_mode")
-    custom_labels = parse_scene_labels(config.scene_labels)
+    # 模块级函数是独立入口（测试与 e2e 会直接调它），所以这里也要转换，
+    # 否则直接调用它的人拿到的仍是裸 ValueError。
+    try:
+        custom_labels = parse_scene_labels(config.scene_labels)
+    except ValueError as exc:
+        raise VisionError(str(exc)) from exc
     prompt = scene.render(
         SceneRequest(
             language=config.language,

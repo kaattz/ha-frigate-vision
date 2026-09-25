@@ -805,3 +805,120 @@ async def test_a_configured_entry_analyses_and_completes_its_claim(
     prompt = content[0]["text"]
     assert "猫" in prompt
     assert "elevator_activity" not in prompt
+
+
+# 每种畸形写法对应的精确错误码。底层解析器的契约就是抛 ValueError，其消息
+# 即错误码；视觉调用路径必须把这个码原样带出去，而不是换成通用错误。
+MALFORMED_LABELS = [
+    ("宠物", "label_malformed"),
+    ("宠物:", "label_definition_missing"),
+    ("宠物: 只有猫\n宠物: 又来一只", "label_duplicate"),
+]
+
+
+async def _store_with_a_ready_activity(hass: HomeAssistant, sheet: Any) -> Any:
+    """建一个持有单个 EVIDENCE_READY 活动的 store，与运行时的状态一致。
+
+    构造方式与 `test_a_configured_entry_analyses_and_completes_its_claim` 相同，
+    这样畸形标签的用例走的是真实可认领的活动，而不是桩对象。
+    """
+    from custom_components.frigate_vision.models import (
+        ActivityRecord,
+        ActivitySource,
+        ActivityStage,
+        ProcessingMode,
+    )
+    from custom_components.frigate_vision.store import ActivityStore
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="activity_1",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.EVIDENCE_READY,
+            processing_mode=ProcessingMode.SHADOW,
+            created_at=1,
+            updated_at=1,
+            camera="front",
+            evidence_mode="review_six",
+            evidence_path=str(sheet),
+        )
+    )
+    return store
+
+
+@pytest.mark.parametrize(("labels", "expected"), MALFORMED_LABELS)
+async def test_malformed_labels_raise_a_vision_error_not_a_value_error(
+    hass: HomeAssistant,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    labels: str,
+    expected: str,
+) -> None:
+    """标签格式写错必须给出精确的错误码，而不是裸 ValueError。
+
+    裸 ValueError 会落到 runtime.py 的通用 except 分支，最终表现为
+    analysis_outcome_unknown——用户看到这个码无法知道是标签格式写错了。
+    VisionError 的错误码会被原样记录到诊断传感器。
+
+    这条路径在 claim 与 provider 调用之前，所以不产生费用；下面断言没有任何
+    请求发出，就是这一点的直接证据。
+    """
+    from custom_components.frigate_vision.scenes import parse_scene_labels
+    from custom_components.frigate_vision.vision import VisionClient
+
+    # 底层解析器仍然抛 ValueError —— 那是它的契约（保存时校验会直接用它），
+    # 不该为了调用方而改。
+    with pytest.raises(ValueError, match=expected):
+        parse_scene_labels(labels)
+
+    sheet = tmp_path / "activity.png"
+    sheet.write_bytes(_png(640, 240))
+    store = await _store_with_a_ready_activity(hass, sheet)
+
+    session = _FakeSession()
+    monkeypatch.setattr(
+        "custom_components.frigate_vision.vision.async_get_clientsession",
+        lambda _hass: session,
+    )
+
+    client = VisionClient(hass, store, _config(scene_labels=labels))
+    with pytest.raises(VisionError) as caught:
+        await client.async_analyze("activity_1")
+
+    # 精确到错误码本身：既证明不是裸 ValueError，也证明没有被替换成
+    # analysis_outcome_unknown 之类的通用码。
+    assert str(caught.value) == expected
+    assert session.payloads == []
+
+
+@pytest.mark.parametrize(("labels", "expected"), MALFORMED_LABELS)
+async def test_the_module_level_analysis_rejects_malformed_labels_too(
+    tmp_path,
+    labels: str,
+    expected: str,
+) -> None:
+    """模块级 `async_analyze` 是独立入口（测试与 e2e 会直接调它），同样要转换。
+
+    只保护 `VisionClient` 那一处会留下同一个洞：直接调用模块级函数的人拿到的
+    仍是裸 ValueError。
+    """
+    from custom_components.frigate_vision.vision import async_analyze
+
+    sheet = tmp_path / "activity.png"
+    sheet.write_bytes(_png(640, 240))
+    session = _FakeSession()
+
+    with pytest.raises(VisionError) as caught:
+        await async_analyze(  # type: ignore[arg-type]
+            session,
+            _config(scene_labels=labels),
+            evidence_path=str(sheet),
+            evidence_mode="review_six",
+            allowed={"visitor"},
+        )
+
+    assert str(caught.value) == expected
+    assert session.payloads == []
