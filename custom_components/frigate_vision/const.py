@@ -50,8 +50,17 @@ CONF_PERSON_HIGHLIGHT_DEFAULT = False
 # (`target_width + this` when the option is on). That matters for artifacts built
 # before the option was switched on: those are grid-only and up to 1920 wide, and
 # a boolean "already sized" would have been computed from the *current* setting
-# and passed them through unscaled -- 6.3x the pixels for nothing. A budget is
-# safe by construction: a grid-only sheet still exceeds it and is still shrunk.
+# and passed them through unscaled. Measured, that is 1,382,400 pixels sent where
+# 554,496 would do -- 2.5x the bill -- for a close-up the image does not contain.
+# (The figure is 2.5x, not the 6.3x an earlier comment claimed: the option is on
+# in that scenario, so the honest comparison is against the composed sheet, not
+# against the grid-only one.) A budget is safe by construction: a composed sheet
+# equals it and is left alone, a stale grid-only one exceeds it and is shrunk.
+#
+# `build_contact_sheet` defaults to this value rather than repeating the number,
+# and a test pins the two together: if they diverged downwards the budget would
+# fall below the sheet's real width and the whole image would be scaled, taking
+# the close-up with it -- the exact failure this column exists to avoid.
 PERSON_HIGHLIGHT_WIDTH = 448
 
 # Known OpenAI-compatible endpoints, so the base URL does not have to be typed by

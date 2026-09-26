@@ -18,6 +18,7 @@ from typing import Any, Protocol
 from homeassistant.core import HomeAssistant
 from PIL import Image, ImageChops, ImageOps, ImageStat, UnidentifiedImageError
 
+from .const import PERSON_HIGHLIGHT_WIDTH
 from .correlation import ZoneRoles, anchor_sequence, infer_direction
 from .frigate import FrigateApiError
 from .media_source import DATA_MEDIA_REGISTRY
@@ -506,7 +507,7 @@ def build_contact_sheet(
     columns: int = 3,
     cell_size: tuple[int, int] = (640, 360),
     highlight: Path | None = None,
-    highlight_width: int = 448,
+    highlight_width: int = PERSON_HIGHLIGHT_WIDTH,
     target_width: int | None = None,
 ) -> None:
     """Compose the evidence sheet, optionally with a person close-up column.

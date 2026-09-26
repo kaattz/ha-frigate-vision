@@ -2587,6 +2587,26 @@ def test_largest_person_box_returns_none_when_nothing_is_usable() -> None:
     assert largest_person_box(((100.0, (0.1, 0.1, 0.0, 0.0)),)) is None
 
 
+def test_the_sheet_and_the_budget_agree_on_the_column_width() -> None:
+    """拼图用的栏宽与预算用的栏宽必须是同一个数字。
+
+    这是实测出来的一个真实隐患：`PERSON_HIGHLIGHT_WIDTH`（const.py）与
+    `build_contact_sheet` 的默认参数曾是同一个 448 的两份独立拷贝。若把常量下调
+    （例如改成 256）而忘了改另一边，预算变成 767+256=1023 而拼图实际 1216 ——
+    预算**小于**实际宽度，于是整张图被缩放，**特写被摧毁**，正是这功能要防的事。
+    现在 media.py 直接引用该常量，这条测试把两者钉在一起。
+    """
+    import inspect
+
+    from custom_components.frigate_vision.const import PERSON_HIGHLIGHT_WIDTH
+    from custom_components.frigate_vision.media import build_contact_sheet
+
+    default = inspect.signature(build_contact_sheet).parameters["highlight_width"]
+    assert default.default == PERSON_HIGHLIGHT_WIDTH, (
+        "拼图的默认栏宽与预算用的常量不同步，会让整张图被缩放"
+    )
+
+
 def test_crop_person_from_frame_uses_the_configured_padding(tmp_path) -> None:
     """裁剪必须真的用 `PERSON_CROP_PADDING`，且比紧贴 box 更大。
 
