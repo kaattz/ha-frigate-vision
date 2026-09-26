@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from homeassistant.core import HomeAssistant
-from PIL import Image
+from PIL import Image, ImageChops
 
 from custom_components.frigate_vision.correlation import ZoneRoles
 from custom_components.frigate_vision.media import (
@@ -29,6 +29,7 @@ from custom_components.frigate_vision.models import (
     ProcessingMode,
 )
 from custom_components.frigate_vision.store import ActivityStore
+from custom_components.frigate_vision.vision import resize_for_provider
 
 
 def _jpeg(value: int) -> bytes:
@@ -180,6 +181,233 @@ def test_contact_sheet_validates_frames_and_dimensions(tmp_path) -> None:
     frames[0].write_text("broken")
     with pytest.raises(MediaError, match="frame_decode_failed"):
         build_contact_sheet(frames[:3], output)
+
+
+# The composed sheet: a three-across, three-down grid of 640x360 cells with the
+# highlight column appended on the right. The numbers are the pipeline's own --
+# a 767-wide provider target scales 1920x1080 to 767x431 (1080 * 767 / 1920).
+_GRID_WIDTH = 3 * 640
+_GRID_HEIGHT = 3 * 360
+_HIGHLIGHT_WIDTH = 448
+_TARGET_WIDTH = 767
+_SCALED_HEIGHT = 431
+# JPEG encodes luma in 8x8 blocks but chroma at half resolution, so the chroma
+# blocks straddling the seam between the grid and the column are 16px wide and
+# the column's presence perturbs up to one macroblock of grid to its left.
+# Measured on this fixture: the first differing column is 16px from the seam.
+# The margin is set to two macroblocks so a different libjpeg build cannot make
+# this assertion flaky; everything further left must be identical.
+_SEAM_MARGIN = 32
+
+
+def _solid_jpeg(
+    size: tuple[int, int], colour: tuple[int, int, int] = (200, 30, 40)
+) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", size, colour).save(output, "JPEG")
+    return output.getvalue()
+
+
+def _nine_frames(tmp_path: Path) -> list[Path]:
+    frames = []
+    for index in range(9):
+        path = tmp_path / f"g{index}.jpg"
+        path.write_bytes(_jpeg(index * 20))
+        frames.append(path)
+    return frames
+
+
+def _highlight_content_box(
+    sheet: Image.Image, column_left: int
+) -> tuple[int, int, int, int]:
+    """Return the bounding box of the lit content inside the highlight column.
+
+    The column is filled black and the crop is bright, so a luma threshold
+    separates the two. The threshold sits above the JPEG ringing at the crop's
+    edge and far below the crop's own luma.
+
+    An empty result carries the sheet's size, because the usual cause is that the
+    sheet came back narrower than the column's offset -- the composed sheet was
+    scaled as a whole, which is the failure the column exists to prevent.
+    """
+    column = sheet.crop((column_left, 0, column_left + _HIGHLIGHT_WIDTH, sheet.height))
+    mask = column.convert("L").point(lambda value: 255 if value > 40 else 0)
+    box = mask.getbbox()
+    assert box is not None, (
+        f"no content in the column at x={column_left}; sheet is {sheet.size}"
+    )
+    return box
+
+
+def test_a_sheet_without_a_highlight_is_unchanged(tmp_path) -> None:
+    """不传特写时必须与现在逐字节一致 —— 零回归的保证。
+
+    默认参数下既有部署的产物不能有任何变化。
+    """
+    frames = _nine_frames(tmp_path)
+    default_output = tmp_path / "default.jpg"
+    explicit_output = tmp_path / "explicit.jpg"
+    build_contact_sheet(frames, default_output)
+    build_contact_sheet(frames, explicit_output, highlight=None)
+    assert default_output.read_bytes() == explicit_output.read_bytes()
+    with Image.open(default_output) as sheet:
+        assert sheet.size == (_GRID_WIDTH, _GRID_HEIGHT)
+
+
+def test_a_sheet_with_a_highlight_is_wider_and_keeps_the_cells_intact(
+    tmp_path,
+) -> None:
+    """有特写时总宽增加一栏，但九宫格那部分像素不变。
+
+    九宫格若被特写挤小，时间轴的可读性会下降，而那正是九宫格的全部价值。
+    """
+    frames = _nine_frames(tmp_path)
+    highlight = tmp_path / "person.jpg"
+    highlight.write_bytes(_solid_jpeg((800, 400)))
+    plain = tmp_path / "plain.jpg"
+    combo = tmp_path / "combo.jpg"
+    build_contact_sheet(frames, plain, target_width=_TARGET_WIDTH)
+    build_contact_sheet(frames, combo, highlight=highlight, target_width=_TARGET_WIDTH)
+    with Image.open(plain) as plain_sheet, Image.open(combo) as combo_sheet:
+        assert combo_sheet.size == (_TARGET_WIDTH + _HIGHLIGHT_WIDTH, _SCALED_HEIGHT)
+        intact = (0, 0, _TARGET_WIDTH - _SEAM_MARGIN, _SCALED_HEIGHT)
+        assert (
+            ImageChops.difference(
+                combo_sheet.convert("RGB").crop(intact),
+                plain_sheet.convert("RGB").crop(intact),
+            ).getbbox()
+            is None
+        ), "the grid must keep its pixels when a column is appended"
+
+
+def test_the_highlight_keeps_its_aspect_ratio(tmp_path) -> None:
+    """特写必须等比缩放，不能拉伸变形 —— 变形会让模型误判人体比例。"""
+    frames = _nine_frames(tmp_path)
+    highlight = tmp_path / "tall.jpg"
+    highlight.write_bytes(_solid_jpeg((100, 300)))
+    output = tmp_path / "combo.jpg"
+    build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
+    with Image.open(output) as sheet:
+        box = _highlight_content_box(sheet.convert("RGB"), _TARGET_WIDTH)
+    assert (box[2] - box[0]) / (box[3] - box[1]) == pytest.approx(100 / 300, abs=0.01)
+
+
+def test_the_highlight_keeps_its_full_width(tmp_path) -> None:
+    """特写在最终图里必须保持 448 宽的像素量。
+
+    这是本功能的成败点：若特写被 target_width 一起缩小，收益从 7.6 倍掉到 3 倍。
+    """
+    frames = _nine_frames(tmp_path)
+    # Wider than the column in aspect as well as in pixels, so the column's
+    # width -- not its height -- is what bounds the crop. A source narrower than
+    # 448, or taller in aspect than the column, would be limited by the other
+    # side and the assertion would prove nothing about the width.
+    highlight = tmp_path / "person.jpg"
+    highlight.write_bytes(_solid_jpeg((800, 400)))
+    output = tmp_path / "combo.jpg"
+    build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
+    with Image.open(output) as sheet:
+        assert sheet.size == (_TARGET_WIDTH + _HIGHLIGHT_WIDTH, _SCALED_HEIGHT)
+        box = _highlight_content_box(sheet.convert("RGB"), _TARGET_WIDTH)
+    assert box[2] - box[0] == _HIGHLIGHT_WIDTH
+
+
+def test_a_tall_crop_is_bounded_by_the_sheet_height(tmp_path) -> None:
+    """A person-shaped crop is limited by the column's height, not its width.
+
+    A real crop is taller than it is wide -- the reference person box is 147x185
+    in the 640x360 frame. `contain` scales by whichever side binds first, and for
+    that shape it is the height, so the crop fills all 431 rows of the column and
+    comes out about 342 pixels wide rather than the full 448.
+
+    That is the honest ceiling of a 640x360 source and it is still worth having:
+    342x431 is a far larger person than the 59x74 the same box occupies in a grid
+    cell. Pinning it here keeps the shape of the gain visible, so nobody later
+    reads the column's 448 as a promise the pixels always reach.
+    """
+    frames = _nine_frames(tmp_path)
+    highlight = tmp_path / "person.jpg"
+    highlight.write_bytes(_solid_jpeg((147, 185)))
+    output = tmp_path / "combo.jpg"
+    build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
+    with Image.open(output) as sheet:
+        box = _highlight_content_box(sheet.convert("RGB"), _TARGET_WIDTH)
+    width, height = box[2] - box[0], box[3] - box[1]
+    assert height == _SCALED_HEIGHT, "a tall crop must fill the column's height"
+    assert width == pytest.approx(147 * _SCALED_HEIGHT / 185, abs=1)
+    # Centre it in the column, so the black bars are split evenly rather than
+    # leaving the person jammed against one edge.
+    assert box[0] == pytest.approx((_HIGHLIGHT_WIDTH - width) / 2, abs=1)
+
+
+def test_a_broken_highlight_fails_like_a_broken_frame(tmp_path) -> None:
+    """An unreadable crop raises MediaError rather than leaking a Pillow error.
+
+    Every other unreadable image in this module is reported the same way, and a
+    raw `UnidentifiedImageError` escaping through the executor would reach the
+    caller as an unhandled crash instead of a recoverable media failure.
+    """
+    frames = _nine_frames(tmp_path)
+    highlight = tmp_path / "person.jpg"
+    highlight.write_bytes(b"not an image")
+    with pytest.raises(MediaError, match="frame_decode_failed"):
+        build_contact_sheet(
+            frames, tmp_path / "combo.jpg", highlight=highlight, target_width=767
+        )
+
+
+def test_a_highlight_without_a_target_width_is_rejected(tmp_path) -> None:
+    """A column composed over an unscaled grid would be shrunk as a whole.
+
+    `resize_for_provider` shrinks any sheet wider than the target, so a sheet
+    built at the grid's full 1920 plus 448 would lose the very pixels the column
+    exists to protect -- measured: 448 becomes 145, and the gain drops from 7.6x
+    to 3x. Failing loudly here keeps that loss from being reintroduced silently.
+    """
+    frames = _nine_frames(tmp_path)
+    highlight = tmp_path / "person.jpg"
+    highlight.write_bytes(_solid_jpeg((800, 400)))
+    with pytest.raises(MediaError, match="highlight_requires_target_width"):
+        build_contact_sheet(frames, tmp_path / "combo.jpg", highlight=highlight)
+
+
+def test_a_composed_sheet_reaches_the_provider_unshrunk(tmp_path) -> None:
+    """The composed sheet must reach the provider at the width it was built at.
+
+    This is the acceptance point of the whole feature. `resize_for_provider`
+    shrinks anything wider than the target width, and a composed sheet is
+    deliberately wider -- 767 of grid plus a 448 column. Scaled as a whole, the
+    close-up lands at about 145 pixels and the measured gain over the grid falls
+    from 7.6x to 3.0x, which is exactly the loss the column was added to avoid.
+    """
+    frames = _nine_frames(tmp_path)
+    highlight = tmp_path / "person.jpg"
+    highlight.write_bytes(_solid_jpeg((800, 400)))
+    sheet = tmp_path / "combo.jpg"
+    build_contact_sheet(frames, sheet, highlight=highlight, target_width=_TARGET_WIDTH)
+    data = resize_for_provider(sheet, _TARGET_WIDTH, already_sized=True)
+    with Image.open(BytesIO(data)) as sent:
+        assert sent.size == (_TARGET_WIDTH + _HIGHLIGHT_WIDTH, _SCALED_HEIGHT)
+        box = _highlight_content_box(sent.convert("RGB"), _TARGET_WIDTH)
+        assert box[2] - box[0] == _HIGHLIGHT_WIDTH, (
+            "the close-up was scaled with the sheet and its pixels were lost"
+        )
+
+
+def test_resizing_still_shrinks_a_grid_only_sheet(tmp_path) -> None:
+    """The opt-out must not become the default for the plain grid path.
+
+    `resize_for_provider` exists because the provider bills by pixel area and a
+    full-size sheet costs several times more to send. A deployment with no
+    close-up must keep being scaled down, or every analysis silently gets more
+    expensive.
+    """
+    frames = _nine_frames(tmp_path)
+    sheet = tmp_path / "plain.jpg"
+    build_contact_sheet(frames, sheet, target_width=_TARGET_WIDTH)
+    data = resize_for_provider(sheet, 640)
+    with Image.open(BytesIO(data)) as sent:
+        assert sent.size == (640, 360)
 
 
 def test_recording_coverage_rejects_any_gap() -> None:

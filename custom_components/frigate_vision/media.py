@@ -453,7 +453,48 @@ def build_contact_sheet(
     *,
     columns: int = 3,
     cell_size: tuple[int, int] = (640, 360),
+    highlight: Path | None = None,
+    highlight_width: int = 448,
+    target_width: int | None = None,
 ) -> None:
+    """Compose the evidence sheet, optionally with a person close-up column.
+
+    `highlight` appends a column of `highlight_width` pixels on the right,
+    holding one crop taken from the original frame rather than from a grid cell.
+    The person in a cell is roughly 59x74 pixels; the same box cropped from the
+    640x360 frame and placed here is several times larger, because the crop is
+    not shrunk along with the grid.
+
+    `highlight_width` is the column's width and the close-up's ceiling, not a
+    size every crop reaches. The crop is fitted proportionally, so whichever side
+    binds first decides: a crop at least as wide as it is tall -- a wide box, or
+    one with generous padding -- comes out the full width, while the reference
+    person box (147x185 in the frame) is taller than the column and fills the
+    height instead, at about 342x431. Both are far past the 59x74 the grid offers,
+    and the smaller one is the honest ceiling of a 640x360 source: the extra
+    pixels are not invented, only made readable.
+
+    That gain is fragile in one specific way, so the order of operations is fixed
+    here rather than left to the caller:
+
+    1. the grid is built at `cell_size`,
+    2. it is scaled down to `target_width` -- the width the provider will be
+       given anyway,
+    3. the close-up is fitted into the column at its own fixed width,
+    4. the two are pasted side by side and saved.
+
+    Composing first and scaling afterwards is the trap. `resize_for_provider`
+    shrinks any image wider than `target_width`, so a sheet composed at the
+    grid's full 1920 plus 448 would be scaled as a whole and the close-up would
+    land at about 145 pixels wide -- roughly the grid's own 59, making the whole
+    column pointless. Passing `target_width` is what makes the result final, and
+    `highlight` without it is refused instead of silently producing that loss.
+
+    The grid keeps its pixels and is never scaled to make room: it carries the
+    time axis, and shrinking it would cost the very legibility the extra column
+    is meant to add. With `highlight` left out the sheet is byte-for-byte what it
+    has always been, so a deployment that never asks for a close-up is untouched.
+    """
     if columns <= 0:
         raise MediaError("invalid_frame_count")
     # The row count follows the frame count rather than being fixed at two.
@@ -463,8 +504,11 @@ def build_contact_sheet(
     # outright for the same reason.
     if not frame_paths or len(frame_paths) % columns:
         raise MediaError("invalid_frame_count")
+    if highlight is not None and target_width is None:
+        raise MediaError("highlight_requires_target_width")
     width, height = cell_size
     sheet = Image.new("RGB", (width * columns, height * (len(frame_paths) // columns)))
+    canvas: Image.Image | None = None
     try:
         for index, path in enumerate(frame_paths):
             try:
@@ -481,10 +525,52 @@ def build_contact_sheet(
                 ((width - contained.width) // 2, (height - contained.height) // 2),
             )
             sheet.paste(cell, ((index % columns) * width, (index // columns) * height))
+        # The same scaling `resize_for_provider` would apply, on the grid alone
+        # and before the close-up exists -- which is what keeps the two from
+        # being scaled together.
+        if target_width is not None and sheet.width > target_width:
+            scaled = sheet.resize(
+                (
+                    target_width,
+                    max(1, round(sheet.height * target_width / sheet.width)),
+                )
+            )
+            sheet.close()
+            sheet = scaled
+        if highlight is not None:
+            # Any format Pillow can decode is accepted: unlike a frame, this is
+            # our own intermediate rather than something Frigate served.
+            try:
+                with Image.open(highlight) as source:
+                    source.load()
+                    close_up = ImageOps.contain(
+                        source.convert("RGB"), (highlight_width, sheet.height)
+                    )
+            except (OSError, UnidentifiedImageError) as exc:
+                raise MediaError("frame_decode_failed") from exc
+            # `contain` scales by whichever side binds first, so a crop taller
+            # than it is wide keeps its proportions and is centred in the black
+            # column. Stretching it to fill would distort the body, and a model
+            # reading human proportions off a distorted crop is worse off than
+            # one reading a small honest one.
+            canvas = Image.new("RGB", (sheet.width + highlight_width, sheet.height))
+            canvas.paste(sheet, (0, 0))
+            canvas.paste(
+                close_up,
+                (
+                    sheet.width + (highlight_width - close_up.width) // 2,
+                    (sheet.height - close_up.height) // 2,
+                ),
+            )
+            sheet.close()
+            sheet = canvas
+            canvas = None
         output_path.parent.mkdir(parents=True, exist_ok=True)
         sheet.save(output_path, "JPEG", quality=85, optimize=True)
     finally:
         sheet.close()
+        if canvas is not None:
+            canvas.close()
 
 
 def _grayscale_signature(path: Path) -> Image.Image:

@@ -137,12 +137,21 @@ class VisionConfig:
         return f"{base}/chat/completions"
 
 
-def resize_for_provider(path: Path, target_width: int) -> bytes:
+def resize_for_provider(
+    path: Path, target_width: int, *, already_sized: bool = False
+) -> bytes:
     """Return JPEG bytes no wider than target_width.
 
     Images are resized rather than sent at native resolution: the sheet is
     1920x720 and the provider bills by pixel area, so sending it whole costs
     several times more for no extra legibility.
+
+    `already_sized` is for a sheet that has already been scaled by
+    `build_contact_sheet` and had a person close-up column appended. Such a sheet
+    is wider than `target_width` on purpose -- the grid was scaled first and the
+    column added afterwards -- so shrinking it here would undo the scaling
+    decision and take the close-up down with it. The default is unchanged: any
+    caller that does not opt out still gets an over-wide image scaled down.
     """
     try:
         with Image.open(path) as source:
@@ -150,7 +159,7 @@ def resize_for_provider(path: Path, target_width: int) -> bytes:
     except (OSError, UnidentifiedImageError) as exc:
         raise VisionError("invalid_evidence_image") from exc
     width, height = image.size
-    if width > target_width:
+    if not already_sized and width > target_width:
         target_height = max(1, round(height * target_width / width))
         image = image.resize((target_width, target_height))
     buffer = io.BytesIO()
