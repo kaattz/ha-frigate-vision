@@ -176,6 +176,90 @@ async def test_engine_attaches_detection_and_review_once(hass: HomeAssistant) ->
     assert first.detection_zone_updates == (("event_1", 2, ("near",)),)
 
 
+async def test_engine_records_each_event_box_against_its_timestamp(
+    hass: HomeAssistant,
+) -> None:
+    """每个事件消息的 box 都要落到活动上，和时间戳绑在一起。
+
+    Frigate 在目标移动时反复发 `update`，每条带一个当刻的 box。这里要的就是那串
+    「逐时刻的 box」，后续才能挑出 box 面积最大的那一帧。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        replace(
+            _activity("activity_1", ()),
+            association_deadline=11,
+            finalization_deadline=121,
+        )
+    )
+    engine = CorrelationEngine(
+        store,
+        entry_id="entry_1",
+        camera="front",
+        processing_mode=ProcessingMode.OBSERVE,
+    )
+    for occurred_at, box in (
+        (2, (0.10, 0.20, 0.30, 0.40)),
+        (3, (0.25, 0.44, 0.23, 0.52)),
+    ):
+        await engine.async_handle(
+            IngressMessage(
+                kind=IngressKind.FRIGATE_EVENT,
+                entry_id="entry_1",
+                source_id="event_1",
+                event_id="event_1",
+                event_type="update",
+                occurred_at=occurred_at,
+                camera="front",
+                current_zones=("near",),
+                box=box,
+            )
+        )
+    record = store.get("activity_1")
+    assert record is not None
+    assert record.box_updates == (
+        (2, (0.10, 0.20, 0.30, 0.40)),
+        (3, (0.25, 0.44, 0.23, 0.52)),
+    )
+
+
+async def test_engine_records_no_box_when_the_event_has_none(
+    hass: HomeAssistant,
+) -> None:
+    """没有 box 的事件不留空洞：序列保持为空，而不是写入一个占位。"""
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        replace(
+            _activity("activity_1", ()),
+            association_deadline=11,
+            finalization_deadline=121,
+        )
+    )
+    engine = CorrelationEngine(
+        store,
+        entry_id="entry_1",
+        camera="front",
+        processing_mode=ProcessingMode.OBSERVE,
+    )
+    await engine.async_handle(
+        IngressMessage(
+            kind=IngressKind.FRIGATE_EVENT,
+            entry_id="entry_1",
+            source_id="event_1",
+            event_id="event_1",
+            event_type="update",
+            occurred_at=2,
+            camera="front",
+            current_zones=("near",),
+        )
+    )
+    record = store.get("activity_1")
+    assert record is not None
+    assert record.box_updates == ()
+
+
 async def test_new_detection_respects_association_deadline_but_existing_continues(
     hass: HomeAssistant,
 ) -> None:

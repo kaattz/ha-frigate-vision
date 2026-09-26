@@ -275,6 +275,7 @@ class ActivityStore:
         review_ids: tuple[str, ...] = (),
         zone_update: tuple[float, tuple[str, ...]] | None = None,
         detection_zone_update: tuple[str, float, tuple[str, ...]] | None = None,
+        box_update: tuple[float, tuple[float, float, float, float]] | None = None,
         doorbell_at: float | None = None,
         doorbell_times: tuple[float, ...] = (),
         updated_at: float,
@@ -314,6 +315,19 @@ class ActivityStore:
                         key=lambda item: (item[0][1], item[0][0]),
                     )
                 )
+            box_updates = existing.box_updates
+            if box_update is not None:
+                occurred_at, box = box_update
+                # Replaced, not unioned: a box is one value, and the model requires
+                # strictly increasing timestamps because "the box at t" has to be a
+                # single answer. Frigate re-publishes the same frame_time when it
+                # revises a detection, so the later value wins.
+                by_box_timestamp = {
+                    timestamp: existing_box
+                    for timestamp, existing_box in box_updates
+                }
+                by_box_timestamp[occurred_at] = box
+                box_updates = tuple(sorted(by_box_timestamp.items()))
             merged_doorbell_times = tuple(
                 sorted(
                     {
@@ -336,6 +350,7 @@ class ActivityStore:
                 review_ids=tuple(dict.fromkeys((*existing.review_ids, *review_ids))),
                 zone_updates=zone_updates,
                 detection_zone_updates=detection_zone_updates,
+                box_updates=box_updates,
                 updated_at=max(existing.updated_at, updated_at),
                 doorbell_at=(
                     merged_doorbell_times[0] if merged_doorbell_times else None

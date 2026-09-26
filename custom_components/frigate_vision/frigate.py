@@ -18,7 +18,13 @@ from homeassistant.helpers.aiohttp_client import (
     async_get_clientsession,
 )
 
-from .models import SAFE_ID, IngressKind, IngressMessage, ModelValidationError
+from .models import (
+    SAFE_ID,
+    IngressKind,
+    IngressMessage,
+    ModelValidationError,
+    person_box,
+)
 
 
 class FrigateApiError(RuntimeError):
@@ -288,6 +294,25 @@ def _load_payload(payload: str) -> Mapping[str, Any]:
     return value
 
 
+def _event_box(after: Mapping[str, Any]) -> tuple[float, float, float, float] | None:
+    """Return the person box from an event payload, or None when unusable.
+
+    Measured on Frigate 0.17: the box lives in `after["data"]["box"]`, while the
+    top-level `after["box"]` is an empty list. Both are read, preferring the
+    top-level one when it actually carries a value -- matching how the rest of
+    this module treats the two locations.
+
+    Every failure degrades to None rather than raising. A box is an optional
+    extra: the same message also carries the zone update that tells a door cycle
+    where the person is. Rejecting the message over one malformed box would throw
+    away evidence that has nothing to do with the box.
+    """
+    data = after.get("data")
+    nested = data.get("box") if isinstance(data, Mapping) else None
+    top_level = after.get("box")
+    return person_box(top_level) or person_box(nested)
+
+
 def parse_event_payload(
     payload: str, *, entry_id: str, camera: str, allowed_zones: set[str]
 ) -> IngressMessage | None:
@@ -314,6 +339,7 @@ def parse_event_payload(
             camera=camera,
             current_zones=current,
             entered_zones=entered,
+            box=_event_box(after),
         )
     except (KeyError, TypeError, ValueError, ModelValidationError) as exc:
         raise FrigatePayloadError("invalid_event_payload") from exc

@@ -184,6 +184,57 @@ async def test_same_timestamp_zone_updates_merge_deterministically(
     assert merged.zone_updates == ((110, ("far", "near")),)
 
 
+async def test_merge_context_accumulates_box_updates(hass: HomeAssistant) -> None:
+    """逐时刻的 box 要在合并处累积，和时间戳一起，按时间排序。
+
+    这是「取 box 最大的那一帧」的唯一数据来源：MQTT 每条 update 带一个 box，
+    这里把它们按发生时间串起来。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(_record())
+    await store.async_merge_context(
+        "activity_1", box_update=(110, (0.1, 0.2, 0.3, 0.4)), updated_at=110
+    )
+    merged = await store.async_merge_context(
+        "activity_1", box_update=(120, (0.2, 0.3, 0.4, 0.5)), updated_at=120
+    )
+    assert merged.box_updates == (
+        (110, (0.1, 0.2, 0.3, 0.4)),
+        (120, (0.2, 0.3, 0.4, 0.5)),
+    )
+
+
+async def test_box_updates_stay_strictly_increasing_on_a_repeat_timestamp(
+    hass: HomeAssistant,
+) -> None:
+    """同一时刻重复上报时替换而不是追加 —— 模型层要求时间戳严格递增。
+
+    Frigate 会在同一 frame_time 上重发；若照抄 zone_updates 的「并集」写法会得到
+    两条同时间戳的记录，`ActivityRecord` 会拒绝，于是**之后所有**上下文合并都开始
+    抛错，连 zone 一起丢。box 是单值，取后到的那条即可。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(_record())
+    await store.async_merge_context(
+        "activity_1", box_update=(110, (0.1, 0.2, 0.3, 0.4)), updated_at=110
+    )
+    merged = await store.async_merge_context(
+        "activity_1", box_update=(110, (0.9, 0.9, 0.9, 0.9)), updated_at=110
+    )
+    assert merged.box_updates == ((110, (0.9, 0.9, 0.9, 0.9)),)
+
+
+async def test_box_update_is_ignored_when_absent(hass: HomeAssistant) -> None:
+    """没有 box 的消息不动序列：缺 box 只是不生成特写，不该写入空洞。"""
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(_record())
+    merged = await store.async_merge_context("activity_1", updated_at=130)
+    assert merged.box_updates == ()
+
+
 async def test_store_prunes_oldest_terminal_history(hass: HomeAssistant) -> None:
     store = ActivityStore(hass, "entry_1", max_activities=2)
     await store.async_load()

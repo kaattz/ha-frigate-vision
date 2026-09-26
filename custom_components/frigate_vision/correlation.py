@@ -187,6 +187,11 @@ class CorrelationEngine:
                     message.occurred_at,
                     message.current_zones,
                 ),
+                box_update=(
+                    (message.occurred_at, message.box)
+                    if message.box is not None
+                    else None
+                ),
                 updated_at=message.occurred_at,
             )
             await self._async_attach_matching_reviews(updated)
@@ -286,6 +291,11 @@ class CorrelationEngine:
                     message.event_id,
                     message.occurred_at,
                     message.current_zones,
+                ),
+                box_update=(
+                    (message.occurred_at, message.box)
+                    if message.box is not None
+                    else None
                 ),
                 updated_at=message.occurred_at,
             )

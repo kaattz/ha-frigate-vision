@@ -31,10 +31,60 @@ MAX_CLASSIFICATION_LENGTH = 192
 SAFE_CLASSIFICATION = re.compile(
     rf"^[^\x00-\x1f\x7f-\x9f\u2028\u2029]{{1,{MAX_CLASSIFICATION_LENGTH}}}$"
 )
+# One person box per MQTT update is cheap (four floats), but a door cycle can stay
+# open for 30 minutes and Frigate re-publishes on every position change. The cap
+# bounds a single activity's stored evidence; 1000 is what the per-detection zone
+# sequence already uses for the same reason.
+MAX_BOX_UPDATES = 1000
 
 
 class ModelValidationError(ValueError):
     """A persisted or incoming model is invalid."""
+
+
+def is_person_box(value: Any) -> bool:
+    """Whether `value` is a usable normalised person box.
+
+    A box is `[x, y, w, h]` as fractions of the frame. Zero or negative width or
+    height covers no pixels, so `crop_person_box` would raise on it; rejecting it
+    here keeps that failure at the boundary rather than at crop time.
+
+    Shared by the model and the MQTT parser on purpose. If the parser accepted
+    something the model rejects, the model's exception would be caught by the
+    event parser's own handler and **the whole event would be lost** -- a door
+    cycle would silently miss a zone update because one box was odd.
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return False
+    if any(
+        isinstance(item, bool) or not isinstance(item, (int, float)) for item in value
+    ):
+        return False
+    return all(math.isfinite(item) for item in value) and value[2] > 0 and value[3] > 0
+
+
+def person_box(value: Any) -> tuple[float, float, float, float] | None:
+    """Return a validated box as a float tuple, or None when unusable.
+
+    Used on the read path, where absent and unreadable both mean "no box" rather
+    than an error.
+    """
+    if not is_person_box(value):
+        return None
+    return (float(value[0]), float(value[1]), float(value[2]), float(value[3]))
+
+
+def _required_box(value: Any) -> tuple[float, float, float, float]:
+    """Coerce a persisted box, rejecting an unreadable one.
+
+    A stored `box_updates` entry is evidence this integration wrote itself, so a
+    malformed one is corruption rather than a Frigate quirk. Raising here makes
+    `ActivityRecord.from_dict` report it instead of storing a hole.
+    """
+    box = person_box(value)
+    if box is None:
+        raise ModelValidationError("invalid_box_updates")
+    return box
 
 
 class ActivitySource(StrEnum):
@@ -83,10 +133,13 @@ class IngressMessage:
     detection_ids: tuple[str, ...] = ()
     processing_mode: ProcessingMode | None = None
     manual: bool = False
+    box: tuple[float, float, float, float] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.manual, bool):
             raise ModelValidationError("invalid_manual_flag")
+        if self.box is not None and not is_person_box(self.box):
+            raise ModelValidationError("invalid_box")
         for value in (
             self.entry_id,
             self.source_id,
@@ -129,6 +182,16 @@ class IngressMessage:
         payload["occurred_at"] = float(self.occurred_at)
         if self.started_at is not None:
             payload["started_at"] = float(self.started_at)
+        if self.box is None:
+            # Omitted rather than written as null: `BufferedIngress.buffer_id` is a
+            # hash of this dict, and `ActivityStore.async_load` re-derives each
+            # buffer_id and requires it to match the stored key. A new key would
+            # change every id, so a restart would reject its own buffer as
+            # `store_identity_mismatch` -- for messages that predate this field,
+            # that is every message currently undecided.
+            payload.pop("box", None)
+        else:
+            payload["box"] = [float(value) for value in self.box]
         return payload
 
     @classmethod
@@ -148,6 +211,7 @@ class IngressMessage:
             "detection_ids",
             "processing_mode",
             "manual",
+            "box",
         }
         if set(payload) - allowed:
             raise ModelValidationError("unknown_ingress_field")
@@ -193,6 +257,9 @@ class IngressMessage:
                     else None
                 ),
                 manual=payload.get("manual", False),
+                # A legacy payload has no box key at all; `None` is also what an
+                # unreadable value degrades to, so both load the same way.
+                box=person_box(payload.get("box")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             if isinstance(exc, ModelValidationError):
@@ -270,6 +337,7 @@ class ActivityRecord:
     detection_ids: tuple[str, ...] = ()
     zone_updates: tuple[tuple[float, tuple[str, ...]], ...] = ()
     detection_zone_updates: tuple[tuple[str, float, tuple[str, ...]], ...] = ()
+    box_updates: tuple[tuple[float, tuple[float, float, float, float]], ...] = ()
     opening_side: str = "unknown"
     door_closed_at: float | None = None
     door_remained_open: bool | None = None
@@ -446,6 +514,23 @@ class ActivityRecord:
             ):
                 raise ModelValidationError("invalid_detection_zone_updates")
             previous_detection_key = detection_key
+        # Strictly increasing, unlike zone_updates which merges same-timestamp
+        # entries into a set. A box is a single value with no union, so two
+        # records at one instant would be ambiguous: "the box at t" would depend
+        # on which one a reader picked, and the crop would land on the wrong
+        # moment. The writer replaces instead (see ActivityStore.async_merge_context).
+        if len(self.box_updates) > MAX_BOX_UPDATES:
+            raise ModelValidationError("invalid_box_updates")
+        previous_box_time = -1.0
+        for occurred_at, box in self.box_updates:
+            if (
+                not math.isfinite(occurred_at)
+                or occurred_at < 0
+                or occurred_at <= previous_box_time
+                or not is_person_box(box)
+            ):
+                raise ModelValidationError("invalid_box_updates")
+            previous_box_time = occurred_at
         deadlines = [
             value
             for value in (self.association_deadline, self.finalization_deadline)
@@ -498,6 +583,7 @@ class ActivityRecord:
             "detection_ids",
             "zone_updates",
             "detection_zone_updates",
+            "box_updates",
             "opening_side",
             "door_closed_at",
             "door_remained_open",
@@ -579,6 +665,16 @@ class ActivityRecord:
                         tuple(str(zone) for zone in update[2]),
                     )
                     for update in payload.get("detection_zone_updates", [])
+                ),
+                # Strict here, unlike the MQTT read path: a stored box that cannot
+                # be read means the persisted evidence is corrupt, and silently
+                # dropping it would hide that behind a missing close-up crop.
+                box_updates=tuple(
+                    (
+                        float(update[0]),
+                        _required_box(update[1]),
+                    )
+                    for update in payload.get("box_updates", [])
                 ),
                 opening_side=str(payload.get("opening_side", "unknown")),
                 door_closed_at=(
