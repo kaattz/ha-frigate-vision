@@ -929,11 +929,13 @@ class MediaManager:
         analysis over it would cost the whole activity, so this degrades instead of
         raising.
 
-        The two guards below are one condition in effect. `largest_person_box`
-        returns None only for an empty sequence -- every stored box is already
-        validated as finite with a positive width and height by `ActivityRecord`
-        -- and an empty sequence is what the first guard rejects. They are kept
-        separate so the crop code reads without a nested block.
+        The second guard is NOT redundant with the first, and must not be removed as
+        dead code. The first rejects an empty `selected` but says nothing about
+        `box_updates`, so an activity that recorded no box -- every activity from
+        before this feature existed -- reaches `largest_person_box` with an empty
+        sequence, gets None back, and would fail to unpack it. A mutation that drops
+        this guard is caught by `test_the_manager_still_builds_when_no_box_was_recorded`
+        with `TypeError: cannot unpack non-iterable NoneType object`.
         """
         if not self._person_highlight or not selected:
             return None

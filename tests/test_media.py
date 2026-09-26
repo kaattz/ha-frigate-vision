@@ -2587,6 +2587,64 @@ def test_largest_person_box_returns_none_when_nothing_is_usable() -> None:
     assert largest_person_box(((100.0, (0.1, 0.1, 0.0, 0.0)),)) is None
 
 
+def test_crop_person_from_frame_uses_the_configured_padding(tmp_path) -> None:
+    """裁剪必须真的用 `PERSON_CROP_PADDING`，且比紧贴 box 更大。
+
+    这条测试补一个实测出来的覆盖缺口：把该常量改成 0.0 或 5.0，整套 452 个测试
+    **全部通过**，因为其他测试都显式传 `padding=` 调 `crop_person_box`，没有任何
+    测试读生产常量，也没有端到端断言裁剪尺寸。于是「人物紧贴边框、头和手里的
+    包裹被切掉」——正是这个功能要解决的问题——可以静默上线。
+
+    断言的是「带 padding 的结果严格大于紧贴 box」，而不是某个具体像素数，这样
+    常量本身仍可调整，但调成 0 会立刻变红。
+    """
+    from custom_components.frigate_vision.media import (
+        PERSON_CROP_PADDING,
+        crop_person_box,
+        crop_person_from_frame,
+    )
+
+    assert PERSON_CROP_PADDING > 0, "padding 为 0 会把头和手里的包裹切掉"
+    # An upper bound too: a large enough padding clamps to the whole frame, and a
+    # "close-up" that is the entire frame is just the frame -- the person is no
+    # bigger than in any other view, so the feature silently does nothing. 5.0 was
+    # measured to collapse a 160x180 box to the full 640x360.
+    assert PERSON_CROP_PADDING < 1.0, "padding 太大会退化成整帧，特写就失去意义"
+
+    box = (0.30, 0.25, 0.25, 0.50)
+    frame = tmp_path / "original.jpg"
+    Image.new("RGB", (640, 360), (180, 140, 110)).save(frame, "JPEG")
+    with Image.open(frame) as source:
+        frame_size = source.size
+
+    tight = crop_person_box(box, frame_size=frame_size, padding=0.0)
+    crop = crop_person_from_frame(frame, box)
+    assert crop.size[0] > tight[2] - tight[0], "宽度没有把 padding 算进去"
+    assert crop.size[1] > tight[3] - tight[1], "高度没有把 padding 算进去"
+
+
+def test_crop_person_from_frame_reads_the_real_frame_size(tmp_path) -> None:
+    """裁剪必须按帧的真实尺寸换算，而不是假定 640x360。
+
+    box 是归一化的，所以帧尺寸错了，裁出来的位置就错了。当前帧恰好是 640x360，
+    硬编码不会有症状；换一个尺寸就能看出来。
+    """
+    from custom_components.frigate_vision.media import crop_person_from_frame
+
+    box = (0.25, 0.25, 0.50, 0.50)
+    for size in ((640, 360), (1280, 720)):
+        frame = tmp_path / f"frame_{size[0]}.jpg"
+        Image.new("RGB", size, (180, 140, 110)).save(frame, "JPEG")
+        crop = crop_person_from_frame(frame, box)
+        # Half the frame plus padding on every side: comfortably more than half,
+        # and far less than the whole frame. A hardcoded 640x360 would give the
+        # same pixel size for both, so the two sizes must differ.
+        assert crop.size[0] > size[0] * 0.5
+        assert crop.size[0] < size[0]
+        assert crop.size[1] > size[1] * 0.5
+        assert crop.size[1] < size[1]
+
+
 async def test_the_manager_adds_a_close_up_when_the_option_is_on(
     hass: HomeAssistant, tmp_path
 ) -> None:
