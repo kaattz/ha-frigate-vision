@@ -330,6 +330,14 @@ def test_the_cell_description_does_not_hardcode_a_count() -> None:
             f"the prompt asserts a fixed cell count ({wrong}) that only holds for "
             "one of the two sheet sizes"
         )
+    # The highlight section describes the same grid, so it inherits the same
+    # constraint: naming a count there would place the emptied scene early
+    # whenever the sheet is the larger of the two sizes.
+    with_highlight = _review_prompt(highlight=True)
+    for wrong in ("六格", "九格", "六个格", "9格"):
+        assert wrong not in with_highlight, (
+            f"the highlight section asserts a fixed cell count ({wrong})"
+        )
     # The structural anchors must still be stated, or the model loses the meaning
     # of the first and last cells.
     assert "首帧" in prompt and "末帧" in prompt and "后置" in prompt
@@ -1047,4 +1055,143 @@ def test_door_scenes_still_key_on_custom_labels() -> None:
         assert with_labels != base, f"{mode} 的标签没有参与缓存键"
         with_override = effective_prompt_version(mode, "", prompt_override="自定义规则")
         assert with_override != base, f"{mode} 的提示词覆盖没有参与缓存键"
+
+
+def _review_prompt(*, highlight: bool, description: str = "") -> str:
+    """Render review_six with the close-up column switched on or off."""
+    scene = SCENES["review_six"]
+    return scene.render(
+        SceneRequest(
+            language="中文",
+            allowed=set(scene.classifications),
+            signals={},
+            scene_description=description,
+            has_person_highlight=highlight,
+        )
+    )
+
+
+def test_the_prompt_explains_the_highlight_column() -> None:
+    """必须说明右侧栏不是时间序列的一部分。
+
+    不说的话模型可能把它当成「第 10 帧」，从而误判人物的移动方向 ——
+    九宫格的全部价值就在方向判断上。
+    """
+    prompt = _review_prompt(highlight=True)
+    assert "特写" in prompt or "放大" in prompt, (
+        "图上多了一栏，提示词必须说明它是什么"
+    )
+    # Which side is which has to be stated here: the model reads the image, and
+    # nothing else in the prompt can tell it the sheet has two regions now.
+    assert "左侧" in prompt, "必须指出九宫格在左"
+    assert "右侧" in prompt, "必须指出特写在右"
+    # Each region's job: direction comes from the grid, appearance from the
+    # close-up. Stating only that the column exists would leave it unexplained.
+    assert "靠近" in prompt and "远离" in prompt, "九宫格要说明用于判断方向"
+    assert "衣着" in prompt, "特写要说明用于辨认外观"
+    # The sentence that stops the model reading the column as a tenth frame.
+    assert "不是时间序列的一部分" in prompt, (
+        "必须有一句明确排除时间解读的话，否则模型会把特写当成第 10 帧，"
+        "从而把人物的移动方向读反"
+    )
+    assert "不要据它判断先后顺序" in prompt
+
+
+def test_the_prompt_omits_the_highlight_section_by_default() -> None:
+    """默认（不启用）时提示词里不能出现特写说明 —— 零回归。"""
+    default = _review_prompt(highlight=False)
+    explicit = _review_prompt(highlight=False)
+    assert default == explicit
+    # Byte-for-byte what this scene rendered before the option existed.
+    assert default == _render("review_six"), (
+        "未启用特写时提示词必须与既有渲染逐字节相同"
+    )
+    for word in ("特写", "放大", "不是时间序列的一部分"):
+        assert word not in default, f"未启用特写时不该出现「{word}」"
+
+
+def test_the_highlight_changes_the_cache_key() -> None:
+    """启用特写必须换缓存键，否则已有活动不会重新分析。"""
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+
+    off = effective_prompt_version("review_six")
+    on = effective_prompt_version("review_six", has_person_highlight=True)
+    assert on != off, (
+        "启用特写改变了提示词，键必须跟着变；否则已有活动会直接返回上一次"
+        "提示词的存储结果，改动看起来完全没生效"
+    )
+    assert on is not None and on.startswith(f"{off}-")
+
+
+def test_the_highlight_is_absent_from_the_key_by_default() -> None:
+    """不启用时键必须与现状完全一致 —— 否则既有部署的缓存全失效。"""
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+
+    base = SCENES["review_six"].prompt_version
+    assert effective_prompt_version("review_six") == base
+    assert effective_prompt_version("review_six", has_person_highlight=False) == base
+
+
+def test_the_key_and_the_prompt_agree_on_whether_the_highlight_is_on() -> None:
+    """claim 与 return 必须用同一条件。
+
+    render() 用某个条件、effective_prompt_version() 用另一个，会导致
+    claim 键与 return 键不一致 -> side_effect_key_mismatch，且发生在
+    provider 已经计费之后。本项目犯过这个错。
+
+    这里不预设两个函数各自怎么写，只观察两个*可观测结果* —— 提示词里有没有
+    特写段落、键里有没有多出来的摘要 —— 然后断言这两个观察在**每一对取值之间
+    同进同退**：提示词不同的两行必须得到不同的键，提示词相同的两行必须得到
+    相同的键。任何一个函数单独用了别的条件，都会让某一对观察分歧而被抓住。
+    """
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+
+    # Two dimensions, so the invariant is checked between rows that differ by the
+    # flag and rows that differ by something else -- a key derived from the wrong
+    # input shows up as a disagreement in one of the pairs.
+    cases: list[tuple[bool, str, str, str]] = []
+    for highlight in (False, True):
+        for description in ("", "入户门在画外左侧"):
+            key = effective_prompt_version(
+                "review_six", description, has_person_highlight=highlight
+            )
+            assert key is not None
+            cases.append(
+                (
+                    highlight,
+                    description,
+                    _review_prompt(highlight=highlight, description=description),
+                    key,
+                )
+            )
+
+    # The invariant, checked first and between *all* pairs rather than only the
+    # flag-differing ones. It names neither function's condition, so it holds for
+    # any pair of implementations that agree -- and breaks the moment one of them
+    # consults something the other does not.
+    for index, (flag_a, desc_a, prompt_a, key_a) in enumerate(cases):
+        for flag_b, desc_b, prompt_b, key_b in cases[index + 1 :]:
+            same_prompt = prompt_a == prompt_b
+            same_key = key_a == key_b
+            assert same_prompt == same_key, (
+                f"has_person_highlight={flag_a}/{desc_a!r} 与 "
+                f"{flag_b}/{desc_b!r}：提示词"
+                f"{'相同' if same_prompt else '不同'}，但缓存键"
+                f"{'相同' if same_key else '不同'}。\n"
+                "render() 与 effective_prompt_version() 必须用同一个条件判断"
+                "「是否启用特写」：两边不一致会让 claim 键与 return 键不同，"
+                "抛 side_effect_key_mismatch，而那时 provider 已经计费。\n"
+                f"  prompt({flag_a}, {desc_a!r}) == prompt({flag_b}, {desc_b!r}): "
+                f"{same_prompt}\n"
+                f"  key({flag_a}, {desc_a!r}) = {key_a}\n"
+                f"  key({flag_b}, {desc_b!r}) = {key_b}"
+            )
+
+    # Guard against a vacuous pass: if *both* functions ignored the flag, every
+    # prompt and every key above would be equal and the invariant would hold
+    # trivially. The flag has to be wired into both, so both must move.
+    off = cases[0]
+    on = cases[-1]
+    assert off[2] != on[2], "启用特写必须改变提示词"
+    assert off[3] != on[3], "启用特写必须改变缓存键"
 

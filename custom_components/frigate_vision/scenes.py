@@ -57,6 +57,8 @@ class SceneRequest:
     scene_labels: tuple[tuple[str, str], ...] = ()
     # 该 entry 自定义的规则全文。空表示用场景内置的 template。
     prompt_override: str = ""
+    # 图上是否多了一栏人物特写。默认 False，既有的构造调用与渲染逐字节不变。
+    has_person_highlight: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +107,10 @@ class Scene:
             parts.append(override)
         else:
             parts.append(self.template)
+        # 只加在规则之后、标签定义之前：先让模型读完判断规则，再告诉它图上
+        # 有两栏。不启用时一个字都不加，既有部署的提示词逐字节不变。
+        if request.has_person_highlight:
+            parts.append(_PERSON_HIGHLIGHT)
         # 标签定义：自定义优先，否则用内置的。覆盖不影响这一选择——只写规则
         # 时内置定义仍要出现：定义与「用什么规则判断」是正交的两件事。
         if request.scene_labels:
@@ -274,6 +280,31 @@ def _scene_context(description: str) -> str:
     )
 
 
+# Tells the model what the extra column on the right is.
+#
+# Without this the model reads that column as a tenth time step, which reverses
+# the direction it reports -- and direction is what this scene's arrival and
+# departure rules rest on. Those rules already have to read direction off the
+# frames rather than off timing (see `_REVIEW_SIX`: no zone telemetry reaches
+# this path), so a column that displaces the frame order costs the scene its only
+# remaining evidence. A column merely *described* as a close-up still invites the
+# model to place it somewhere in the sequence, so the exclusion sentence is the
+# payload here rather than a caveat: it is what stops the column from being read
+# as evidence about order.
+#
+# Says "各帧" rather than naming a count, for the reason the template does: the
+# grid is 2x3 when no hole is wide enough to probe and 3x3 when one is, so
+# "九宫格" would be wrong half the time -- and wrong in the direction that
+# matters, since it would place the emptied scene three cells early.
+_PERSON_HIGHLIGHT = (
+    "画面分成两栏。左侧是本次事件过程的各帧网格图，按时间从左到右、"
+    "再从上到下读取，用于判断人物是靠近还是远离。"
+    "右侧单独一栏是同一事件中人物最清晰的一帧放大特写，"
+    "用于辨认衣着、携带物等外观特征。"
+    "它不是时间序列的一部分，不要据它判断先后顺序。"
+)
+
+
 # The general scene. Its phrasing carries the arrival/departure rules because no
 # zone telemetry reaches this path (measured: 0 of 90 standalone reviews carried
 # detection_zone_updates, while door cycles did), so direction has to be seen in
@@ -400,6 +431,7 @@ def effective_prompt_version(
     *,
     scene_labels: tuple[tuple[str, str], ...] = (),
     prompt_override: str = "",
+    has_person_highlight: bool = False,
 ) -> str | None:
     """Return the version to key an analysis on.
 
@@ -440,6 +472,11 @@ def effective_prompt_version(
     override = prompt_override.strip()
     if override:
         parts.append(override)
+    # 与 `render()` 用同一个条件：图上多一栏时提示词就多一段，键也必须多一段。
+    # 两个函数各用各的条件，claim 键就会与 return 键不同，抛
+    # `side_effect_key_mismatch`——而那发生在 provider 已经计费之后。
+    if has_person_highlight:
+        parts.append("person_highlight")
     if not parts:
         # Nothing was configured, so the prompt is exactly the base one and the
         # key must stay exactly the base key. Deployments that never configure
