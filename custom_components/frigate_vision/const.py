@@ -31,6 +31,19 @@ CONF_LLM_PROVIDER = "llm_provider"
 CONF_LLM_BASE_URL_DEFAULT = "https://api.deepseek.com/v1"
 CONF_LLM_PROVIDER_DEFAULT = "deepseek"
 
+# 证据图右侧是否再附一栏人物放大特写。九宫格里的人物只有 59x74 px，辨认衣着
+# 与携带物基本不可能；右侧特写栏能到 255-415 px，模型才真的看得清。
+#
+# 默认**关**，因为这是一个行为变更：它改变发给模型的图，并且会改变缓存键
+# （`effective_prompt_version` 把开关折进键里）。默认开着会让每一个既有部署在
+# 升级后立刻换键、缓存全失效、每次分析都多发一张图——而用户并没有要求这个。
+# 默认关则提示词与键都逐字节不变（Task 3 已验证不传 highlight 时拼图输出不变），
+# 只有显式打开的人才付出那点额外费用。
+#
+# 与 `analyze_night_unknown` 这类既有选项一样取保守默认：新功能不改变既有行为。
+CONF_PERSON_HIGHLIGHT = "person_highlight"
+CONF_PERSON_HIGHLIGHT_DEFAULT = False
+
 # Known OpenAI-compatible endpoints, so the base URL does not have to be typed by
 # hand. That URL is the field most easily got wrong: it must be the
 # OpenAI-compatible *root*, and providers disagree about the shape. Google's is the

@@ -816,11 +816,16 @@ MALFORMED_LABELS = [
 ]
 
 
-async def _store_with_a_ready_activity(hass: HomeAssistant, sheet: Any) -> Any:
+async def _store_with_a_ready_activity(
+    hass: HomeAssistant, sheet: Any, *, entry_id: str = "entry_1"
+) -> Any:
     """建一个持有单个 EVIDENCE_READY 活动的 store，与运行时的状态一致。
 
     构造方式与 `test_a_configured_entry_analyses_and_completes_its_claim` 相同，
     这样畸形标签的用例走的是真实可认领的活动，而不是桩对象。
+
+    `entry_id` 可换是为了让一个测试里跑两遍：HA 的 Store 按 entry_id 持久化，
+    同一个 id 第二次 `async_load` 会读回上一次已完成的记录，直接 stage_conflict。
     """
     from custom_components.frigate_vision.models import (
         ActivityRecord,
@@ -830,12 +835,12 @@ async def _store_with_a_ready_activity(hass: HomeAssistant, sheet: Any) -> Any:
     )
     from custom_components.frigate_vision.store import ActivityStore
 
-    store = ActivityStore(hass, "entry_1")
+    store = ActivityStore(hass, entry_id)
     await store.async_load()
     await store.async_create(
         ActivityRecord(
             activity_id="activity_1",
-            entry_id="entry_1",
+            entry_id=entry_id,
             source=ActivitySource.STANDALONE_REVIEW,
             stage=ActivityStage.EVIDENCE_READY,
             processing_mode=ProcessingMode.SHADOW,
@@ -847,6 +852,168 @@ async def _store_with_a_ready_activity(hass: HomeAssistant, sheet: Any) -> Any:
         )
     )
     return store
+
+
+def test_person_highlight_is_off_by_default() -> None:
+    """默认不启用 —— 既有部署的行为与缓存完全不变。
+
+    这是一个**行为变更**（改变发给模型的图）并且会改变缓存键，所以默认必须是
+    关的：没打开开关的部署，提示词逐字节不变、键也逐字节不变，缓存全部命中。
+    """
+    from custom_components.frigate_vision.const import (
+        CONF_PERSON_HIGHLIGHT_DEFAULT,
+    )
+    from custom_components.frigate_vision.vision import vision_config_from
+
+    assert CONF_PERSON_HIGHLIGHT_DEFAULT is False
+    assert VisionConfig(
+        base_url="https://api.example.com/v1", api_key="k", model="m"
+    ).person_highlight is False
+    # 没配置时（既有 entry 的 options 里根本没有这个键）也是关的。
+    assert vision_config_from({}, {}).person_highlight is False
+
+
+def test_enabling_the_highlight_changes_the_cache_key() -> None:
+    """打开开关必须换键，否则已有活动不会重新分析，会返回旧提示词的结果。
+
+    键与提示词必须同源：只改提示词不换键，用户打开开关后拿到的仍是**上一次
+    提示词**产生的存储结果，改动看起来完全没生效。本项目已因这种形状丢过功能
+    两次。
+    """
+    from custom_components.frigate_vision.const import CONF_PERSON_HIGHLIGHT
+    from custom_components.frigate_vision.scenes import SCENES, effective_prompt_version
+    from custom_components.frigate_vision.vision import vision_config_from
+
+    base = SCENES["review_six"].prompt_version
+    assert effective_prompt_version("review_six", "") == base
+    assert (
+        effective_prompt_version("review_six", "", has_person_highlight=False) == base
+    )
+    on = effective_prompt_version("review_six", "", has_person_highlight=True)
+    assert on != base, "打开特写改变了提示词，缓存键必须跟着变"
+
+    # 而且这个值确实是从 entry 的配置里读出来的，不是某处写死的常量。
+    enabled = vision_config_from(
+        {}, {CONF_PERSON_HIGHLIGHT: True, "llm_model": "m"}
+    )
+    assert enabled.person_highlight is True
+    assert (
+        effective_prompt_version(
+            "review_six", "", has_person_highlight=enabled.person_highlight
+        )
+        == on
+    )
+
+
+async def test_the_claim_and_the_rendered_prompt_use_the_same_flag(
+    hass: HomeAssistant,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """claim 键与 render 必须用同一个值。
+
+    不一致会导致 claim 键 != return 键 -> side_effect_key_mismatch，
+    而那发生在 provider 已经计费之后。
+
+    这里不读源码、也不假定哪几行传参，而是让**真实的一次分析**跑完，然后检查
+    两个可观测结果是否自洽：
+
+      * ground truth —— 模型实际收到的提示词里有没有特写段落（render 传的值）；
+      * store 的结果 —— 认领的副作用键是哪一个版本（claim 传的值）。
+
+    分析能到 ANALYSIS_DONE，就要求 claim 键 == return 键 == store 重建的键。
+    于是只要 claim 与 render 传了不同的值，三者中必有一处对不上，这个测试就会
+    以 side_effect_key_mismatch（或 store 里没有那个键）失败。两个方向都跑一遍，
+    所以恒 True / 恒 False 的写死同样会被抓住。
+    """
+    from custom_components.frigate_vision.models import ActivityStage
+    from custom_components.frigate_vision.scenes import effective_prompt_version
+    from custom_components.frigate_vision.vision import VisionClient
+
+    # 提示词里只有特写段落用到「放大特写」这个词，所以它是 render 是否收到
+    # True 的直接证据。
+    marker = "放大特写"
+    seen: list[tuple[bool, str]] = []
+
+    for flag in (False, True):
+        sheet = tmp_path / f"activity_{flag}.png"
+        sheet.write_bytes(_png(640, 240))
+        # 每轮一个独立的 entry_id：HA 的 Store 按 entry_id 持久化，复用会让
+        # 第二次 async_load 读回上一轮已完成的记录。
+        store = await _store_with_a_ready_activity(
+            hass, sheet, entry_id=f"entry_{flag}"
+        )
+        reply = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "classification": "visitor",
+                                    "description": "一人在门前经过。",
+                                    "confidence": 71,
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+        session = _FakeSession(body=reply)
+        monkeypatch.setattr(
+            "custom_components.frigate_vision.vision.async_get_clientsession",
+            lambda _hass, _session=session: _session,
+        )
+
+        client = VisionClient(hass, store, _config(person_highlight=flag))
+        done = await client.async_analyze("activity_1")
+
+        # render 实际收到了什么。
+        rendered = session.payloads[0]["messages"][0]["content"][0]["text"]
+        rendered_highlight = marker in rendered
+
+        # claim 实际用了哪个版本：键必须就在认领集合里，且它就是 store 用来
+        # 完成分析的那一个（能到 ANALYSIS_DONE 已证明这一点）。
+        claimed = done.claimed_side_effects
+        expected_version = effective_prompt_version(
+            "review_six", "", has_person_highlight=flag
+        )
+        assert done.stage is ActivityStage.ANALYSIS_DONE, (
+            f"person_highlight={flag} 时分析没有走完：{done.error_code!r}。"
+            "claim 键与 return 键不同会在这里以 side_effect_key_mismatch 失败，"
+            "而那发生在 provider 已经计费之后。"
+        )
+        assert analysis_key("activity_1", "review_six", expected_version) in claimed, (
+            f"person_highlight={flag} 时认领的键不是 {expected_version!r}，"
+            f"实际认领：{sorted(claimed)}"
+        )
+        # 反过来：另一个取值的键不能被认领，否则说明 flag 根本没进键。
+        other_version = effective_prompt_version(
+            "review_six", "", has_person_highlight=not flag
+        )
+        assert analysis_key("activity_1", "review_six", other_version) not in claimed
+
+        seen.append((rendered_highlight, done.prompt_version or ""))
+
+    # 两行必须自洽：render 收到什么，claim 就用了什么。任何一处写死/传错，
+    # 两行之间就会出现「提示词不同而版本相同」或反之。
+    assert seen[0][0] is False and seen[1][0] is True, (
+        f"提示词没有按 person_highlight 变化：{seen}"
+    )
+    assert seen[0][1] != seen[1][1], (
+        f"两个取值的 prompt_version 相同（{seen[0][1]!r}），说明键没有跟着开关走"
+    )
+    for flag, (rendered_highlight, version) in zip((False, True), seen, strict=True):
+        assert version == effective_prompt_version(
+            "review_six", "", has_person_highlight=flag
+        ), (
+            f"person_highlight={flag}：模型收到的图"
+            f"{'有' if rendered_highlight else '没有'}特写，"
+            f"但 claim 用的是版本 {version!r}，与 render 传的值不一致。"
+            "两处不一致会让 claim 键 != return 键 -> side_effect_key_mismatch，"
+            "而那发生在 provider 已经计费之后。"
+        )
 
 
 @pytest.mark.parametrize(("labels", "expected"), MALFORMED_LABELS)

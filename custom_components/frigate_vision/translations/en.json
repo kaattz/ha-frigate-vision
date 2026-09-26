@@ -65,12 +65,14 @@
           "queue_size": "Queue size",
           "min_review_seconds": "Minimum activity length (seconds)",
           "analyze_night_unknown": "Analyze unknown night activity",
-          "analyze_all_far_reviews": "Analyze all far-zone reviews"
+          "analyze_all_far_reviews": "Analyze all far-zone reviews",
+          "person_highlight": "Person close-up"
         },
         "data_description": {
           "llm_provider": "Picking a provider fills in its OpenAI-compatible base URL. The URL stays editable, for a local router or reverse proxy.",
           "scene_labels": "One per line as `name: definition`, with a half-width colon (not the full-width `：` that a Chinese IME types by default). Leave empty to use the built-in set. Always give a definition: without one the model can only guess, and abstention rose from 11% to 55% when definitions were missing.",
-          "prompt_override": "Leave empty to use the built-in judgement rules. The output contract and the scene description are still appended automatically, because both the parser and the rules depend on them."
+          "prompt_override": "Leave empty to use the built-in judgement rules. The output contract and the scene description are still appended automatically, because both the parser and the rules depend on them.",
+          "person_highlight": "Appends a magnified column of the person to the right of the evidence sheet, so clothing and carried items can be made out. Adds a little cost."
         }
       },
       "reconfigure": {
@@ -152,11 +154,13 @@
           "queue_size": "Queue size",
           "min_review_seconds": "Minimum activity length (seconds)",
           "analyze_night_unknown": "Analyze unknown night activity",
-          "analyze_all_far_reviews": "Analyze all far-zone reviews"
+          "analyze_all_far_reviews": "Analyze all far-zone reviews",
+          "person_highlight": "Person close-up"
         },
         "data_description": {
           "scene_labels": "One per line as `name: definition`, with a half-width colon (not the full-width `：` that a Chinese IME types by default). Leave empty to use the built-in set. Always give a definition: without one the model can only guess, and abstention rose from 11% to 55% when definitions were missing.",
-          "prompt_override": "Leave empty to use the built-in judgement rules. The output contract and the scene description are still appended automatically, because both the parser and the rules depend on them."
+          "prompt_override": "Leave empty to use the built-in judgement rules. The output contract and the scene description are still appended automatically, because both the parser and the rules depend on them.",
+          "person_highlight": "Appends a magnified column of the person to the right of the evidence sheet, so clothing and carried items can be made out. Adds a little cost."
         }
       },
       "test_connection": {

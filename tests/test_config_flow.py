@@ -1256,6 +1256,33 @@ def test_the_options_form_offers_labels_and_a_prompt_override() -> None:
     assert CONF_PROMPT_OVERRIDE in fields
 
 
+def test_the_options_form_offers_the_person_highlight_switch() -> None:
+    """开关必须出现在设置表单上，否则用户打不开它。
+
+    只加在 `_llm_schema()`（初始流的服务商那一步）是不够的：那个表单在 entry
+    建好之后再也到不了，用户之后只能从选项流改设置。所以它属于 `_options_schema()`
+    —— 初始流的最后一步与选项流都用这一个 schema。
+    """
+    from custom_components.frigate_vision.const import CONF_PERSON_HIGHLIGHT
+    from custom_components.frigate_vision.vision import (
+        vision_config_from,
+    )
+
+    schema = config_flow._options_schema()
+    fields = {getattr(m, "schema", None) for m in schema.schema}
+    assert CONF_PERSON_HIGHLIGHT in fields, "设置表单上没有人物特写开关"
+
+    # 默认值是关的：既有部署保存一次表单不会意外打开一个会改变缓存键的开关。
+    marker = next(
+        m for m in schema.schema if getattr(m, "schema", None) == CONF_PERSON_HIGHLIGHT
+    )
+    default = marker.default
+    assert (default() if callable(default) else default) is False
+
+    # 表单存下的值要能被读回配置对象，否则开关存了也不生效。
+    assert vision_config_from({}, {CONF_PERSON_HIGHLIGHT: True}).person_highlight
+
+
 def test_every_options_field_has_a_translated_label() -> None:
     """选项表单上每个字段都要有标签，否则界面显示原始键名。
 

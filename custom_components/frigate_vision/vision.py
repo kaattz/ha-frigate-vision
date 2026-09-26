@@ -43,6 +43,8 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from PIL import Image, UnidentifiedImageError
 
 from .const import (
+    CONF_PERSON_HIGHLIGHT,
+    CONF_PERSON_HIGHLIGHT_DEFAULT,
     CONF_PROMPT_OVERRIDE,
     CONF_SCENE_DESCRIPTION,
     CONF_SCENE_LABELS,
@@ -123,6 +125,9 @@ class VisionConfig:
     # 该 entry 自定义的标签与提示词覆盖，原样来自选项。空表示用场景内置的。
     scene_labels: str = ""
     prompt_override: str = ""
+    # 证据图右侧是否附了一栏人物放大特写。默认关：关着的时候提示词与缓存键都
+    # 逐字节不变，既有部署升级后行为与缓存完全不受影响。
+    person_highlight: bool = CONF_PERSON_HIGHLIGHT_DEFAULT
 
     def endpoint(self) -> str:
         """Return the chat-completions URL for this base URL.
@@ -247,6 +252,31 @@ def vision_config_from(
             value = data.get(key)
         return str(value) if value not in (None, "") else default
 
+    def pick_flag(key: str, default: bool) -> bool:
+        """Read a boolean the way `pick` reads text: options first, then data.
+
+        Deliberately not `bool(value)`, which is how the older
+        `analyze_all_far_reviews` option is read elsewhere. A stored value can
+        come back as the *string* "false" -- from the frontend, or from a JSON
+        round trip -- and `bool("false")` is True. Here that would silently turn
+        the close-up on for a user who switched it off, changing the image that
+        gets billed and the cache key with it. Only a recognised true/false is
+        honoured; anything else falls back to the default rather than to
+        truthiness.
+        """
+        value = options.get(key)
+        if value is None or value == "":
+            value = data.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("true", "yes", "on", "1"):
+                return True
+            if text in ("false", "no", "off", "0"):
+                return False
+        return default
+
     return VisionConfig(
         base_url=pick("llm_base_url"),
         api_key=pick("llm_api_key"),
@@ -263,6 +293,9 @@ def vision_config_from(
         prompt_override=pick(CONF_PROMPT_OVERRIDE, "")[
             :MAX_PROMPT_OVERRIDE_LENGTH
         ],
+        person_highlight=pick_flag(
+            CONF_PERSON_HIGHLIGHT, CONF_PERSON_HIGHLIGHT_DEFAULT
+        ),
     )
 
 
@@ -339,6 +372,7 @@ class VisionClient:
                 self._config.scene_description,
                 scene_labels=custom_labels,
                 prompt_override=self._config.prompt_override,
+                has_person_highlight=self._config.person_highlight,
             )
             or scene.prompt_version,
         )
@@ -539,6 +573,7 @@ async def async_analyze(
             scene_description=config.scene_description,
             scene_labels=custom_labels,
             prompt_override=config.prompt_override,
+            has_person_highlight=config.person_highlight,
         )
     )
     image_bytes = await asyncio.get_running_loop().run_in_executor(
@@ -572,6 +607,7 @@ async def async_analyze(
             config.scene_description,
             scene_labels=custom_labels,
             prompt_override=config.prompt_override,
+            has_person_highlight=config.person_highlight,
         )
         or scene.prompt_version
     )

@@ -39,6 +39,8 @@ from .const import (
     CONF_MQTT_TOPIC_PREFIX,
     CONF_NAME,
     CONF_NEAR_ZONES,
+    CONF_PERSON_HIGHLIGHT,
+    CONF_PERSON_HIGHLIGHT_DEFAULT,
     CONF_PROMPT_OVERRIDE,
     CONF_SCENE_DESCRIPTION,
     CONF_SCENE_LABELS,
@@ -157,6 +159,15 @@ def _options_schema() -> vol.Schema:
             ),
             vol.Required("analyze_night_unknown", default=True): bool,
             vol.Required("analyze_all_far_reviews", default=True): bool,
+            # 证据图右侧是否再附一栏人物放大特写。默认关：打开会改变发给模型的
+            # 图并改变缓存键，属于用户要显式选择的行为变更。
+            #
+            # 放在这个 schema 而不是 `_llm_schema()`：后者是初始流的服务商那一步，
+            # entry 建好之后再也到不了；设置表单是初始流最后一步与选项流共用的
+            # 那一个，用户之后只能从这里改。
+            vol.Required(
+                CONF_PERSON_HIGHLIGHT, default=CONF_PERSON_HIGHLIGHT_DEFAULT
+            ): bool,
         }
     )
 
