@@ -403,6 +403,50 @@ def pair_times_with_roles(
     )
 
 
+def crop_person_box(
+    box: tuple[float, float, float, float],
+    *,
+    frame_size: tuple[int, int],
+    padding: float,
+) -> tuple[int, int, int, int]:
+    """Return the pixel crop for a person's box, padded and clamped.
+
+    The box arrives normalised (Frigate reports it as fractions of the frame), so
+    it is scaled by the frame's actual size. The frame is 640x360 here -- Frigate's
+    snapshot comes from the detect stream and the `h` query parameter is ignored --
+    which is why the crop is taken from the original frame rather than from the
+    contact sheet: the sheet shrinks each cell to a third of that, and the person
+    with it.
+
+    Padding is applied on all four sides because a tight box cuts off heads, hands
+    and carried objects -- the very things this crop exists to show. The result is
+    clamped to the frame so Pillow never sees an out-of-range region.
+    """
+    x, y, width, height = box
+    # A zero-sized or non-finite box is not a person the model can look at, and
+    # Frigate does emit tiny boxes in the instant a target appears.
+    if not all(math.isfinite(value) for value in (x, y, width, height)):
+        raise ValueError("invalid_person_box")
+    if width <= 0 or height <= 0:
+        raise ValueError("invalid_person_box")
+    frame_width, frame_height = frame_size
+    pad_x = width * padding * frame_width
+    pad_y = height * padding * frame_height
+    # Truncating every edge keeps the four coordinates consistent with one
+    # another: the box spans pixels [x*frame_width, (x+width)*frame_width).
+    left = math.floor(x * frame_width - pad_x)
+    top = math.floor(y * frame_height - pad_y)
+    right = math.floor((x + width) * frame_width + pad_x)
+    bottom = math.floor((y + height) * frame_height + pad_y)
+    left = max(0, min(left, frame_width - 1))
+    top = max(0, min(top, frame_height - 1))
+    # A box that truncates to nothing, or one sitting on the last pixel, still
+    # needs a non-empty region; a zero-width crop is an error to Pillow.
+    right = min(frame_width, max(right, left + 1))
+    bottom = min(frame_height, max(bottom, top + 1))
+    return left, top, right, bottom
+
+
 def build_contact_sheet(
     frame_paths: Sequence[Path],
     output_path: Path,

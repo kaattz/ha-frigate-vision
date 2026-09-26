@@ -2155,3 +2155,68 @@ async def test_overexposure_repair_never_accepts_a_night_vision_frame(
             f"frame {entry['index']} was replaced with an instant that is still "
             f"unusable ({entry['to']})"
         )
+
+
+def test_crop_person_maps_a_normalised_box_to_pixels() -> None:
+    """box 是归一化的，必须按帧的真实尺寸换算。
+
+    帧是 640x360（Frigate 的 detect 流分辨率）。box 的 [x,y,w,h] 直接乘即可。
+    """
+    from custom_components.frigate_vision.media import crop_person_box
+
+    left, top, right, bottom = crop_person_box(
+        (0.25, 0.44, 0.23, 0.52), frame_size=(640, 360), padding=0.0
+    )
+    assert (left, top) == (160, 158)
+    assert right - left == 147
+    assert bottom - top == 187
+
+
+def test_crop_person_adds_padding_on_every_side() -> None:
+    """padding 必须四边都加，否则头部或手里的包裹会被切掉。
+
+    用户文档第 6 节明确要求不要紧贴 bbox。
+    """
+    from custom_components.frigate_vision.media import crop_person_box
+
+    tight = crop_person_box(
+        (0.40, 0.40, 0.20, 0.20), frame_size=(640, 360), padding=0.0
+    )
+    padded = crop_person_box(
+        (0.40, 0.40, 0.20, 0.20), frame_size=(640, 360), padding=0.40
+    )
+    assert padded[0] < tight[0], "左边要更靠左"
+    assert padded[1] < tight[1], "上边要更靠上"
+    assert padded[2] > tight[2], "右边要更靠右"
+    assert padded[3] > tight[3], "下边要更靠下"
+
+
+def test_crop_person_clamps_to_the_frame() -> None:
+    """裁剪区不能越出画面，否则会出现黑边或 Pillow 抛错。"""
+    from custom_components.frigate_vision.media import crop_person_box
+
+    left, top, right, bottom = crop_person_box(
+        (0.0, 0.0, 0.10, 0.10), frame_size=(640, 360), padding=0.50
+    )
+    assert left >= 0 and top >= 0
+    assert right <= 640 and bottom <= 360
+
+
+def test_crop_person_rejects_a_degenerate_box() -> None:
+    """零尺寸或非有限的 box 要拒绝，不能返回一个空裁剪区。
+
+    Frigate 偶尔会在目标刚出现时给出极小的 box。
+    """
+    from custom_components.frigate_vision.media import crop_person_box
+
+    for bad in (
+        (0.5, 0.5, 0.0, 0.2),
+        (0.5, 0.5, 0.2, 0.0),
+        (0.5, 0.5, -0.1, 0.2),
+        (float("nan"), 0.5, 0.2, 0.2),
+    ):
+        try:
+            crop_person_box(bad, frame_size=(640, 360), padding=0.4)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad} 应被拒绝")
