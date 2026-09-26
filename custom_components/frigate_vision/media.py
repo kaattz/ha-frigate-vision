@@ -447,6 +447,58 @@ def crop_person_box(
     return left, top, right, bottom
 
 
+def largest_person_box(
+    box_updates: Sequence[tuple[float, tuple[float, float, float, float]]],
+) -> tuple[float, tuple[float, float, float, float]] | None:
+    """The largest box seen and when it was seen, or None when nothing is usable.
+
+    Largest by area rather than by height or recency: the close-up exists to show
+    clothing and carried objects, and the frame where the person covers the most
+    pixels is the one that shows most of them. Frigate emits tiny boxes in the
+    instant a target appears, so an early-but-large pick would be far worse than
+    this. Returns None rather than raising: a missing box only costs the close-up,
+    and the analysis itself must still run.
+    """
+    best: tuple[float, tuple[float, float, float, float]] | None = None
+    best_area = 0.0
+    for timestamp, box in box_updates:
+        try:
+            _x, _y, width, height = (float(value) for value in box)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(float(timestamp)):
+            continue
+        if not (math.isfinite(width) and math.isfinite(height)):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        area = width * height
+        if area > best_area:
+            best_area = area
+            best = (float(timestamp), (float(box[0]), float(box[1]), width, height))
+    return best
+
+
+def crop_person_from_frame(
+    frame_path: Path, box: tuple[float, float, float, float]
+) -> Image.Image:
+    """Crop the person out of an original frame, padded and clamped.
+
+    Taken from the frame itself rather than from the contact sheet: a cell is a
+    third of the frame, so the person in it has already lost most of their pixels.
+    The frame's own size is read rather than assumed, because the crop is only
+    correct relative to the frame it came from.
+    """
+    try:
+        with Image.open(frame_path) as source:
+            source.load()
+            frame = source.convert("RGB")
+    except (OSError, UnidentifiedImageError) as exc:
+        raise MediaError("frame_decode_failed") from exc
+    region = crop_person_box(box, frame_size=frame.size, padding=PERSON_CROP_PADDING)
+    return frame.crop(region)
+
+
 def build_contact_sheet(
     frame_paths: Sequence[Path],
     output_path: Path,
@@ -624,6 +676,12 @@ GAP_PROBE_COUNT = 3
 # Seconds between the last tracked person sample and the postroll frame. The
 # postroll frame must stay after this point to keep showing the emptied scene.
 POSTROLL_OFFSET_SECONDS = 2.8
+
+# Padding added around the person box when cropping a close-up, as a fraction of
+# the box's own width and height. A tight box cuts off heads, hands and carried
+# objects -- the very things the close-up exists to show -- so the crop reaches
+# out past the detection on every side.
+PERSON_CROP_PADDING = 0.40
 
 # Offsets tried when a required frame falls inside a recording hole. Frigate
 # writes recordings as fixed segments that can leave sub-second (sometimes
@@ -845,13 +903,66 @@ class MediaManager:
         client: FrigateMediaClient,
         root: Path,
         roles: ZoneRoles,
+        *,
+        person_highlight: bool = False,
+        target_width: int = 768,
     ) -> None:
         self._hass = hass
         self._store = store
         self._client = client
         self._root = root.resolve()
         self._roles = roles
+        self._person_highlight = person_highlight
+        self._target_width = target_width
         self._locks: dict[str, asyncio.Lock] = {}
+
+    async def _async_person_highlight(
+        self,
+        record: ActivityRecord,
+        selected: Sequence[tuple[float, Path]],
+        temporary: Path,
+    ) -> Path | None:
+        """Crop the person's clearest frame, or None when that is not possible.
+
+        None is the ordinary answer, not an error: the option may be off, or no box
+        may have been recorded. A missing close-up costs detail; failing the
+        analysis over it would cost the whole activity, so this degrades instead of
+        raising.
+
+        The two guards below are one condition in effect. `largest_person_box`
+        returns None only for an empty sequence -- every stored box is already
+        validated as finite with a positive width and height by `ActivityRecord`
+        -- and an empty sequence is what the first guard rejects. They are kept
+        separate so the crop code reads without a nested block.
+        """
+        if not self._person_highlight or not selected:
+            return None
+        found = largest_person_box(record.box_updates)
+        if found is None:
+            return None
+        timestamp, box = found
+        # The frame the box was measured on. Any selected frame is a candidate;
+        # the nearest in time is the one whose pixels the box actually describes.
+        _frame_time, frame_path = min(
+            selected, key=lambda item: abs(item[0] - timestamp)
+        )
+        target = temporary / "person.jpg"
+        try:
+            crop = await self._hass.async_add_executor_job(
+                crop_person_from_frame, frame_path, box
+            )
+            try:
+                # `partial` because the executor takes positional arguments only.
+                await self._hass.async_add_executor_job(
+                    partial(
+                        crop.save, target, "JPEG", quality=85, optimize=True
+                    )
+                )
+            finally:
+                crop.close()
+        except (MediaError, OSError, ValueError):
+            return None
+        return target
 
     async def async_build(self, activity_id: str) -> ActivityRecord:
         lock = self._locks.setdefault(activity_id, asyncio.Lock())
@@ -1076,9 +1187,24 @@ class MediaManager:
                 validate_unique_frames, [path for _, path in selected]
             )
             sheet = temporary / "evidence.jpg"
-            await self._hass.async_add_executor_job(
-                build_contact_sheet, [path for _, path in selected], sheet
-            )
+            # The close-up is built from the frame the box was measured on, not
+            # from the cell it was pasted into: a cell is a third of the frame, so
+            # cropping there would re-shrink the very pixels this exists to keep.
+            highlight = await self._async_person_highlight(record, selected, temporary)
+            if highlight is None:
+                await self._hass.async_add_executor_job(
+                    build_contact_sheet, [path for _, path in selected], sheet
+                )
+            else:
+                await self._hass.async_add_executor_job(
+                    partial(
+                        build_contact_sheet,
+                        [path for _, path in selected],
+                        sheet,
+                        highlight=highlight,
+                        target_width=self._target_width,
+                    )
+                )
             meta = temporary / "evidence.json"
             await self._hass.async_add_executor_job(
                 meta.write_text,

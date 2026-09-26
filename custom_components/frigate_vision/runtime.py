@@ -494,8 +494,15 @@ class IntegrationRuntime:
                     far=frozenset(zones_data.get("far", [])),
                 )
                 media_root = await async_default_media_root(hass)
+                media_config = vision_config_from(entry.data, dict(entry.options))
                 runtime.media_manager = MediaManager(
-                    hass, store, client, media_root, roles
+                    hass,
+                    store,
+                    client,
+                    media_root,
+                    roles,
+                    person_highlight=media_config.person_highlight,
+                    target_width=media_config.target_width,
                 )
                 await runtime.media_manager.async_restore_registry()
                 await runtime.media_manager.async_cleanup(

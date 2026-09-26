@@ -9,6 +9,7 @@ import pytest
 from homeassistant.core import HomeAssistant
 from PIL import Image, ImageChops
 
+from custom_components.frigate_vision.const import CONF_PERSON_HIGHLIGHT
 from custom_components.frigate_vision.correlation import ZoneRoles
 from custom_components.frigate_vision.media import (
     EvidencePlan,
@@ -17,6 +18,7 @@ from custom_components.frigate_vision.media import (
     build_contact_sheet,
     frame_is_infrared,
     frame_is_overexposed,
+    largest_person_box,
     pair_times_with_roles,
     recordings_cover,
     select_review_change_frames,
@@ -29,7 +31,11 @@ from custom_components.frigate_vision.models import (
     ProcessingMode,
 )
 from custom_components.frigate_vision.store import ActivityStore
-from custom_components.frigate_vision.vision import resize_for_provider
+from custom_components.frigate_vision.vision import (
+    evidence_width_budget,
+    resize_for_provider,
+    vision_config_from,
+)
 
 
 def _jpeg(value: int) -> bytes:
@@ -217,6 +223,41 @@ def _nine_frames(tmp_path: Path) -> list[Path]:
     return frames
 
 
+def _sealed_record_with_boxes(
+    activity_id: str,
+    *,
+    boxes: tuple[tuple[float, tuple[float, float, float, float]], ...] = (
+        (102.0, (0.20, 0.30, 0.10, 0.20)),
+        (110.0, (0.30, 0.35, 0.32, 0.55)),
+    ),
+) -> ActivityRecord:
+    """A SEALED door-cycle record, the shape the media manager can build from.
+
+    Door-cycle detection updates are what place the sample times; `boxes` is the
+    per-instant person box the close-up is chosen from.
+    """
+    return ActivityRecord(
+        activity_id=activity_id,
+        entry_id="entry_1",
+        source=ActivitySource.DOOR_CYCLE,
+        stage=ActivityStage.SEALED,
+        processing_mode=ProcessingMode.OBSERVE,
+        created_at=100,
+        updated_at=130,
+        camera="front",
+        detection_ids=("event_1",),
+        detection_zone_updates=(
+            ("event_1", 102, ("near",)),
+            ("event_1", 110, ("mid",)),
+            ("event_1", 120, ("far",)),
+        ),
+        box_updates=boxes,
+        door_closed_at=130,
+        association_deadline=140,
+        finalization_deadline=220,
+    )
+
+
 def _highlight_content_box(
     sheet: Image.Image, column_left: int
 ) -> tuple[int, int, int, int]:
@@ -391,6 +432,65 @@ def test_a_composed_sheet_reaches_the_provider_unshrunk(tmp_path) -> None:
         box = _highlight_content_box(sent.convert("RGB"), _TARGET_WIDTH)
         assert box[2] - box[0] == _HIGHLIGHT_WIDTH, (
             "the close-up was scaled with the sheet and its pixels were lost"
+        )
+
+
+def test_the_budget_keeps_a_composed_sheet_whole(tmp_path) -> None:
+    """With the close-up on, the budget admits a composed sheet unscaled.
+
+    Same acceptance point as the test above, but driven the way the provider path
+    actually drives it -- through the budget rather than the boolean -- so the
+    wiring cannot silently regress while the boolean stays correct.
+    """
+    config = vision_config_from(
+        {},
+        {"llm_base_url": "https://example.test/v1", "llm_api_key": "k",
+         "llm_model": "m", CONF_PERSON_HIGHLIGHT: True},
+    )
+    frames = _nine_frames(tmp_path)
+    highlight = tmp_path / "person.jpg"
+    highlight.write_bytes(_solid_jpeg((800, 400)))
+    sheet = tmp_path / "combo.jpg"
+    build_contact_sheet(
+        frames, sheet, highlight=highlight, target_width=config.target_width
+    )
+    data = resize_for_provider(sheet, evidence_width_budget(config))
+    with Image.open(BytesIO(data)) as sent:
+        assert sent.size[0] == config.target_width + _HIGHLIGHT_WIDTH
+        box = _highlight_content_box(sent.convert("RGB"), config.target_width)
+        assert box[2] - box[0] == _HIGHLIGHT_WIDTH
+
+
+def test_the_budget_still_shrinks_an_artifact_built_before_the_option_was_on(
+    tmp_path,
+) -> None:
+    """A grid-only sheet reused from before the option was enabled must still shrink.
+
+    This is why the provider path uses a budget rather than the `already_sized`
+    boolean. The option describes what *new* sheets look like, but evidence is
+    reused once built (`_async_build_locked` returns early when the stage is
+    EVIDENCE_READY), so an artifact can predate the switch. Deriving a boolean
+    from the current setting would pass that 1920-wide grid-only sheet through
+    unscaled -- 6.3x the pixels, billed, for a close-up the image does not
+    contain. The budget is safe for both shapes.
+    """
+    config = vision_config_from(
+        {},
+        {"llm_base_url": "https://example.test/v1", "llm_api_key": "k",
+         "llm_model": "m", CONF_PERSON_HIGHLIGHT: True},
+    )
+    # A stale artifact: grid only, never scaled by build_contact_sheet.
+    frames = _nine_frames(tmp_path)
+    stale = tmp_path / "stale.jpg"
+    build_contact_sheet(frames, stale)
+    with Image.open(stale) as image:
+        assert image.size[0] > evidence_width_budget(config), (
+            "fixture must exceed the budget for this test to mean anything"
+        )
+    data = resize_for_provider(stale, evidence_width_budget(config))
+    with Image.open(BytesIO(data)) as sent:
+        assert sent.size[0] == evidence_width_budget(config), (
+            "a stale grid-only sheet was sent unscaled"
         )
 
 
@@ -2448,3 +2548,150 @@ def test_crop_person_rejects_a_degenerate_box() -> None:
         except ValueError:
             continue
         raise AssertionError(f"{bad} 应被拒绝")
+
+
+def test_largest_person_box_picks_by_area_not_order() -> None:
+    """取面积最大的那条，而不是第一条或最后一条。
+
+    特写是为了看清衣着与携带物，人物占像素最多的那一帧才看得最清楚。
+    Frigate 在目标刚出现时会给出极小的 box，所以「早但大」比「晚但小」更糟。
+    """
+    updates = (
+        (100.0, (0.10, 0.10, 0.05, 0.10)),   # small, first
+        (105.0, (0.20, 0.20, 0.30, 0.50)),   # largest, middle
+        (110.0, (0.30, 0.30, 0.10, 0.20)),   # small, last
+    )
+    found = largest_person_box(updates)
+    assert found is not None
+    timestamp, box = found
+    assert timestamp == 105.0
+    assert box == (0.20, 0.20, 0.30, 0.50)
+
+
+def test_largest_person_box_skips_unusable_entries() -> None:
+    """畸形或零尺寸的 box 要跳过，不能让它赢下面积比较。"""
+    updates = (
+        (100.0, (0.1, 0.1, 0.0, 0.5)),        # zero width
+        (101.0, (0.1, 0.1, float("nan"), 0.5)),
+        (102.0, (0.1, 0.1, -0.2, 0.5)),       # negative
+        (103.0, (0.2, 0.2, 0.20, 0.30)),      # the only usable one
+    )
+    found = largest_person_box(updates)
+    assert found is not None
+    assert found[0] == 103.0
+
+
+def test_largest_person_box_returns_none_when_nothing_is_usable() -> None:
+    """全不可用时返回 None —— 调用方据此降级，而不是抛错。"""
+    assert largest_person_box(()) is None
+    assert largest_person_box(((100.0, (0.1, 0.1, 0.0, 0.0)),)) is None
+
+
+async def test_the_manager_adds_a_close_up_when_the_option_is_on(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """开启后证据图确实变宽并含特写栏 —— 端到端，防接线错误。
+
+    这是整条链路的验收点：box_updates -> 选最大 -> 配最近帧 -> 从原始帧裁剪
+    -> 拼到右侧。任何一环断了，宽度都不会超过 target_width。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _sealed_record_with_boxes("activity_1")
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id, "camera": camera, "label": "person",
+                "start_time": 100, "end_time": 120,
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            return [{"start_time": after - 1, "end_time": before + 1}]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+    manager = MediaManager(
+        hass, store, Client(), tmp_path,
+        ZoneRoles(near=frozenset({"near"}), transition=frozenset({"mid"}),
+                  far=frozenset({"far"})),
+        person_highlight=True,
+        target_width=_TARGET_WIDTH,
+    )
+    completed = await manager.async_build(record.activity_id)
+    assert completed.evidence_path is not None
+    with Image.open(completed.evidence_path) as sheet:
+        assert sheet.size[0] == _TARGET_WIDTH + _HIGHLIGHT_WIDTH, (
+            "拼图没有变宽，特写没有接上（或忘了传 target_width）"
+        )
+
+
+async def test_the_manager_omits_the_close_up_when_the_option_is_off(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """关闭时走原路径 —— 拼图宽度不变，也不含特写栏（零回归）。"""
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _sealed_record_with_boxes("activity_1")
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id, "camera": camera, "label": "person",
+                "start_time": 100, "end_time": 120,
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            return [{"start_time": after - 1, "end_time": before + 1}]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+    manager = MediaManager(
+        hass, store, Client(), tmp_path,
+        ZoneRoles(near=frozenset({"near"}), transition=frozenset({"mid"}),
+                  far=frozenset({"far"})),
+        person_highlight=False,
+    )
+    completed = await manager.async_build(record.activity_id)
+    assert completed.evidence_path is not None
+    with Image.open(completed.evidence_path) as sheet:
+        assert sheet.size[0] == 1920, "关闭时拼图不该被提前缩放"
+
+
+async def test_the_manager_still_builds_when_no_box_was_recorded(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """没有 box 时降级为普通拼图，但分析照常完成（不抛错）。"""
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _sealed_record_with_boxes("activity_1", boxes=())
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id, "camera": camera, "label": "person",
+                "start_time": 100, "end_time": 120,
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            return [{"start_time": after - 1, "end_time": before + 1}]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+    manager = MediaManager(
+        hass, store, Client(), tmp_path,
+        ZoneRoles(near=frozenset({"near"}), transition=frozenset({"mid"}),
+                  far=frozenset({"far"})),
+        person_highlight=True,
+        target_width=_TARGET_WIDTH,
+    )
+    completed = await manager.async_build(record.activity_id)
+    assert completed.stage is ActivityStage.EVIDENCE_READY
+    with Image.open(completed.evidence_path) as sheet:
+        assert sheet.size[0] == 1920, "无 box 时应退回普通拼图"

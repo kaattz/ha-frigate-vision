@@ -44,6 +44,16 @@ CONF_LLM_PROVIDER_DEFAULT = "deepseek"
 CONF_PERSON_HIGHLIGHT = "person_highlight"
 CONF_PERSON_HIGHLIGHT_DEFAULT = False
 
+# Width of the person close-up column appended to the evidence sheet.
+#
+# It is a width rather than a flag, and the provider path spends it as a budget
+# (`target_width + this` when the option is on). That matters for artifacts built
+# before the option was switched on: those are grid-only and up to 1920 wide, and
+# a boolean "already sized" would have been computed from the *current* setting
+# and passed them through unscaled -- 6.3x the pixels for nothing. A budget is
+# safe by construction: a grid-only sheet still exceeds it and is still shrunk.
+PERSON_HIGHLIGHT_WIDTH = 448
+
 # Known OpenAI-compatible endpoints, so the base URL does not have to be typed by
 # hand. That URL is the field most easily got wrong: it must be the
 # OpenAI-compatible *root*, and providers disagree about the shape. Google's is the

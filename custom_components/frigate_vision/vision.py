@@ -50,6 +50,7 @@ from .const import (
     CONF_SCENE_LABELS,
     MAX_PROMPT_OVERRIDE_LENGTH,
     MAX_SCENE_DESCRIPTION_LENGTH,
+    PERSON_HIGHLIGHT_WIDTH,
 )
 from .models import ActivityRecord, ActivityStage, analysis_key
 from .scenes import (
@@ -142,6 +143,22 @@ class VisionConfig:
         return f"{base}/chat/completions"
 
 
+def evidence_width_budget(config: VisionConfig) -> int:
+    """The widest the evidence sheet may be before it must be scaled down.
+
+    A budget rather than a boolean `already_sized`: the option says what *new*
+    sheets look like, but a sheet can be reused from before the option was
+    switched on, and that one is grid-only and up to 1920 wide. Deriving a
+    boolean from the current setting would pass such a sheet through unscaled --
+    6.3x the pixels, billed, for a close-up that is not in the image. A budget
+    stays correct for both: a fresh composed sheet equals it and is left alone,
+    while a stale grid-only one exceeds it and is still shrunk.
+    """
+    if config.person_highlight:
+        return config.target_width + PERSON_HIGHLIGHT_WIDTH
+    return config.target_width
+
+
 def resize_for_provider(
     path: Path, target_width: int, *, already_sized: bool = False
 ) -> bytes:
@@ -157,6 +174,10 @@ def resize_for_provider(
     column added afterwards -- so shrinking it here would undo the scaling
     decision and take the close-up down with it. The default is unchanged: any
     caller that does not opt out still gets an over-wide image scaled down.
+
+    Prefer the budget form over this flag where the caller has the close-up width
+    in hand: a boolean is derived from the *current* setting, so it also passes
+    through artifacts built before the setting changed. See `evidence_width_budget`.
     """
     try:
         with Image.open(path) as source:
@@ -577,7 +598,10 @@ async def async_analyze(
         )
     )
     image_bytes = await asyncio.get_running_loop().run_in_executor(
-        None, resize_for_provider, Path(evidence_path), config.target_width
+        None,
+        resize_for_provider,
+        Path(evidence_path),
+        evidence_width_budget(config),
     )
     payload = build_payload(config, prompt, image_bytes)
     started = time.monotonic()
