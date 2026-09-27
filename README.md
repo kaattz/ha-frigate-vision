@@ -4,41 +4,37 @@
 [![HACS](https://github.com/kaattz/ha-frigate-vision/actions/workflows/hacs.yml/badge.svg)](https://github.com/kaattz/ha-frigate-vision/actions/workflows/hacs.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Home Assistant 自定义集成（HACS）：把**任意受监控区域的活动**编排成一条可复用、可验证、可回滚的流水线——用事件固定活动边界，用 Frigate 检测与 Review 提供视觉证据，合成帧联系图后交给兼容 OpenAI 协议的视觉模型分析，最后通过通知蓝图交付结果。
+Home Assistant 自定义集成（HACS）：把 Frigate 检测到的人物活动编排成一条**可复用、可验证、可回滚**的流水线——以 Frigate 人物 Review 固定活动边界，确定性抽帧合成联系图，交给兼容 OpenAI 协议的视觉模型分析，最后通过通知蓝图交付结果。
 
-> **状态：0.1.0，实验性。** 实现与单元测试已完成（30 个测试模块），但**尚未有完整的现场验收记录**。建议先用 `observe` 模式观察一段时间再开放通知。
+> **状态：0.1.0，实验性。** 实现与单元测试已完成，但**尚未有完整的现场验收记录**。配置完成即开始调用模型并推送通知，没有任何"只观察"的档位——请确认好 Provider 与蓝图后再启用。
 
 ## 它做什么
 
 ```text
-事件源（可选，仅门锁场景）          Frigate events + reviews
-门锁 / 门磁 / 门铃                        │
-        └──────────────┬─────────────────┘
-                       ↓
-                 frigate_vision
-   ┌───────────────────────────────────────────┐
-   │ 通用核心（与场景无关）                      │
-   │  ├─ 活动状态机与持久化                      │
-   │  ├─ Review 归属与活动合并（detection ID）    │
-   │  ├─ 严格幂等 + 重启恢复                     │
-   │  ├─ 帧选择与联系图合成                      │
-   │  ├─ observe / shadow / live                │
-   │  └─ 兼容 OpenAI 协议的视觉模型调用           │
-   ├───────────────────────────────────────────┤
-   │ 场景层（scenes.py）                         │
-   │  └─ 每个场景声明：可回答的分类 + 提示词       │
-   │     + 允许读取的辅助信号 + 提示词版本         │
-   └───────────────────────────────────────────┘
-                       ↓
-               标准化活动结果事件
-                       ↓
-           通知蓝图 / 你自己的自动化
+                     Frigate events + reviews
+                              │
+                       frigate_vision
+    ┌────────────────────────────────────────────┐
+    │ 活动状态机与持久化                           │
+    │ Review 归属与活动合并（detection ID）        │
+    │ 严格幂等 + 重启恢复                          │
+    │ 帧选择与联系图合成（6 格，必要时 9 格）        │
+    │ 人物特写栏（可选）                           │
+    │ 兼容 OpenAI 协议的视觉模型调用                │
+    ├────────────────────────────────────────────┤
+    │ 场景层（scenes.py，内置一个场景）             │
+    │  └─ review_six：可回答的分类 + 提示词         │
+    │     + 提示词版本 + 部署自己的现场描述         │
+    └────────────────────────────────────────────┘
+                              ↓
+                      标准化活动结果事件
+                              ↓
+                  通知蓝图 / 你自己的自动化
 ```
 
-- **活动边界来自事件，不来自猜测。** 配了门锁就以开门建立周期、关门固定边界，重复开门只记录不覆盖；没配门锁则退化为 **review-only**，直接以 Frigate 人物 Review 为活动单元——后者对任意摄像头都成立。
-- **证据是确定性抽帧。** 单向出入用 3 帧联系图；门未关往返用 2×3 联系图；通用 Review 用「首帧 + 3 张高变化帧 + 末帧 + 后置现场帧」共 6 格，当画面中没有足够的变化候选时再补 3 格探测帧、扩为 3×3。优先采用 Frigate `path_data` 做路径运动选帧，缺失时回退像素差分。
+- **活动边界来自 Frigate Review，不来自猜测。** 每条人物 Review 就是一次活动；以 detection ID 关联同一活动的多次上报，`min_review_seconds` 与 zone 配置决定什么值得分析。
+- **证据是确定性抽帧。** 「首帧 + 3 张高变化帧 + 末帧 + 后置现场帧」共 6 格，当画面中没有足够的变化候选时再补 3 格探测帧、扩为 3×3。优先采用 Frigate `path_data` 做路径运动选帧，缺失时回退像素差分。
 - **严格幂等。** 媒体生成、模型调用、通知交付都先持久化 `started` 阶段再执行；结果不确定的失败（`analysis_outcome_unknown`、`delivery_outcome_unknown`）**禁止自动重试**，宁可人工介入也不重复打扰或重复计费。
-- **模式可回滚。** `observe` → `shadow` → `live` 逐级放开，任何一步都能退回上一级而不丢历史。
 
 ## 两个层次：核心与场景
 
@@ -48,54 +44,41 @@ Home Assistant 自定义集成（HACS）：把**任意受监控区域的活动**
 |---|---|
 | `classifications` | 该场景**允许**返回的分类集合；越界值在本地被拒绝 |
 | `template` | 提示词：这几帧画面意味着什么，以及**不可以**推断什么 |
-| `signals` | 允许读取的辅助信号（如门锁内外侧）；未声明的信号**根本不会进入**提示词 |
+| `signals` | 允许读取的辅助信号；未声明的信号**根本不会进入**提示词 |
 | `prompt_version` | 提示词版本，参与分析缓存键；措辞变了就不会复用旧结果 |
 | `accepts_scene_description` | 是否接受部署自己的现场布局描述（见下） |
 
-信号隔离是刻意的：门口场景可以读门锁状态，通用 Review 场景**不能**——它拿不到任何 zone telemetry（实测 90 条独立 Review 中 0 条携带 `detection_zone_updates`，而门周期有），所以一个暗示「知道门的状态」的通用提示词，等于要求模型编造证据。
-
-内置场景：
+内置场景只有一个：
 
 | 场景 | 用途 | 声明可返回分类 |
 |---|---|---|
-| `review_six` | 任意摄像头的人物 Review（通用） | 11 类 |
-| `door_single` | 门锁单向出入（3 帧） | `home_arrival`、`home_departure`、`unknown_activity`、`unable_to_confirm` |
-| `door_roundtrip` | 门未关短时往返（2×3 帧） | `short_roundtrip`、`unknown_activity`、`unable_to_confirm` |
+| `review_six` | 摄像头人物 Review（通用） | 11 类 |
 
-分类全集 12 个：`home_arrival`、`home_departure`、`short_roundtrip`、`package_delivery`、`food_delivery`、`cleaning`、`maintenance`、`visitor`、`elevator_activity`、`suspicious_activity`、`unknown_activity`、`unable_to_confirm`。其中 `short_roundtrip` 只属于 `door_roundtrip`，`review_six` 自己声明的是另 11 个。
+分类全集 11 个：`home_arrival`、`home_departure`、`package_delivery`、`food_delivery`、`cleaning`、`maintenance`、`visitor`、`elevator_activity`、`suspicious_activity`、`unknown_activity`、`unable_to_confirm`。
 
 ### 适配你自己的摄像头
 
-有两条路，成本差别很大：
-
-**① 只换文案（不改代码，推荐先走这条）。** 在集成选项的「行为选项」里有三个字段：
+**只换文案（不改代码）。** 在集成选项的「行为选项」里有三个字段：
 
 | 字段 | 生效范围 | 说明 |
 |---|---|---|
 | 场景描述 | **仅 `review_six`** | 说明画面里哪个门是入户门、哪里是电梯、镜头外有什么。不写这段时，模型会把画面里最近的门当成「入户门」——实测本部署曾把「走出电梯后离开」判成 `home_departure`。 |
-| 标签 | **所有场景** | 每行一条「标签: 定义」。**非空时会全局替换允许集合**，所以必须列出**所有场景标签的并集**；漏掉 `short_roundtrip` 会让门锁场景的「短暂外出」永远报不出来，而且没有任何报错。 |
-| 判断规则 | **所有场景** | 替换内置规则全文。契约（JSON 结构）与现场布局仍会自动附加，因为解析器依赖它们。 |
+| 标签 | 场景契约 | 每行一条「标签: 定义」。**非空时会全局替换允许集合**，必须列出全部 11 个标签；漏掉任何一个它就永远报不出来，而且没有任何报错。 |
+| 判断规则 | 场景契约 | 替换内置规则全文。契约（JSON 结构）与现场布局仍会自动附加，因为解析器依赖它们。 |
 
-注意「场景描述」只进入声明接受它的场景：`door_single` / `door_roundtrip` 自带关于电梯与画外门的说明，一段为通用场景写的描述会与之重复或矛盾，所以它们收不到——这是刻意的隔离，有测试固化。
-
-**② 新增一个真正的场景（需要改代码）。** 仅注册 `Scene` **不足以**让新场景投入使用，必须同时改两处：
+**新增一个场景（需要改代码）。** 仅注册 `Scene` **不足以**让新场景投入使用，必须同时改两处：
 
 | 要做的事 | 位置 |
 |---|---|
 | 声明场景（分类、提示词、信号、版本） | `scenes.py` 的 `SCENES` |
 | **让活动能路由到它**，以及该场景的抽帧计划 | `media.py` 的 `plan_evidence()` |
 
-原因是 mode 由 `plan_evidence()` 按 `ActivitySource` 决定（`door_cycle` / `standalone_review` / `manual_review` 三种来源各自对应写死的 mode 字符串），场景注册表不参与选路。因此**注册了但没有路由的场景是死代码**：它能渲染提示词，却没有任何活动会走到它。
-
-核心的抽帧、联系图、调用、交付、幂等确实无需改动，但「新增场景 = 注册一个 `Scene`」这个说法不成立——路由是第二个必要改动点。[test_scenes.py](tests/test_scenes.py) 验证的是场景接口本身的隔离性（未声明的信号不会泄漏、缓存键按场景分离、未知 mode 报错而非猜测），不是端到端的可路由性。
-
-> 新增场景要自己负责提示词质量与验证。`door_*` 场景的措辞是在真实现场数据上反复测量调优的结果（例如「不能仅凭电梯方向断言进入可见电梯」），新场景应比照同样的方式自行验收。
+原因是 mode 由 `plan_evidence()` 决定，场景注册表不参与选路。因此**注册了但没有路由的场景是死代码**：它能渲染提示词，却没有任何活动会走到它。核心的抽帧、联系图、调用、交付、幂等确实无需改动，但路由是第二个必要改动点。新场景要自己负责提示词质量与验证，并比照 `review_six` 的方式自行验收。
 
 ### 实体
 
 | 实体 | 说明 |
 |---|---|
-| `select.<name>_processing_mode` | 运行模式，切换后自动 reload |
 | `event.<name>_activity` | 活动完成 / 失败事件 |
 | `sensor.<name>_last_classification` | 最近一次分类 |
 | `sensor.<name>_last_confidence` | 最近一次置信度 |
@@ -112,7 +95,7 @@ Home Assistant 自定义集成（HACS）：把**任意受监控区域的活动**
 | `frigate_vision.retry_failed` | 对**可证明安全**的失败建立一次显式重试 |
 | `frigate_vision.ack_delivery` | 通知蓝图处理成功后回执，活动转为 `completed` |
 
-`retry_failed` 接受：任何 5xx（`provider_http_500`…`599`）、`provider_http_429`（配额用尽）、`provider_unavailable`、`evidence_incomplete`、`frigate_unavailable`、`media_retry_exhausted`、`door_open_too_long` 等。**拒绝** `analysis_outcome_unknown` 与 `delivery_outcome_unknown`——模型可能已计费、通知可能已发出，重放会重复打扰。
+`retry_failed` 接受：任何 5xx（`provider_http_500`…`599`）、`provider_http_429`（配额用尽）、`provider_unavailable`、`evidence_incomplete`、`frigate_unavailable`、`media_retry_exhausted` 等。**拒绝** `analysis_outcome_unknown` 与 `delivery_outcome_unknown`——模型可能已计费、通知可能已发出，重放会重复打扰。
 
 **交付事件** `frigate_vision_activity` 字段：`entry_id`、`activity_id`、`delivery_attempt_id`、`classification`、`description`、`confidence`、`evidence_url`、`evidence_image_url`、`evidence_offsets`、`clip_url`、`hls_url`、`frigate_review_url`、`review_ids`、`occurred_at`。
 
@@ -144,12 +127,7 @@ Home Assistant 自定义集成（HACS）：把**任意受监控区域的活动**
 
 - base URL、认证方式（`none` / `native`）、MQTT topic 前缀（默认 `frigate`）、精确的摄像头名。
 - 端口 5000 是无认证内部 API，只应在可信内网使用；端口 8971 使用原生认证，填写用户名/密码后由共享 CookieJar 登录并自动刷新。
-- zone 分组（near / transition / far）用于判断人物相对门的方向。三组不得重叠。
-
-**门口设备（可选）**
-
-- 门锁 `event` 实体、动作与内外侧属性名及其匹配值、门磁 `binary_sensor`、门铃事件实体。
-- **留空门锁实体即为 review-only 模式**，只用 Frigate 人物 Review，不建立门周期；此时门磁与门铃字段会被拒绝（`door_lock_required`）。非门口场景请直接留空，切到 review-only。
+- zone 分组（near / transition / far）用于**过滤**哪些 Review 值得分析（配合「分析所有远端 Review」开关）。三组不得重叠。
 
 **视觉 Provider**
 
@@ -162,7 +140,6 @@ Home Assistant 自定义集成（HACS）：把**任意受监控区域的活动**
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| 处理模式 | `observe` | `observe` / `shadow` / `live` |
 | 图片宽度 | 768 | 发给模型前缩放到的宽度上限（512–1920） |
 | 最大 Token | 4000 | 每次模型调用的上限（1–20000） |
 | 输出语言 | `zh-CN` | 提示词与描述的语种 |
@@ -177,18 +154,8 @@ Home Assistant 自定义集成（HACS）：把**任意受监控区域的活动**
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| 人物特写栏 | 关 | 在联系图右侧附加一栏人物放大图。九宫格里的人物只有约 59×74 px，辨认衣着基本不可能；特写可到 255–415 px。打开会改变发给模型的图并改变缓存键，因此默认关。 |
+| 人物特写栏 | 关 | 在联系图下侧附加一栏人物放大图。九宫格里的人物只有约 59×74 px，辨认衣着基本不可能；特写可到 255–415 px。打开会改变发给模型的图并改变缓存键，因此默认关。 |
 | 人脸检测服务 URL | 空 | 可选，用来挑**哪一帧**做特写。留空则按「检测框面积最大」选帧。它是提升项而非依赖：服务没配、连不上、超时或答案不对时一律退回该规则。 |
-
-### 运行模式
-
-| 模式 | 行为 | 外部副作用 |
-|---|---|---|
-| `observe` | 只做关联与证据，跑通到 `evidence_ready` | 0 次模型调用、0 次通知 |
-| `shadow` | 证据 + 一次模型调用，保存结果 | 有模型调用，**不发**正式结果事件 |
-| `live` | 证据 + 模型调用 + 一次需回执的交付 | 模型调用 + 通知各一次 |
-
-迁移到 `shadow` / `live` 前，请先**停用（不要删除）**被替代的旧自动化——停用即可随时回滚，删除则丢失原有配置。
 
 ## 通知蓝图
 
@@ -227,7 +194,6 @@ https://github.com/kaattz/ha-frigate-vision/blob/main/blueprints/automation/frig
 | `media_retry_exhausted` | 可安全使用 `retry_failed` |
 | `ambiguous_review_ownership` | Review 归属不唯一，检查 detection ID 与 zone 布局 |
 | `invalid_path_data` | Frigate 路径数据非法，永久失败，不回退像素差分 |
-| `door_open_too_long` | 只收到开门未收到关门，30 分钟后看门狗将周期置为失败（绝不臆造关门时间）；仅在使用门锁场景时出现 |
 
 provider 类故障（5xx / 429）会在「设置 → 修复」中报一条 `provider_error`，并在日志留下一条 WARNING；下一次分析成功时自动清除。具体状态码仍在 `sensor.<name>_last_error` 上。
 
@@ -235,6 +201,22 @@ provider 类故障（5xx / 429）会在「设置 → 修复」中报一条 `prov
 
 - **「夜间未知也分析」选项当前不生效。** 它在配置界面中存在并会被保存，但代码中没有任何地方读取它（`analyze_night_unknown` 仅出现在 schema 定义处）。切换它不会改变行为。
 - 新增场景需要同时改 `scenes.py` 与 `media.py`（见[适配你自己的摄像头](#适配你自己的摄像头)）；仅注册 `Scene` 不会让场景可用。
+
+## 升级到 0.1.0（单一流水线）
+
+**此版本删除了门周期、door 场景与三档处理模式，且不兼容旧存档。** 部署前必须手动删除 store 文件，否则集成启动失败：
+
+```text
+/config/.storage/frigate_vision.<entry_id>
+```
+
+这会丢失全部活动历史。原因：存档加载是全有或全无的，旧记录携带的字段（`door_cycle` 来源、`processing_mode`、门铃时间等）已不存在，任何一条读不出都会让整个配置项拒绝启动。曾提供「保留死字段兼容旧记录」的方案并被否决——删除是明确的选择。
+
+同时移除的还有：
+
+- `select.<name>_processing_mode` 实体与「处理模式」选项。引用该实体的自动化会失效，需先改掉。
+- 配置页的「门口设备」步骤。旧 entry 数据里残留的 `door` 键会被无视，不影响启动。
+- Repair 告警 `door_mapping_invalid`、`door_open_too_long`。
 
 ## 兼容性
 
@@ -269,7 +251,8 @@ mypy custom_components/frigate_vision        # strict 模式
 - 不按固定时长猜测「回家 / 离家 / 倒垃圾 / 保洁」。
 - 第一版不使用对象存储，不回退到完整视频 LLM。
 - 不自动删除既有 HA 自动化、Helpers 或历史数据。
-- 不内置除门口参考场景之外的场景实现；新增场景由使用者自行撰写并验收。
+- 不内置除 `review_six` 之外的场景实现；新增场景由使用者自行撰写并验收。
+- 不做门锁 / 门磁 / 门铃事件编排——那是门周期状态机的工作，已整体移除；活动边界一律来自 Frigate Review。
 
 ## License
 
