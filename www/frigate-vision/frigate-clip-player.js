@@ -379,8 +379,12 @@ class FrigateClipPlayer extends HTMLElement {
           overflow: hidden; background: #000; line-height: 0;
         }
         .sheet { display: block; width: 100%; }
+        /* Anchored to the top-left and sized by the element, because the sheet's
+           shape varies: the close-up may be beside the grid (narrow the overlay)
+           or below it (shorten it), and only the loaded image says which. A
+           four-edge inset would fix all of them and leave no room for either. */
         .cells {
-          position: absolute; top: 0; bottom: 0; left: 0; width: 100%;
+          position: absolute; top: 0; left: 0; width: 100%; height: 100%;
           display: grid;
           grid-template-columns: repeat(${SHEET_COLUMNS}, 1fr);
           grid-auto-rows: 1fr;
@@ -629,6 +633,36 @@ class FrigateClipPlayer extends HTMLElement {
    * dimensions directly, passed. So: apply now in case it is already loaded, and
    * keep a listener for when it is not.
    */
+  /**
+   * Size the overlay to the frames, leaving out anything that is not a frame.
+   *
+   * The sheet can carry a person close-up, and it is not a frame: no offset maps
+   * to it, so numbering it would put a number on a picture that is not part of the
+   * time series. The card is never told whether the close-up is on -- it is a
+   * server-side option the card has no field for -- and a stored sheet may predate
+   * the setting, so the geometry is read from the image instead.
+   *
+   * The cells are a fixed 16:9, so the grid spans exactly
+   * `3 * (gridHeight / rows) * CELL_ASPECT` pixels, where `rows` comes from the
+   * offsets. Both placements have to be handled, because the close-up has been in
+   * both:
+   *
+   * * beside the grid, the image is wider, and the overlay must be narrower;
+   * * below it, the image is taller, and the overlay must be shorter.
+   *
+   * Trying only the first is what let the second silently misplace every number:
+   * a 433-tall sheet with a 288-tall grid would have split the overlay into two
+   * 216-pixel rows, putting the second row's numbers 72 pixels below the frames
+   * they belong to and covering the close-up with invisible tap targets.
+   *
+   * The dimensions are only known after the image loads, and both ways of learning
+   * them have a trap. Reading `naturalWidth` immediately after assigning `src` gets
+   * zero. Waiting for a `load` event alone misses an already-cached image, which can
+   * finish before the listener is attached -- that is what made an earlier attempt
+   * silently do nothing in production while the unit test, which sets the
+   * dimensions directly, passed. So: apply now in case it is already loaded, and
+   * keep a listener for when it is not.
+   */
   _insetFromExtraColumn() {
     if (!this._cells) return;
     const rows = Math.floor(this._offsets.length / SHEET_COLUMNS);
@@ -637,15 +671,41 @@ class FrigateClipPlayer extends HTMLElement {
       const width = this._sheet.naturalWidth;
       const height = this._sheet.naturalHeight;
       if (!width || !height) return;
-      const naturalFrames = SHEET_COLUMNS * (height / rows) * CELL_ASPECT;
-      // The sheet is built by scaling the grid to a target width and rounding the
-      // height, so deriving the grid's width back from that rounded height lands a
-      // fraction of a pixel short. Without this snap a grid-only sheet would get an
-      // overlay 0.1% narrower than the picture, leaving the right edge of the last
-      // cell untappable. A real close-up column is hundreds of pixels, so a
-      // sub-pixel difference can only mean there is no column.
+      // The cells are a fixed 16:9, so a grid of three columns and `rows` rows is
+      // this tall when it spans the full image width. The close-up never changes
+      // the WIDTH in the current layout, which is what makes this the reliable
+      // measurement: deriving the grid from the height instead conflates it with a
+      // strip below, and the grid would be measured as taller than it is.
+      const gridHeightFullWidth =
+        (width / (SHEET_COLUMNS * CELL_ASPECT)) * rows;
+      // A shortfall under a pixel is rounding -- the sheet is built by scaling the
+      // grid to a target width and rounding the height, so the two agree to well
+      // under a pixel. A real strip is tens of pixels.
+      const taller = height - gridHeightFullWidth >= 1.5;
+      if (taller) {
+        // The close-up sits BELOW the grid, so the image is taller than the grid
+        // and the overlay stops at the grid's bottom edge. Covering the strip would
+        // spread the numbers over rows that are too tall and lay invisible tap
+        // targets over the close-up.
+        this._cells.style.width = "100%";
+        this._cells.style.height =
+          ((gridHeightFullWidth / height) * 100).toFixed(4) + "%";
+        return;
+      }
+      // No strip: the image's height IS the grid's height, so the row height is
+      // known and the grid's width follows from the cells' aspect. Anything wider
+      // than that is a close-up column on the right -- the layout used before the
+      // strip, which stored sheets may still carry.
+      const cellHeight = height / rows;
+      const gridWidth = SHEET_COLUMNS * cellHeight * CELL_ASPECT;
+      // A shortfall under a pixel is rounding, not a column: the sheet is built by
+      // scaling the grid to a target width and rounding the height, so deriving the
+      // width back from that rounded height lands a fraction under. Without this
+      // snap a grid-only sheet gets an overlay 0.1% narrower than the picture,
+      // leaving the right edge of the last cell untappable.
       const share =
-        width - naturalFrames < 1.5 ? 1 : Math.min(1, naturalFrames / width);
+        width - gridWidth < 1.5 ? 1 : Math.min(1, gridWidth / width);
+      this._cells.style.height = "100%";
       this._cells.style.width = (share * 100).toFixed(4) + "%";
     };
     apply();

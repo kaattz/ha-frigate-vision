@@ -63,6 +63,11 @@ CONF_PERSON_HIGHLIGHT_DEFAULT = False
 # the close-up with it -- the exact failure this column exists to avoid.
 PERSON_HIGHLIGHT_WIDTH = 448
 
+# Blank pixels between the frame grid and the close-up strip below it. The two are
+# different scenes, and a model reading straight down across the boundary would
+# otherwise see the grid's last row as continuous with the crop.
+HIGHLIGHT_SEAM = 1
+
 # Optional face-detection service, used to choose *which* frame the close-up comes
 # from. Empty by default, and empty means the close-up behaves exactly as it did
 # before this option existed.

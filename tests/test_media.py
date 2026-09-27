@@ -9,7 +9,10 @@ import pytest
 from homeassistant.core import HomeAssistant
 from PIL import Image, ImageChops
 
-from custom_components.frigate_vision.const import CONF_PERSON_HIGHLIGHT
+from custom_components.frigate_vision.const import (
+    CONF_PERSON_HIGHLIGHT,
+    HIGHLIGHT_SEAM,
+)
 from custom_components.frigate_vision.correlation import ZoneRoles
 from custom_components.frigate_vision.media import (
     EvidencePlan,
@@ -282,70 +285,93 @@ def _sealed_record_with_boxes(
     )
 
 
-def _highlight_content_box(
-    sheet: Image.Image, column_left: int, column_width: int = _HIGHLIGHT_WIDTH
+def _close_up_strip_box(
+    sheet: Image.Image, grid_height: int
 ) -> tuple[int, int, int, int]:
-    """Return the bounding box of the lit content inside the highlight column.
+    """Return the bounding box of the lit content in the strip below the grid.
 
-    The column is filled black and the crop is bright, so a luma threshold
-    separates the two. The threshold sits above the JPEG ringing at the crop's
-    edge and far below the crop's own luma.
-
-    `column_width` is a search bound rather than the column's real width: the
-    column is now as wide as the crop, which varies. Everything to the right of
-    `column_left` is searched, so the box is found whatever the crop's shape.
+    The strip sits under the grid, separated by `HIGHLIGHT_SEAM` blank rows, and is
+    filled black where the crop does not reach. A luma threshold separates crop from
+    background; it sits above the JPEG ringing at the crop's edge and far below the
+    crop's own luma.
 
     An empty result carries the sheet's size, because the usual cause is that the
-    sheet came back narrower than the column's offset -- the composed sheet was
-    scaled as a whole, which is the failure the column exists to prevent.
+    sheet is not taller than the grid -- no strip was appended at all.
     """
-    column = sheet.crop(
-        (column_left, 0, min(sheet.width, column_left + column_width), sheet.height)
-    )
-    mask = column.convert("L").point(lambda value: 255 if value > 40 else 0)
+    strip = sheet.crop((0, grid_height + HIGHLIGHT_SEAM, sheet.width, sheet.height))
+    mask = strip.convert("L").point(lambda value: 255 if value > 40 else 0)
     box = mask.getbbox()
     assert box is not None, (
-        f"no content in the column at x={column_left}; sheet is {sheet.size}"
+        f"no content in the strip below y={grid_height}; sheet is {sheet.size}"
     )
     return box
 
 
-def _expected_column_width(crop_size: tuple[int, int], sheet_height: int) -> int:
-    """The column width the builder should produce for a crop of this shape.
+def _expected_strip_size(
+    crop_size: tuple[int, int], sheet_width: int, row_height: int
+) -> tuple[int, int]:
+    """The strip size the builder should produce for a crop of this shape.
 
-    The column is fitted to the crop, capped at `_HIGHLIGHT_WIDTH`. A tall crop is
-    height-bound and narrower than the ceiling; a wide one hits the cap.
+    The crop is fitted to (the sheet's width, one grid row's height), so a wide crop
+    is capped by the row height and a tall one by the sheet width.
     """
     crop_width, crop_height = crop_size
-    scale = min(_HIGHLIGHT_WIDTH / crop_width, sheet_height / crop_height)
-    return max(1, round(crop_width * scale))
+    scale = min(sheet_width / crop_width, row_height / crop_height)
+    return max(1, round(crop_width * scale)), max(1, round(crop_height * scale))
 
 
-def _assert_has_close_up_column(sheet: Image.Image) -> int:
-    """Assert the sheet carries a close-up column and return its width.
+def _close_up_span(sheet: Image.Image, rows: int) -> tuple[int, int]:
+    """The close-up's drawn width and height, measured from the image itself.
 
-    The column is fitted to the crop, so its width varies with the crop's shape
-    and cannot be predicted from the frame alone -- the crop is derived from the
-    box. What is invariant, and what these end-to-end tests care about, is:
-
-    * the sheet is wider than the grid alone, so a column was appended;
-    * the column is not wider than the ceiling;
-    * the column's content is flush and fills it, i.e. no black bars.
-
-    Black bars are the defect this sizing exists to remove, so they are asserted
-    against rather than merely described.
+    Taking the expectation from the composed sheet rather than computing it keeps
+    the provider-path tests honest about their own subject: they exist to prove the
+    close-up does not lose pixels on the way to the provider, and predicting the
+    builder's rounding in a second place would only add a way for the two to
+    disagree for reasons that have nothing to do with the provider.
     """
-    column_left = _TARGET_WIDTH
-    assert sheet.width > column_left, "no close-up column was appended"
-    column_width = sheet.width - column_left
-    assert column_width <= _HIGHLIGHT_WIDTH, "the column exceeded its ceiling"
-    box = _highlight_content_box(sheet.convert("RGB"), column_left, column_width)
-    content_width = box[2] - box[0]
-    assert content_width >= column_width - 2, (
-        f"the column is {column_width} wide but the crop only fills {content_width} "
-        "-- black bars are back"
+    grid_height = round((sheet.width / 3) / (640 / 360)) * rows
+    box = _close_up_strip_box(sheet.convert("RGB"), grid_height)
+    return box[2] - box[0], box[3] - box[1]
+
+
+def _assert_has_close_up_strip(
+    sheet: Image.Image, rows: int, total_width: int = _TARGET_WIDTH
+) -> int:
+    """Assert the sheet carries a close-up strip below the grid; return its height.
+
+    What these end-to-end tests care about is invariant across crop shapes:
+
+    * the sheet is taller than the grid alone, so a strip was appended;
+    * the strip is not taller than one grid row, so the close-up never outgrows the
+      frames it accompanies;
+    * the crop is centred in the strip rather than jammed against an edge.
+
+    `rows` is the frame count divided by three, which the caller knows; the grid's
+    height in the output is the sheet's width divided by the cells' 16:9 aspect and
+    multiplied by those rows. Deriving it here rather than taking a constant keeps
+    the helper correct for both the six- and nine-frame fixtures.
+
+    The strip's own width cannot be predicted from the frame: the crop's shape
+    decides it, and the crop is derived from the detection box.
+    """
+    cell_width = total_width / 3
+    row_height = round(cell_width / (640 / 360))
+    grid_height = row_height * rows
+    assert sheet.height > grid_height, (
+        f"no close-up strip below the grid: sheet {sheet.height} tall, "
+        f"grid {grid_height} ({rows} rows of {row_height})"
     )
-    return column_width
+    strip_height = sheet.height - grid_height - HIGHLIGHT_SEAM
+    assert strip_height <= row_height + 1, (
+        f"the strip is {strip_height} tall, taller than a grid row ({row_height})"
+    )
+    box = _close_up_strip_box(sheet.convert("RGB"), grid_height)
+    left_gap = box[0]
+    right_gap = sheet.width - box[2]
+    assert abs(left_gap - right_gap) <= 2, (
+        f"the crop is not centred: {left_gap} left against {right_gap} right"
+    )
+    return strip_height
 
 
 def test_a_sheet_without_a_highlight_is_unchanged(tmp_path) -> None:
@@ -378,18 +404,23 @@ def test_a_sheet_with_a_highlight_is_wider_and_keeps_the_cells_intact(
     build_contact_sheet(frames, plain, target_width=_TARGET_WIDTH)
     build_contact_sheet(frames, combo, highlight=highlight, target_width=_TARGET_WIDTH)
     with Image.open(plain) as plain_sheet, Image.open(combo) as combo_sheet:
+        row_height = _SCALED_HEIGHT // 3
+        strip_w, strip_h = _expected_strip_size((800, 400), _TARGET_WIDTH, row_height)
         assert combo_sheet.size == (
-            _TARGET_WIDTH + _expected_column_width((800, 400), _SCALED_HEIGHT),
-            _SCALED_HEIGHT,
+            _TARGET_WIDTH,
+            _SCALED_HEIGHT + HIGHLIGHT_SEAM + strip_h,
         )
-        intact = (0, 0, _TARGET_WIDTH - _SEAM_MARGIN, _SCALED_HEIGHT)
+        # The grid is the top block, unchanged pixel for pixel: appending a strip
+        # must not cost the frames anything, which is the whole reason it goes
+        # below rather than beside them.
+        intact = (0, 0, _TARGET_WIDTH, _SCALED_HEIGHT - _SEAM_MARGIN)
         assert (
             ImageChops.difference(
                 combo_sheet.convert("RGB").crop(intact),
                 plain_sheet.convert("RGB").crop(intact),
             ).getbbox()
             is None
-        ), "the grid must keep its pixels when a column is appended"
+        ), "the grid must keep its pixels when a strip is appended"
 
 
 def test_the_highlight_keeps_its_aspect_ratio(tmp_path) -> None:
@@ -400,85 +431,96 @@ def test_the_highlight_keeps_its_aspect_ratio(tmp_path) -> None:
     output = tmp_path / "combo.jpg"
     build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
     with Image.open(output) as sheet:
-        box = _highlight_content_box(sheet.convert("RGB"), _TARGET_WIDTH)
+        box = _close_up_strip_box(sheet.convert("RGB"), _SCALED_HEIGHT)
     assert (box[2] - box[0]) / (box[3] - box[1]) == pytest.approx(100 / 300, abs=0.01)
 
 
-def test_the_highlight_keeps_its_full_width(tmp_path) -> None:
-    """特写在最终图里必须保持 448 宽的像素量。
+def test_the_highlight_keeps_its_pixels_when_the_provider_scales_the_sheet(
+    tmp_path,
+) -> None:
+    """特写不能被 target_width 一起缩小 —— 这是本功能的成败点。
 
-    这是本功能的成败点：若特写被 target_width 一起缩小，收益从 7.6 倍掉到 3 倍。
+    `resize_for_provider` 会缩小任何宽于 target_width 的图。拼图先缩到 target_width
+    再贴特写，所以特写保留自己的像素；若顺序反了，收益从 7.6 倍掉到 3 倍。
+
+    放下方之后这条同样成立，而且更容易成立：拼图本身就是 target_width 宽，贴上的
+    条也是同一宽度，整图不再「比 target 宽」。
     """
     frames = _nine_frames(tmp_path)
-    # Wider than the column in aspect as well as in pixels, so the column's
-    # width -- not its height -- is what bounds the crop. A source narrower than
-    # 448, or taller in aspect than the column, would be limited by the other
-    # side and the assertion would prove nothing about the width.
     highlight = tmp_path / "person.jpg"
-    highlight.write_bytes(_solid_jpeg((800, 400)))
+    # Wide, so it is the strip's height that bounds it -- the case where a naive
+    # implementation would lose pixels to the provider's own downscale.
+    highlight.write_bytes(_solid_jpeg((1600, 400)))
     output = tmp_path / "combo.jpg"
     build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
+    row_height = _SCALED_HEIGHT // 3
+    expected_w, expected_h = _expected_strip_size(
+        (1600, 400), _TARGET_WIDTH, row_height
+    )
     with Image.open(output) as sheet:
-        assert sheet.size == (_TARGET_WIDTH + _HIGHLIGHT_WIDTH, _SCALED_HEIGHT)
-        box = _highlight_content_box(sheet.convert("RGB"), _TARGET_WIDTH)
-    assert box[2] - box[0] == _HIGHLIGHT_WIDTH
+        assert sheet.size == (
+            _TARGET_WIDTH,
+            _SCALED_HEIGHT + HIGHLIGHT_SEAM + expected_h,
+        )
+        box = _close_up_strip_box(sheet.convert("RGB"), _SCALED_HEIGHT)
+    assert box[2] - box[0] == pytest.approx(expected_w, abs=1)
+    assert box[3] - box[1] == pytest.approx(expected_h, abs=1)
 
 
-def test_a_tall_crop_is_bounded_by_the_sheet_height(tmp_path) -> None:
-    """A person-shaped crop is limited by the sheet's height, not the ceiling.
+def test_a_tall_crop_is_bounded_by_the_sheet_width(tmp_path) -> None:
+    """A person-shaped crop is limited by the sheet's width, not by the row height.
 
-    A real crop is taller than it is wide -- the reference person box is 147x185
-    in the 640x360 frame. `contain` scales by whichever side binds first, and for
-    that shape it is the height, so the crop fills all 431 rows and comes out
-    about 342 pixels wide rather than the full 448.
-
-    The column is then exactly those 342 pixels rather than a padded 448. That is
-    the point of sizing it to the crop: the other 106 would have been black, and
-    the sheet is scaled to a fixed display width, so black column pixels are paid
-    for out of the grid's cells. Measured on a real six-frame sheet, the old fixed
-    column was 39% black.
+    A real crop is taller than it is wide -- the reference person box is 147x185 in
+    the 640x360 frame, and the measured one is 249x261. Fitting that into a strip
+    one grid row tall would shrink it to a fraction of the width available, so the
+    box it is fitted to is (sheet width, one row height) and the width binds first.
     """
     frames = _nine_frames(tmp_path)
     highlight = tmp_path / "person.jpg"
     highlight.write_bytes(_solid_jpeg((147, 185)))
     output = tmp_path / "combo.jpg"
     build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
-    with Image.open(output) as sheet:
-        box = _highlight_content_box(sheet.convert("RGB"), _TARGET_WIDTH)
-        width, height = box[2] - box[0], box[3] - box[1]
-        expected_width = round(147 * _SCALED_HEIGHT / 185)
-        assert sheet.width == _TARGET_WIDTH + expected_width, (
-            "the column must be the crop's own width, not the 448 ceiling"
-        )
-    assert height == _SCALED_HEIGHT, "a tall crop must fill the sheet's height"
-    assert width == pytest.approx(expected_width, abs=1)
-    # And it starts flush at the seam, because there is no bar to centre within.
-    assert box[0] == pytest.approx(0, abs=1), (
-        "the crop must sit flush left in its column"
+    row_height = _SCALED_HEIGHT // 3
+    expected_w, expected_h = _expected_strip_size(
+        (147, 185), _TARGET_WIDTH, row_height
     )
+    with Image.open(output) as sheet:
+        assert sheet.size == (
+            _TARGET_WIDTH,
+            _SCALED_HEIGHT + HIGHLIGHT_SEAM + expected_h,
+        )
+        box = _close_up_strip_box(sheet.convert("RGB"), _SCALED_HEIGHT)
+    assert box[2] - box[0] == pytest.approx(expected_w, abs=1)
+    assert box[3] - box[1] == pytest.approx(expected_h, abs=1)
+    # Centred, so the bars are split evenly rather than the person sitting against
+    # one edge of a strip it does not fill.
+    left = box[0]
+    right = _TARGET_WIDTH - box[2]
+    assert abs(left - right) <= 2, f"not centred: {left} left against {right} right"
 
 
-def test_a_wide_crop_is_capped_at_the_ceiling(tmp_path) -> None:
-    """A crop wider than the ceiling must not widen the column past it.
+def test_a_wide_crop_is_capped_by_the_row_height(tmp_path) -> None:
+    """A very wide crop is bounded by one grid row's height, not by its own width.
 
-    Without the cap a very wide crop would take more of the sheet than
-    `highlight_width` allows, and the grid would lose the pixels the ceiling
-    exists to protect. The crop is still shown undistorted, just scaled down.
+    Letting the strip grow past a row would make the sheet taller than the frames
+    warrant, and the whole point of moving the close-up below was to stop it
+    costing the grid anything -- not to let it dominate the image instead.
     """
     frames = _nine_frames(tmp_path)
     highlight = tmp_path / "wide.jpg"
-    highlight.write_bytes(_solid_jpeg((1600, 400)))
+    highlight.write_bytes(_solid_jpeg((4000, 200)))
     output = tmp_path / "combo.jpg"
     build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
+    row_height = _SCALED_HEIGHT // 3
+    expected_w, expected_h = _expected_strip_size(
+        (4000, 200), _TARGET_WIDTH, row_height
+    )
     with Image.open(output) as sheet:
-        assert sheet.width == _TARGET_WIDTH + _HIGHLIGHT_WIDTH, (
-            "a wide crop must be capped at the ceiling, not widen the column"
-        )
-        box = _highlight_content_box(sheet.convert("RGB"), _TARGET_WIDTH)
-    width, height = box[2] - box[0], box[3] - box[1]
-    # 1600x400 is 4:1, so the ceiling's width binds and the height follows.
-    assert width == pytest.approx(_HIGHLIGHT_WIDTH, abs=1)
-    assert height == pytest.approx(round(_HIGHLIGHT_WIDTH * 400 / 1600), abs=1)
+        assert sheet.width == _TARGET_WIDTH, "the strip must not widen the sheet"
+        strip_height = sheet.height - _SCALED_HEIGHT - HIGHLIGHT_SEAM
+    assert strip_height == expected_h
+    assert strip_height <= row_height + 1, "the strip outgrew a grid row"
+    assert expected_w == _TARGET_WIDTH, "a very wide crop should fill the width"
 
 
 def test_a_broken_highlight_fails_like_a_broken_frame(tmp_path) -> None:
@@ -513,26 +555,33 @@ def test_a_highlight_without_a_target_width_is_rejected(tmp_path) -> None:
 
 
 def test_a_composed_sheet_reaches_the_provider_unshrunk(tmp_path) -> None:
-    """The composed sheet must reach the provider at the width it was built at.
+    """The composed sheet must reach the provider with the close-up's pixels intact.
 
-    This is the acceptance point of the whole feature. `resize_for_provider`
-    shrinks anything wider than the target width, and a composed sheet is
-    deliberately wider -- 767 of grid plus a 448 column. Scaled as a whole, the
-    close-up lands at about 145 pixels and the measured gain over the grid falls
-    from 7.6x to 3.0x, which is exactly the loss the column was added to avoid.
+    This is the acceptance point of the whole feature. `resize_for_provider` shrinks
+    anything wider than the target width, and if that happened to the close-up the
+    measured gain over the grid would collapse.
+
+    With the strip below the grid the widths agree by construction -- the sheet is
+    exactly `target_width` wide -- so the only way to lose pixels is to get the
+    budget wrong and shrink on height. The assertion is on the close-up's own size
+    rather than on the sheet's, because that is what the feature is for.
     """
     frames = _nine_frames(tmp_path)
     highlight = tmp_path / "person.jpg"
-    highlight.write_bytes(_solid_jpeg((800, 400)))
+    highlight.write_bytes(_solid_jpeg((1600, 400)))
     sheet = tmp_path / "combo.jpg"
     build_contact_sheet(frames, sheet, highlight=highlight, target_width=_TARGET_WIDTH)
+    row_height = _SCALED_HEIGHT // 3
+    expected_w, expected_h = _expected_strip_size(
+        (1600, 400), _TARGET_WIDTH, row_height
+    )
     data = resize_for_provider(sheet, _TARGET_WIDTH, already_sized=True)
     with Image.open(BytesIO(data)) as sent:
-        assert sent.size == (_TARGET_WIDTH + _HIGHLIGHT_WIDTH, _SCALED_HEIGHT)
-        box = _highlight_content_box(sent.convert("RGB"), _TARGET_WIDTH)
-        assert box[2] - box[0] == _HIGHLIGHT_WIDTH, (
+        box = _close_up_strip_box(sent.convert("RGB"), _SCALED_HEIGHT)
+        assert box[2] - box[0] == pytest.approx(expected_w, abs=1), (
             "the close-up was scaled with the sheet and its pixels were lost"
         )
+        assert box[3] - box[1] == pytest.approx(expected_h, abs=1)
 
 
 def test_the_budget_keeps_a_composed_sheet_whole(tmp_path) -> None:
@@ -549,16 +598,24 @@ def test_the_budget_keeps_a_composed_sheet_whole(tmp_path) -> None:
     )
     frames = _nine_frames(tmp_path)
     highlight = tmp_path / "person.jpg"
-    highlight.write_bytes(_solid_jpeg((800, 400)))
+    highlight.write_bytes(_solid_jpeg((1600, 400)))
     sheet = tmp_path / "combo.jpg"
     build_contact_sheet(
         frames, sheet, highlight=highlight, target_width=config.target_width
     )
+    with Image.open(sheet) as composed:
+        expected_w, expected_h = _close_up_span(composed, rows=3)
     data = resize_for_provider(sheet, evidence_width_budget(config))
     with Image.open(BytesIO(data)) as sent:
-        assert sent.size[0] == config.target_width + _HIGHLIGHT_WIDTH
-        box = _highlight_content_box(sent.convert("RGB"), config.target_width)
-        assert box[2] - box[0] == _HIGHLIGHT_WIDTH
+        assert sent.size[0] == config.target_width, "the strip must not widen the sheet"
+        # Measured against the composed sheet rather than a predicted number: the
+        # close-up's scale is the builder's business, and what this test exists to
+        # prove is that the provider path does not shrink it further.
+        box = _close_up_strip_box(sent.convert("RGB"), _SCALED_HEIGHT)
+        assert box[2] - box[0] == pytest.approx(expected_w, abs=1), (
+            "the close-up lost pixels on the way to the provider"
+        )
+        assert box[3] - box[1] == pytest.approx(expected_h, abs=1)
 
 
 def test_the_budget_still_shrinks_an_artifact_built_before_the_option_was_on(
@@ -2936,7 +2993,10 @@ async def test_the_close_up_prefers_a_frontal_frame_from_the_sheet(
             return _changing_jpeg(timestamp)
 
         async def async_get_event_snapshot(self, event_id, camera, height):
-            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
+            # Bright, not _changing_jpeg: the strip below the grid is filled
+            # black and the tests locate the crop by luma, so the crop must be
+            # clearly lighter than the fill. A dark fixture is invisible to them.
+            return _solid_jpeg((240, 240))
 
     asked: list[str] = []
 
@@ -2995,7 +3055,10 @@ async def test_an_unreachable_face_service_still_produces_a_close_up(
             return _changing_jpeg(timestamp)
 
         async def async_get_event_snapshot(self, event_id, camera, height):
-            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
+            # Bright, not _changing_jpeg: the strip below the grid is filled
+            # black and the tests locate the crop by luma, so the crop must be
+            # clearly lighter than the fill. A dark fixture is invisible to them.
+            return _solid_jpeg((240, 240))
 
     # A port nothing is listening on: every request fails immediately.
     manager = MediaManager(
@@ -3010,9 +3073,8 @@ async def test_an_unreachable_face_service_still_produces_a_close_up(
     assert completed.stage is ActivityStage.EVIDENCE_READY
     assert completed.evidence_path is not None
     with Image.open(completed.evidence_path) as sheet:
-        _assert_has_close_up_column(sheet), (
-            "服务不可达时必须仍然拼出特写栏（退回面积最大），而不是降级成纯九宫格"
-        )
+        # 服务不可达时仍须拼出特写（退回面积最大），而不是降级成纯九宫格。
+        _assert_has_close_up_strip(sheet, rows=1)
 
 
 async def test_the_manager_adds_a_close_up_when_the_option_is_on(
@@ -3042,7 +3104,10 @@ async def test_the_manager_adds_a_close_up_when_the_option_is_on(
             return _changing_jpeg(timestamp)
 
         async def async_get_event_snapshot(self, event_id, camera, height):
-            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
+            # Bright, not _changing_jpeg: the strip below the grid is filled
+            # black and the tests locate the crop by luma, so the crop must be
+            # clearly lighter than the fill. A dark fixture is invisible to them.
+            return _solid_jpeg((240, 240))
 
     manager = MediaManager(
         hass, store, Client(), tmp_path,
@@ -3054,7 +3119,7 @@ async def test_the_manager_adds_a_close_up_when_the_option_is_on(
     completed = await manager.async_build(record.activity_id)
     assert completed.evidence_path is not None
     with Image.open(completed.evidence_path) as sheet:
-        _assert_has_close_up_column(sheet)
+        _assert_has_close_up_strip(sheet, rows=1)
 
 
 async def test_the_manager_omits_the_close_up_when_the_option_is_off(
@@ -3080,7 +3145,10 @@ async def test_the_manager_omits_the_close_up_when_the_option_is_off(
             return _changing_jpeg(timestamp)
 
         async def async_get_event_snapshot(self, event_id, camera, height):
-            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
+            # Bright, not _changing_jpeg: the strip below the grid is filled
+            # black and the tests locate the crop by luma, so the crop must be
+            # clearly lighter than the fill. A dark fixture is invisible to them.
+            return _solid_jpeg((240, 240))
 
     manager = MediaManager(
         hass, store, Client(), tmp_path,
@@ -3117,7 +3185,10 @@ async def test_the_manager_still_builds_when_no_box_was_recorded(
             return _changing_jpeg(timestamp)
 
         async def async_get_event_snapshot(self, event_id, camera, height):
-            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
+            # Bright, not _changing_jpeg: the strip below the grid is filled
+            # black and the tests locate the crop by luma, so the crop must be
+            # clearly lighter than the fill. A dark fixture is invisible to them.
+            return _solid_jpeg((240, 240))
 
     manager = MediaManager(
         hass, store, Client(), tmp_path,
@@ -3174,7 +3245,10 @@ async def test_a_review_activity_gets_a_close_up_from_its_detections(
             return _changing_jpeg(timestamp)
 
         async def async_get_event_snapshot(self, event_id, camera, height):
-            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
+            # Bright, not _changing_jpeg: the strip below the grid is filled
+            # black and the tests locate the crop by luma, so the crop must be
+            # clearly lighter than the fill. A dark fixture is invisible to them.
+            return _solid_jpeg((240, 240))
 
     manager = MediaManager(
         hass, store, Client(), tmp_path,
@@ -3187,7 +3261,8 @@ async def test_a_review_activity_gets_a_close_up_from_its_detections(
     assert completed.stage is ActivityStage.EVIDENCE_READY
     assert asked, "没有按 detection id 去要 box —— review 路径上 box 无处可来"
     with Image.open(completed.evidence_path) as sheet:
-        _assert_has_close_up_column(sheet)
+        # This fixture plans six samples, so the grid is two rows here.
+        _assert_has_close_up_strip(sheet, rows=2)
 
 
 async def test_a_review_activity_without_a_box_degrades_instead_of_failing(
@@ -3214,7 +3289,10 @@ async def test_a_review_activity_without_a_box_degrades_instead_of_failing(
             return _changing_jpeg(timestamp)
 
         async def async_get_event_snapshot(self, event_id, camera, height):
-            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
+            # Bright, not _changing_jpeg: the strip below the grid is filled
+            # black and the tests locate the crop by luma, so the crop must be
+            # clearly lighter than the fill. A dark fixture is invisible to them.
+            return _solid_jpeg((240, 240))
 
     manager = MediaManager(
         hass, store, Client(), tmp_path,

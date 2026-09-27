@@ -19,7 +19,10 @@ from typing import Any, Protocol
 from homeassistant.core import HomeAssistant
 from PIL import Image, ImageChops, ImageOps, ImageStat, UnidentifiedImageError
 
-from .const import PERSON_HIGHLIGHT_WIDTH
+from .const import (
+    HIGHLIGHT_SEAM,
+    PERSON_HIGHLIGHT_WIDTH,
+)
 from .correlation import ZoneRoles, anchor_sequence, infer_direction
 from .frigate import FrigateApiError, event_box
 from .media_source import DATA_MEDIA_REGISTRY
@@ -667,6 +670,7 @@ def build_contact_sheet(
             )
             sheet.close()
             sheet = scaled
+        rows = len(frame_paths) // columns
         if highlight is not None:
             # Any format Pillow can decode is accepted: unlike a frame, this is
             # our own intermediate rather than something Frigate served.
@@ -676,47 +680,41 @@ def build_contact_sheet(
                     close_up = source.convert("RGB")
             except (OSError, UnidentifiedImageError) as exc:
                 raise MediaError("frame_decode_failed") from exc
-            # The column is fitted to the crop rather than the crop to a fixed
-            # column. `highlight_width` is a ceiling, not the width to pad out to.
+            # The close-up goes UNDER the grid, and the strip is sized to the crop.
             #
-            # A fixed column wastes most of itself on a tall crop: the reference
-            # crop is 249x261 while the column is 448 wide and only as tall as the
-            # grid, so `contain` is height-bound and the crop lands at 275 wide --
-            # measured on a real sheet, 173 of the column's 448 pixels, 39%, were
-            # black. Those pixels are not free: the sheet is scaled to a fixed
-            # display width, so every wasted column pixel is taken from the grid's
-            # cells, which are the part that carries the time axis.
+            # Beside the grid it costs the grid its pixels. The sheet is scaled to a
+            # fixed display width, so every pixel the close-up takes is a pixel the
+            # cells do not get -- and the cells carry the time axis, which is the
+            # sheet's whole purpose. Measured on a real six-frame sheet: beside the
+            # grid the cells render 154x87, under it they render 243x137, 1.58x
+            # larger in each direction. A generous strip below therefore shows the
+            # person LARGER (261x274 against 192x202) while also enlarging the grid,
+            # which is why the placement is worth its extra height.
             #
-            # Sizing to the crop instead removes the bars and hands the width back
-            # to the grid. Measured for a six-frame sheet: the column drops from
-            # 448 to 275, the grid's cells grow from 154x87 to 179x101 on screen
-            # (+16%), and the whole image gets 14% smaller rather than larger.
-            #
-            # `contain` still decides the scale, so nothing is distorted; it is
-            # given the ceiling and, for a crop smaller than the grid is tall, may
-            # enlarge it to meet it. That is the existing behaviour and is wanted:
-            # the close-up exists to make a small crop readable, and the source is
-            # a 640x360 detect stream whose pixels are all there is.
+            # The crop is fitted to the sheet's width and the grid's height, so it is
+            # never enlarged past what the grid's own rows are and never distorted.
+            # A tall crop like the reference 249x261 is width-bound in this box and
+            # leaves bars at the sides; that is the honest cost of not stretching a
+            # body, and unlike the column case those bars cost the grid nothing.
             try:
-                close_up = ImageOps.contain(close_up, (highlight_width, sheet.height))
+                close_up = ImageOps.contain(
+                    close_up,
+                    (sheet.width, max(1, sheet.height // rows)),
+                )
             except (OSError, UnidentifiedImageError) as exc:
                 raise MediaError("frame_decode_failed") from exc
-            # After `contain`, height <= sheet.height and width <= highlight_width
-            # by construction, so the column is exactly the fitted width: no black
-            # bars, and never wider than the ceiling.
-            column = max(1, close_up.width)
-            canvas = Image.new("RGB", (sheet.width + column, sheet.height))
-            canvas.paste(sheet, (0, 0))
-            canvas.paste(
-                close_up,
-                (
-                    # Centred vertically; horizontally the fit is exact, so this is
-                    # zero unless rounding left a pixel over.
-                    sheet.width + (column - close_up.width) // 2,
-                    (sheet.height - close_up.height) // 2,
-                ),
-            )
+            strip = Image.new("RGB", (sheet.width, close_up.height))
+            strip.paste(close_up, ((sheet.width - close_up.width) // 2, 0))
             close_up.close()
+            # A one-pixel seam keeps the two from reading as one image: the grid's
+            # last row and the crop are different scenes, and a model reading
+            # straight across the boundary would otherwise see them as continuous.
+            canvas = Image.new(
+                "RGB", (sheet.width, sheet.height + HIGHLIGHT_SEAM + strip.height)
+            )
+            canvas.paste(sheet, (0, 0))
+            canvas.paste(strip, (0, sheet.height + HIGHLIGHT_SEAM))
+            strip.close()
             sheet.close()
             sheet = canvas
             canvas = None

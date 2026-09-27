@@ -246,37 +246,14 @@ check("a nine-offset notification builds nine cells", async () => {
   assert.strictEqual(cells.children[8].dataset.cell, "9");
 });
 
-check("the overlay covers the frames and stops before the close-up", async () => {
-  // Reported from the UI: the numbers were on the wrong frames and the close-up
-  // was numbered as though it were one of them. The sheet carries a fourth column
-  // when the close-up is on, and the overlay was covering it.
+check("an overlay still stops before a close-up beside the grid", async () => {
+  // Older sheets, built before the close-up moved below the grid, may still be
+  // stored and opened. That layout puts the close-up on the right, so the overlay
+  // has to be narrower -- the card cannot know which layout it is looking at, so
+  // both are handled from the image's own shape alone.
   //
-  // 1215x431 is the composed sheet this deployment actually produces: 767 of grid
-  // plus a 448 close-up column. Three 16:9 cells across 431/3 per row come to 766px
-  // of frames, so the overlay must be 63.1% wide.
-  const { card, cells } = makeCard({ notification_id: "alert_nine" });
-  cells.style = {};
-  card.hass = storeWith({
-    id: "alert_nine",
-    hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
-    evidence_image_url: "/api/frigate_vision/media/e/nine.jpg?authSig=Y",
-    evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7|52.3|61.8|70.2",
-  });
-  await flush();
-  card._sheet.naturalWidth = 1215;
-  card._sheet.naturalHeight = 431;
-  card._insetFromExtraColumn();
-  const width = parseFloat(cells.style.width);
-  assert.ok(
-    Math.abs(width - 63.1) < 0.3,
-    "the overlay must stop before the close-up column, got " + cells.style.width
-  );
-});
-
-check("a six-frame sheet with a close-up is two rows, not three", async () => {
-  // The row count comes from the offsets, and real six-frame sheets are 1215x288
-  // -- the grid is scaled to the target width before the close-up column is added.
-  // Assuming three rows would make the overlay far too narrow.
+  // 767x433 is a grid-plus-strip sheet; 1042x288 is the older grid-plus-column one
+  // for six frames. Here the column is 275 wide, so the overlay is 767/1042 = 73.6%.
   const { card, cells } = makeCard({ notification_id: "alert_six" });
   cells.style = {};
   card.hass = storeWith({
@@ -286,17 +263,24 @@ check("a six-frame sheet with a close-up is two rows, not three", async () => {
     evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7",
   });
   await flush();
-  card._sheet.naturalWidth = 1215;
+  card._sheet.naturalWidth = 1042;
   card._sheet.naturalHeight = 288;
   card._insetFromExtraColumn();
+  // Six 16:9 cells across two 144-tall rows span 767, so the overlay is
+  // 767/1042 = 73.6% and the side column keeps the rest.
   const width = parseFloat(cells.style.width);
   assert.ok(
-    Math.abs(width - 63.2) < 0.3,
-    "six frames is two rows, got " + cells.style.width
+    Math.abs(width - 73.6) < 0.3,
+    "a same-height sheet is the grid plus a side column; expected ~73.6%, got " +
+      cells.style.width
+  );
+  assert.ok(
+    Math.abs(parseFloat(cells.style.height) - 100) < 0.01,
+    "the overlay spans the full height, got " + cells.style.height
   );
 });
 
-check("a grid-only sheet keeps the full width", async () => {
+check("a grid-only sheet keeps the full overlay", async () => {
   // Both shapes have to stay correct: with no close-up the image is exactly the
   // frames, so the overlay covers all of it and no inset appears.
   for (const [offsets, width, height, label] of [
@@ -315,12 +299,75 @@ check("a grid-only sheet keeps the full width", async () => {
     card._sheet.naturalWidth = width;
     card._sheet.naturalHeight = height;
     card._insetFromExtraColumn();
-    assert.strictEqual(
-      cells.style.width,
-      "100.0000%",
+    assert.ok(
+      Math.abs(parseFloat(cells.style.width) - 100) < 0.01,
       label + " must keep the full width, got " + cells.style.width
     );
+    assert.ok(
+      Math.abs(parseFloat(cells.style.height) - 100) < 0.01,
+      label + " must keep the full height, got " + cells.style.height
+    );
   }
+});
+
+check("an overlay stops above a close-up strip below the grid", async () => {
+  // The placement the owner asked for. The close-up sits UNDER the grid, so the
+  // image is taller than the frames rather than wider, and the overlay has to stop
+  // at the grid's bottom edge. Without that, the numbers are spread over the whole
+  // image: a 433-tall sheet with a 288-tall grid made two 216-pixel rows, dropping
+  // the second row's numbers 72 pixels below the frames they belong to and laying
+  // invisible tap targets over the close-up.
+  //
+  // 767x433 is the real six-frame sheet: 288 of grid, a 1px seam, 144 of close-up.
+  // The overlay must therefore be 288/433 = 66.5% tall.
+  const { card, cells } = makeCard({ notification_id: "alert_six" });
+  cells.style = {};
+  card.hass = storeWith({
+    id: "alert_six",
+    hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
+    evidence_image_url: "/api/frigate_vision/media/e/six.jpg?authSig=Y",
+    evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7",
+  });
+  // The offsets arrive with the notification, so the render must run before the
+  // dimensions are faked in: `rows` comes from the offsets, and calling the sizing
+  // with none loaded leaves it at zero and silently does nothing.
+  return flush().then(() => {
+    card._sheet.naturalWidth = 767;
+    card._sheet.naturalHeight = 433;
+    card._insetFromExtraColumn();
+    assert.ok(
+      Math.abs(parseFloat(cells.style.width) - 100) < 0.01,
+      "the grid spans the full width, got " + cells.style.width
+    );
+    const height = parseFloat(cells.style.height);
+    assert.ok(
+      Math.abs(height - 66.5) < 0.5,
+      "the overlay must stop above the strip, expected ~66.5%, got " +
+        cells.style.height
+    );
+  });
+});
+
+check("a nine-frame sheet with a strip stops above it too", async () => {
+  // 767x575: 432 of grid, 1px seam, 142 of close-up. Three rows, so the overlay is
+  // 432/575 = 75.1% tall.
+  const { card, cells } = makeCard({ notification_id: "alert_nine" });
+  cells.style = {};
+  card.hass = storeWith({
+    id: "alert_nine",
+    hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
+    evidence_image_url: "/api/frigate_vision/media/e/nine.jpg?authSig=Y",
+    evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7|52.3|61.8|70.2",
+  });
+  await flush();
+  card._sheet.naturalWidth = 767;
+  card._sheet.naturalHeight = 575;
+  card._insetFromExtraColumn();
+  const height = parseFloat(cells.style.height);
+  assert.ok(
+    Math.abs(height - 75.1) < 0.5,
+    "three rows of grid in a 575-tall sheet is 75.1%, got " + cells.style.height
+  );
 });
 
 check("the overlay is sized once the image loads, when it is not yet cached", async () => {
