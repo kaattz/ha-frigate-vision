@@ -9,8 +9,6 @@ ISSUES = {
     "vision_not_configured",
     "provider_unavailable",
     "frigate_unavailable",
-    "door_mapping_invalid",
-    "door_open_too_long",
     "storage_corrupt",
     "media_cleanup_failed",
     "delivery_outcome_unknown",

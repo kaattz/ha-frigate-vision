@@ -10,7 +10,6 @@ from custom_components.frigate_vision.models import (
     ActivityRecord,
     ActivitySource,
     ActivityStage,
-    ProcessingMode,
     analysis_key,
     delivery_key,
     media_key,
@@ -30,7 +29,6 @@ async def test_hundred_replays_keep_one_activity(hass: HomeAssistant) -> None:
         entry_id="entry_1",
         source=ActivitySource.STANDALONE_REVIEW,
         stage=ActivityStage.COLLECTING,
-        processing_mode=ProcessingMode.SHADOW,
         created_at=1,
         updated_at=1,
         camera="front",
@@ -76,7 +74,6 @@ async def test_side_effect_start_is_atomic_when_store_write_fails(
         entry_id="entry_1",
         source=ActivitySource.STANDALONE_REVIEW,
         stage=ActivityStage.EVIDENCE_READY,
-        processing_mode=ProcessingMode.SHADOW,
         created_at=1,
         updated_at=1,
         camera="front",
@@ -108,7 +105,6 @@ async def test_side_effect_start_rejects_wrong_key_family(
             entry_id="entry_1",
             source=ActivitySource.STANDALONE_REVIEW,
             stage=ActivityStage.EVIDENCE_READY,
-            processing_mode=ProcessingMode.LIVE,
             created_at=1,
             updated_at=1,
             camera="front",
@@ -154,9 +150,8 @@ async def test_concurrent_retry_creates_one_active_attempt_and_keeps_source(
         ActivityRecord(
             activity_id="door_original",
             entry_id="entry_1",
-            source=ActivitySource.DOOR_CYCLE,
+            source=ActivitySource.STANDALONE_REVIEW,
             stage=ActivityStage.FAILED,
-            processing_mode=ProcessingMode.SHADOW,
             created_at=1,
             updated_at=2,
             camera="front",
@@ -171,7 +166,7 @@ async def test_concurrent_retry_creates_one_active_attempt_and_keeps_source(
     )
     attempts = [item for item in results if isinstance(item, ActivityRecord)]
     assert len(attempts) == 1
-    assert attempts[0].source is ActivitySource.DOOR_CYCLE
+    assert attempts[0].source is ActivitySource.STANDALONE_REVIEW
     assert attempts[0].stage is ActivityStage.SEALED
     with pytest.raises(StoreConflictError, match="retry_requires_root_activity"):
         await store.async_create_retry(attempts[0].activity_id, now=5)

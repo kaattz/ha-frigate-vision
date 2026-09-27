@@ -7,7 +7,6 @@ from custom_components.frigate_vision.models import (
     ActivityRecord,
     ActivitySource,
     ActivityStage,
-    ProcessingMode,
 )
 from custom_components.frigate_vision.runtime import (
     EntryRuntime,
@@ -28,7 +27,6 @@ async def test_get_activity_returns_only_whitelisted_state(hass: HomeAssistant) 
             entry_id="entry_1",
             source=ActivitySource.STANDALONE_REVIEW,
             stage=ActivityStage.COMPLETED,
-            processing_mode=ProcessingMode.SHADOW,
             created_at=1,
             updated_at=2,
             camera="front",

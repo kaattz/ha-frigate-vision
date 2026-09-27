@@ -12,7 +12,6 @@ from homeassistant.helpers.storage import Store
 
 from .models import (
     ActivityRecord,
-    ActivitySource,
     ActivityStage,
     BufferedIngress,
     IngressMessage,
@@ -171,8 +170,6 @@ class ActivityStore:
         error_code: str | None = None,
         association_deadline: float | None = None,
         finalization_deadline: float | None = None,
-        door_closed_at: float | None = None,
-        door_remained_open: bool | None = None,
     ) -> ActivityRecord:
         async with self._lock:
             existing = self._activities.get(activity_id)
@@ -202,16 +199,6 @@ class ActivityStore:
                     finalization_deadline
                     if finalization_deadline is not None
                     else existing.finalization_deadline
-                ),
-                door_closed_at=(
-                    door_closed_at
-                    if door_closed_at is not None
-                    else existing.door_closed_at
-                ),
-                door_remained_open=(
-                    door_remained_open
-                    if door_remained_open is not None
-                    else existing.door_remained_open
                 ),
             )
             candidate = {**self._activities, activity_id: updated}
@@ -276,8 +263,6 @@ class ActivityStore:
         zone_update: tuple[float, tuple[str, ...]] | None = None,
         detection_zone_update: tuple[str, float, tuple[str, ...]] | None = None,
         box_update: tuple[float, tuple[float, float, float, float]] | None = None,
-        doorbell_at: float | None = None,
-        doorbell_times: tuple[float, ...] = (),
         updated_at: float,
     ) -> ActivityRecord:
         async with self._lock:
@@ -328,20 +313,6 @@ class ActivityStore:
                 }
                 by_box_timestamp[occurred_at] = box
                 box_updates = tuple(sorted(by_box_timestamp.items()))
-            merged_doorbell_times = tuple(
-                sorted(
-                    {
-                        *existing.doorbell_times,
-                        *(
-                            (existing.doorbell_at,)
-                            if existing.doorbell_at is not None
-                            else ()
-                        ),
-                        *((doorbell_at,) if doorbell_at is not None else ()),
-                        *doorbell_times,
-                    }
-                )
-            )
             updated = replace(
                 existing,
                 detection_ids=tuple(
@@ -352,10 +323,6 @@ class ActivityStore:
                 detection_zone_updates=detection_zone_updates,
                 box_updates=box_updates,
                 updated_at=max(existing.updated_at, updated_at),
-                doorbell_at=(
-                    merged_doorbell_times[0] if merged_doorbell_times else None
-                ),
-                doorbell_times=merged_doorbell_times,
             )
             candidate = {**self._activities, activity_id: updated}
             await self._async_save(candidate)
@@ -403,36 +370,6 @@ class ActivityStore:
             await self._async_save(candidate)
             self._activities = candidate
             return True
-
-    async def async_update_contact(
-        self, activity_id: str, *, is_open: bool, updated_at: float
-    ) -> ActivityRecord:
-        """Persist door-contact continuity evidence for a collecting cycle."""
-        async with self._lock:
-            existing = self._activities.get(activity_id)
-            if existing is None:
-                raise StoreConflictError("activity_missing")
-            if existing.stage is not ActivityStage.COLLECTING:
-                raise StoreConflictError("stage_conflict")
-            contact_seen_open = existing.contact_seen_open
-            contact_seen_close = existing.contact_seen_close
-            contact_reopened = existing.contact_reopened
-            if is_open:
-                contact_reopened = contact_reopened or contact_seen_close
-                contact_seen_open = True
-            elif contact_seen_open:
-                contact_seen_close = True
-            updated = replace(
-                existing,
-                contact_seen_open=contact_seen_open,
-                contact_seen_close=contact_seen_close,
-                contact_reopened=contact_reopened,
-                updated_at=max(existing.updated_at, updated_at),
-            )
-            candidate = {**self._activities, activity_id: updated}
-            await self._async_save(candidate)
-            self._activities = candidate
-            return updated
 
     async def async_complete_media(
         self,
@@ -596,8 +533,6 @@ class ActivityStore:
                 raise StoreConflictError("activity_missing")
             if existing.stage is not ActivityStage.ANALYSIS_DONE:
                 raise StoreConflictError("stage_conflict")
-            if existing.processing_mode.value != "live":
-                raise StoreConflictError("delivery_mode_forbidden")
             if any(
                 value.startswith(f"delivery:{activity_id}:")
                 for value in existing.claimed_side_effects
@@ -615,33 +550,6 @@ class ActivityStore:
             self._activities = candidate
             return updated
 
-    async def async_complete_mode(
-        self, activity_id: str, *, mode: str, updated_at: float
-    ) -> ActivityRecord:
-        expected = {
-            "observe": ActivityStage.EVIDENCE_READY,
-            "shadow": ActivityStage.ANALYSIS_DONE,
-        }.get(mode)
-        if expected is None:
-            raise StoreConflictError("invalid_completion_kind")
-        async with self._lock:
-            existing = self._activities.get(activity_id)
-            if existing is None:
-                raise StoreConflictError("activity_missing")
-            if existing.stage is not expected or existing.processing_mode.value != mode:
-                raise StoreConflictError("stage_conflict")
-            updated = replace(
-                existing,
-                stage=ActivityStage.COMPLETED,
-                completion_kind=mode,
-                updated_at=max(existing.updated_at, updated_at),
-            )
-            candidate = {**self._activities, activity_id: updated}
-            await self._async_save(candidate)
-            self._activities = candidate
-            self._notify(updated)
-            return updated
-
     async def async_ack_delivery(
         self, activity_id: str, *, attempt_id: str, updated_at: float
     ) -> ActivityRecord:
@@ -656,7 +564,7 @@ class ActivityStore:
             updated = replace(
                 existing,
                 stage=ActivityStage.COMPLETED,
-                completion_kind="live",
+                completion_kind="delivered",
                 updated_at=max(existing.updated_at, updated_at),
             )
             candidate = {**self._activities, activity_id: updated}
@@ -671,26 +579,9 @@ class ActivityStore:
             recovered: list[ActivityRecord] = []
             candidate = dict(self._activities)
             changed = False
-            collecting_by_camera: dict[str, list[str]] = {}
-            for item in candidate.values():
-                if (
-                    item.source is ActivitySource.DOOR_CYCLE
-                    and item.stage is ActivityStage.COLLECTING
-                ):
-                    collecting_by_camera.setdefault(item.camera, []).append(
-                        item.activity_id
-                    )
-            conflicts = {
-                activity_id
-                for ids in collecting_by_camera.values()
-                if len(ids) > 1
-                for activity_id in ids
-            }
             for activity_id, record in list(candidate.items()):
                 error_code = None
-                if activity_id in conflicts:
-                    error_code = "conflicting_door_cycles"
-                elif record.stage is ActivityStage.ANALYSIS_STARTED:
+                if record.stage is ActivityStage.ANALYSIS_STARTED:
                     error_code = "analysis_outcome_unknown"
                 elif record.stage is ActivityStage.DELIVERY_STARTED:
                     error_code = "delivery_outcome_unknown"

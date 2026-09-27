@@ -15,20 +15,6 @@
           "far_zones": "远端区域"
         }
       },
-      "door": {
-        "title": "门口设备",
-        "data": {
-          "event_entity_id": "门锁事件实体",
-          "action_attribute": "动作属性名",
-          "open_values": "开门匹配值",
-          "close_values": "关门匹配值",
-          "side_attribute": "操作侧属性名",
-          "inside_values": "室内侧匹配值",
-          "outside_values": "室外侧匹配值",
-          "contact_entity_id": "门磁实体（可选）",
-          "doorbell_event_entity_id": "门铃事件实体（可选）"
-        }
-      },
       "llmvision": {
         "title": "视觉模型服务",
         "data": {
@@ -47,7 +33,6 @@
       "options": {
         "title": "行为选项",
         "data": {
-          "processing_mode": "处理模式",
           "llm_provider": "服务商",
           "llm_base_url": "接口地址",
           "llm_api_key": "API 密钥",
@@ -92,21 +77,6 @@
           "transition_zones": "过渡区域",
           "far_zones": "远端区域"
         }
-      },
-      "reconfigure_door": {
-        "title": "门口设备",
-        "description": "门锁事件实体留空即切换为纯 Review 模式：集成将完全以 Frigate 人物 Review 作为活动入口，不再创建门周期。",
-        "data": {
-          "event_entity_id": "门锁事件实体",
-          "action_attribute": "动作属性名",
-          "open_values": "开门匹配值",
-          "close_values": "关门匹配值",
-          "side_attribute": "操作侧属性名",
-          "inside_values": "室内侧匹配值",
-          "outside_values": "室外侧匹配值",
-          "contact_entity_id": "门磁实体（可选）",
-          "doorbell_event_entity_id": "门铃事件实体（可选）"
-        }
       }
     },
     "error": {
@@ -144,7 +114,6 @@
       "settings_form": {
         "title": "行为选项",
         "data": {
-          "processing_mode": "处理模式",
           "llm_base_url": "接口地址",
           "llm_api_key": "API 密钥",
           "llm_model": "模型名称",
@@ -221,14 +190,6 @@
     "frigate_unavailable": {
       "title": "Frigate 不可用",
       "description": "配置项 {entry_id} 无法连接 Frigate。"
-    },
-    "door_mapping_invalid": {
-      "title": "门锁映射无效",
-      "description": "配置项 {entry_id} 拒绝了门锁事件。"
-    },
-    "door_open_too_long": {
-      "title": "入户门长时间未关闭",
-      "description": "配置项 {entry_id} 超过 30 分钟未收到关门事件，该门周期已按失败结束。请检查门是否处于虚掩状态，以及门锁是否仍在上报关门事件。"
     },
     "storage_corrupt": {
       "title": "持久状态无效",

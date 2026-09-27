@@ -14,7 +14,7 @@ from homeassistant.core import (
 )
 
 from .const import DOMAIN
-from .models import IngressKind, IngressMessage, ProcessingMode
+from .models import IngressKind, IngressMessage
 from .runtime import IntegrationRuntime
 
 
@@ -88,9 +88,6 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 camera=camera,
                 current_zones=zones,
                 detection_ids=tuple(data["detections"]),
-                processing_mode=ProcessingMode(
-                    str(entry.options.get("processing_mode", "observe"))
-                ),
                 manual=True,
             )
         )

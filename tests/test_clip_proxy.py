@@ -21,7 +21,6 @@ from custom_components.frigate_vision.models import (
     ActivityRecord,
     ActivitySource,
     ActivityStage,
-    ProcessingMode,
 )
 
 

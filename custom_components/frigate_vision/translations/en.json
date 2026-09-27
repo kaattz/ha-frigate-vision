@@ -15,20 +15,6 @@
           "far_zones": "Far zones"
         }
       },
-      "door": {
-        "title": "Entrance devices",
-        "data": {
-          "event_entity_id": "Lock event entity",
-          "action_attribute": "Action attribute",
-          "open_values": "Open values",
-          "close_values": "Close values",
-          "side_attribute": "Side attribute",
-          "inside_values": "Inside values",
-          "outside_values": "Outside values",
-          "contact_entity_id": "Door contact (optional)",
-          "doorbell_event_entity_id": "Doorbell event (optional)"
-        }
-      },
       "llmvision": {
         "title": "Vision provider",
         "data": {
@@ -47,7 +33,6 @@
       "options": {
         "title": "Behavior",
         "data": {
-          "processing_mode": "Processing mode",
           "llm_provider": "Provider",
           "llm_base_url": "Base URL",
           "llm_api_key": "API key",
@@ -90,21 +75,6 @@
           "transition_zones": "Transition zones",
           "far_zones": "Far zones"
         }
-      },
-      "reconfigure_door": {
-        "title": "Entrance devices",
-        "description": "Leave the lock event entity empty to run review-only: the integration then keys every activity off Frigate person reviews and never creates a door cycle.",
-        "data": {
-          "event_entity_id": "Lock event entity",
-          "action_attribute": "Action attribute",
-          "open_values": "Open values",
-          "close_values": "Close values",
-          "side_attribute": "Side attribute",
-          "inside_values": "Inside values",
-          "outside_values": "Outside values",
-          "contact_entity_id": "Door contact (optional)",
-          "doorbell_event_entity_id": "Doorbell event (optional)"
-        }
       }
     },
     "error": {
@@ -139,7 +109,6 @@
       "settings_form": {
         "title": "Behavior",
         "data": {
-          "processing_mode": "Processing mode",
           "llm_base_url": "Base URL",
           "llm_api_key": "API key",
           "llm_model": "Model",
@@ -217,14 +186,6 @@
     "frigate_unavailable": {
       "title": "Frigate unavailable",
       "description": "Entry {entry_id} cannot reach Frigate."
-    },
-    "door_mapping_invalid": {
-      "title": "Door mapping invalid",
-      "description": "Entry {entry_id} rejected the configured lock event."
-    },
-    "door_open_too_long": {
-      "title": "Front door open too long",
-      "description": "Entry {entry_id} received no close event for 30 minutes, so the open door cycle was closed as failed. Check whether the door is ajar and whether the lock still reports close events."
     },
     "storage_corrupt": {
       "title": "Stored state invalid",

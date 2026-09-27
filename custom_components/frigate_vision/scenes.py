@@ -367,51 +367,7 @@ _REVIEW_SIX = Scene(
     ),
 )
 
-# Door scenes read the lock, so they declare it. `door_single` uses the opening
-# side; `door_roundtrip` uses both.
-_DOOR_SINGLE = Scene(
-    mode="door_single",
-    classifications=frozenset(
-        {"home_arrival", "home_departure", "unknown_activity", "unable_to_confirm"}
-    ),
-    signals=frozenset({"opening_side"}),
-    prompt_version=PROMPT_VERSION,
-    template="门锁只给出开门和关门边界，各格是近端、路径和远端候选。",
-    signal_text={
-        "opening_side": {
-            "inside": "室内侧开门支持离家候选，但不是结论。",
-            "outside": "室外侧开门支持回家候选，但不是结论。",
-            "unknown": "开门操作侧未知，不能据此判断回家或离家。",
-        }
-    },
-    preamble="不能仅凭电梯方向断言进入可见电梯；右侧画外还有另一部电梯。",
-)
-
-_DOOR_ROUNDTRIP = Scene(
-    mode="door_roundtrip",
-    classifications=frozenset(
-        {"short_roundtrip", "unknown_activity", "unable_to_confirm"}
-    ),
-    signals=frozenset({"door_remained_open", "opening_side"}),
-    prompt_version=PROMPT_VERSION,
-    template=(
-        "这是六帧两阶段联系图：上排三格是出去候选，下排三格是返回候选，"
-        "最终在返回候选后关门。"
-    ),
-    signal_text={
-        "door_remained_open": {
-            True: "门磁支持活动期间持续开启。",
-            False: "门磁记录与持续开启候选冲突，不能确认短时往返。",
-            None: "没有门磁连续开启证据，门是否持续开启未知。",
-        }
-    },
-    preamble="不能猜测同一人物或倒垃圾目的。",
-)
-
-
-SCENES: dict[str, Scene] = {
-    scene.mode: scene for scene in (_REVIEW_SIX, _DOOR_SINGLE, _DOOR_ROUNDTRIP)
-}
+SCENES: dict[str, Scene] = {scene.mode: scene for scene in (_REVIEW_SIX,)}
 
 
 def scene_for(mode: str) -> Scene | None:

@@ -50,7 +50,6 @@ from .const import (
     DEFAULT_PROMPT_OVERRIDE,
     DEFAULT_SCENE_LABELS,
     DOMAIN,
-    PROCESSING_MODES,
     PROVIDER_PRESETS,
     provider_for_url,
 )
@@ -96,9 +95,6 @@ def _parse_base_url(value: str) -> URL:
 def _options_schema() -> vol.Schema:
     return vol.Schema(
         {
-            vol.Required("processing_mode", default="observe"): selector.SelectSelector(
-                selector.SelectSelectorConfig(options=list(PROCESSING_MODES))
-            ),
             # Provider settings live in options rather than data so they can be
             # changed from the UI at any time; changing the credential should
             # not require removing and re-adding the integration.
@@ -307,106 +303,6 @@ def _llm_schema() -> vol.Schema:
     )
 
 
-def _door_schema() -> vol.Schema:
-    """Optional lock mapping; an empty lock entity means review-only."""
-    return vol.Schema(
-        {
-            vol.Optional("event_entity_id"): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="event")
-            ),
-            vol.Optional("action_attribute"): _text(),
-            vol.Optional("open_values"): _text(),
-            vol.Optional("close_values"): _text(),
-            vol.Optional("side_attribute"): _text(),
-            vol.Optional("inside_values"): _text(),
-            vol.Optional("outside_values"): _text(),
-            vol.Optional("contact_entity_id"): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="binary_sensor")
-            ),
-            vol.Optional("doorbell_event_entity_id"): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="event")
-            ),
-        }
-    )
-
-
-def _parse_door_mapping(
-    user_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    """Return the stored door mapping, or the error key that rejected it.
-
-    An absent lock entity is the review-only case: it yields an empty mapping
-    so the runtime skips the whole door-cycle branch (REQ-2). Contact and
-    doorbell context cannot stand alone, so they are rejected without a lock.
-    """
-    event_entity_id = user_input.get("event_entity_id")
-    contact_entity_id = user_input.get("contact_entity_id")
-    doorbell_event_entity_id = user_input.get("doorbell_event_entity_id")
-    if not event_entity_id:
-        if contact_entity_id or doorbell_event_entity_id:
-            return None, "door_lock_required"
-        return {}, None
-    try:
-        open_values = _split_values(user_input.get("open_values") or "")
-        close_values = _split_values(user_input.get("close_values") or "")
-        inside_values = _split_values(user_input.get("inside_values") or "")
-        outside_values = _split_values(user_input.get("outside_values") or "")
-        action_attribute = str(user_input.get("action_attribute") or "").strip()
-        side_attribute = str(user_input.get("side_attribute") or "").strip()
-        if not action_attribute or not side_attribute:
-            raise vol.Invalid("invalid_door_mapping")
-        if set(open_values) & set(close_values) or set(inside_values) & set(
-            outside_values
-        ):
-            raise vol.Invalid("invalid_door_mapping")
-    except vol.Invalid:
-        return None, "invalid_door_mapping"
-    return {
-        "event_entity_id": event_entity_id,
-        "action_attribute": action_attribute,
-        "open_values": open_values,
-        "close_values": close_values,
-        "side_attribute": side_attribute,
-        "inside_values": inside_values,
-        "outside_values": outside_values,
-        "contact_entity_id": contact_entity_id,
-        "doorbell_event_entity_id": doorbell_event_entity_id,
-    }, None
-
-
-def _door_suggestions(door: Mapping[str, Any]) -> dict[str, Any]:
-    """Convert a stored mapping or a submitted form payload into form values.
-
-    Called with two shapes: the persisted mapping (lists) and, when a
-    submission was rejected, the payload the user just sent (comma strings).
-    Echoing the submitted payload back is what lets a user clear the lock and
-    see it stay cleared, instead of having the stored mapping restored under
-    them. Value lists are comma-joined because the text selector holds a single
-    string; passing the raw lists would prefill `['1']` verbatim.
-    """
-
-    def as_text(value: Any) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        return ",".join(str(item) for item in value)
-
-    if not door:
-        return {}
-    return {
-        "event_entity_id": door.get("event_entity_id"),
-        "action_attribute": door.get("action_attribute"),
-        "open_values": as_text(door.get("open_values")),
-        "close_values": as_text(door.get("close_values")),
-        "side_attribute": door.get("side_attribute"),
-        "inside_values": as_text(door.get("inside_values")),
-        "outside_values": as_text(door.get("outside_values")),
-        "contact_entity_id": door.get("contact_entity_id"),
-        "doorbell_event_entity_id": door.get("doorbell_event_entity_id"),
-    }
-
-
 def _label_errors(user_input: Mapping[str, Any]) -> dict[str, str]:
     """Return form errors for the labels field, or an empty dict when valid.
 
@@ -462,8 +358,6 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
 
     def __init__(self) -> None:
         self._data: dict[str, Any] = {}
-        self._reconfigure_data: dict[str, Any] = {}
-        self._reconfigure_unique_id: str | None = None
 
     @staticmethod
     def async_get_options_flow(
@@ -532,7 +426,7 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
                     },
                     "zones": zones,
                 }
-                return await self.async_step_door()
+                return await self.async_step_llmvision()
 
         schema = vol.Schema(
             {
@@ -555,25 +449,6 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
             }
         )
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
-
-    async def async_step_door(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            door, error = _parse_door_mapping(user_input)
-            if error is not None:
-                errors["base"] = error
-            else:
-                self._data["door"] = door
-                return await self.async_step_llmvision()
-        return self.async_show_form(
-            step_id="door",
-            data_schema=self.add_suggested_values_to_schema(
-                _door_schema(), _door_suggestions(user_input or {})
-            ),
-            errors=errors,
-        )
 
     async def async_step_llmvision(
         self, user_input: dict[str, Any] | None = None
@@ -731,9 +606,11 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
                     "password": password,
                 }
                 data["zones"] = zones
-                self._reconfigure_data = data
-                self._reconfigure_unique_id = unique_id
-                return await self.async_step_reconfigure_door()
+                return self.async_update_reload_and_abort(
+                    entry,
+                    unique_id=unique_id,
+                    data=data,
+                )
         schema = vol.Schema(
             {
                 vol.Required(CONF_BASE_URL, default=current[CONF_BASE_URL]): _text(),
@@ -768,39 +645,6 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
         )
         return self.async_show_form(
             step_id="reconfigure", data_schema=schema, errors=errors
-        )
-
-    async def async_step_reconfigure_door(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Edit the optional lock mapping, or clear it to run review-only.
-
-        Reconfigure exists so an existing entry can move between door-cycle and
-        review-only operation without deleting the entry and losing its stored
-        activity history. Leaving the lock entity empty is the review-only case.
-        """
-        entry = self._get_reconfigure_entry()
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            door, error = _parse_door_mapping(user_input)
-            if error is not None:
-                errors["base"] = error
-            else:
-                data = dict(self._reconfigure_data)
-                data["door"] = door
-                return self.async_update_reload_and_abort(
-                    entry,
-                    unique_id=self._reconfigure_unique_id,
-                    data=data,
-                )
-        schema = self.add_suggested_values_to_schema(
-            _door_schema(),
-            _door_suggestions(
-                user_input if user_input is not None else (entry.data.get("door") or {})
-            ),
-        )
-        return self.async_show_form(
-            step_id="reconfigure_door", data_schema=schema, errors=errors
         )
 
 

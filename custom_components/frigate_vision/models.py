@@ -88,7 +88,6 @@ def _required_box(value: Any) -> tuple[float, float, float, float]:
 
 
 class ActivitySource(StrEnum):
-    DOOR_CYCLE = "door_cycle"
     STANDALONE_REVIEW = "standalone_review"
     MANUAL_REVIEW = "manual_review"
 
@@ -104,15 +103,7 @@ class ActivityStage(StrEnum):
     FAILED = "failed"
 
 
-class ProcessingMode(StrEnum):
-    OBSERVE = "observe"
-    SHADOW = "shadow"
-    LIVE = "live"
-
-
 class IngressKind(StrEnum):
-    DOOR = "door"
-    DOORBELL = "doorbell"
     FRIGATE_EVENT = "frigate_event"
     FRIGATE_REVIEW = "frigate_review"
 
@@ -131,7 +122,6 @@ class IngressMessage:
     current_zones: tuple[str, ...] = ()
     entered_zones: tuple[str, ...] = ()
     detection_ids: tuple[str, ...] = ()
-    processing_mode: ProcessingMode | None = None
     manual: bool = False
     box: tuple[float, float, float, float] | None = None
 
@@ -176,9 +166,6 @@ class IngressMessage:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["kind"] = self.kind.value
-        payload["processing_mode"] = (
-            self.processing_mode.value if self.processing_mode is not None else None
-        )
         payload["occurred_at"] = float(self.occurred_at)
         if self.started_at is not None:
             payload["started_at"] = float(self.started_at)
@@ -209,7 +196,6 @@ class IngressMessage:
             "current_zones",
             "entered_zones",
             "detection_ids",
-            "processing_mode",
             "manual",
             "box",
         }
@@ -250,11 +236,6 @@ class IngressMessage:
                 ),
                 detection_ids=tuple(
                     str(value) for value in payload.get("detection_ids", [])
-                ),
-                processing_mode=(
-                    ProcessingMode(payload["processing_mode"])
-                    if payload.get("processing_mode") is not None
-                    else None
                 ),
                 manual=payload.get("manual", False),
                 # A legacy payload has no box key at all; `None` is also what an
@@ -325,7 +306,6 @@ class ActivityRecord:
     entry_id: str
     source: ActivitySource
     stage: ActivityStage
-    processing_mode: ProcessingMode
     created_at: float
     updated_at: float
     camera: str
@@ -338,14 +318,6 @@ class ActivityRecord:
     zone_updates: tuple[tuple[float, tuple[str, ...]], ...] = ()
     detection_zone_updates: tuple[tuple[str, float, tuple[str, ...]], ...] = ()
     box_updates: tuple[tuple[float, tuple[float, float, float, float]], ...] = ()
-    opening_side: str = "unknown"
-    door_closed_at: float | None = None
-    door_remained_open: bool | None = None
-    contact_seen_open: bool = False
-    contact_seen_close: bool = False
-    contact_reopened: bool = False
-    doorbell_at: float | None = None
-    doorbell_times: tuple[float, ...] = ()
     claimed_side_effects: tuple[str, ...] = ()
     evidence_mode: str | None = None
     evidence_revision: int = 0
@@ -444,47 +416,6 @@ class ActivityRecord:
         for delivery_value in (self.delivery_attempt_id, self.completion_kind):
             if delivery_value is not None and not SAFE_ID.fullmatch(delivery_value):
                 raise ModelValidationError("invalid_delivery_identity")
-        if self.opening_side not in {"inside", "outside", "unknown"}:
-            raise ModelValidationError("invalid_opening_side")
-        if self.door_remained_open is not None and not isinstance(
-            self.door_remained_open, bool
-        ):
-            raise ModelValidationError("invalid_door_state")
-        if not all(
-            isinstance(value, bool)
-            for value in (
-                self.contact_seen_open,
-                self.contact_seen_close,
-                self.contact_reopened,
-            )
-        ):
-            raise ModelValidationError("invalid_door_state")
-        if self.door_closed_at is not None and (
-            not math.isfinite(self.door_closed_at)
-            or self.door_closed_at < self.created_at
-        ):
-            raise ModelValidationError("invalid_activity_timestamp")
-        earliest_doorbell = max(0.0, self.created_at - 120)
-        if self.doorbell_at is not None and (
-            not math.isfinite(self.doorbell_at) or self.doorbell_at < earliest_doorbell
-        ):
-            raise ModelValidationError("invalid_activity_timestamp")
-        if (
-            len(self.doorbell_times) > 100
-            or tuple(sorted(set(self.doorbell_times))) != self.doorbell_times
-            or any(
-                not math.isfinite(timestamp) or timestamp < earliest_doorbell
-                for timestamp in self.doorbell_times
-            )
-            or (
-                self.doorbell_at is not None
-                and (
-                    not self.doorbell_times
-                    or self.doorbell_at != self.doorbell_times[0]
-                )
-            )
-        ):
-            raise ModelValidationError("invalid_doorbell_times")
         previous_time = -1.0
         for occurred_at, zones in self.zone_updates:
             if (
@@ -551,7 +482,6 @@ class ActivityRecord:
         payload = asdict(self)
         payload["source"] = self.source.value
         payload["stage"] = self.stage.value
-        payload["processing_mode"] = self.processing_mode.value
         return payload
 
     def identity(self) -> tuple[object, ...]:
@@ -559,7 +489,6 @@ class ActivityRecord:
             self.activity_id,
             self.entry_id,
             self.source,
-            self.processing_mode,
             self.created_at,
             self.camera,
         )
@@ -572,7 +501,6 @@ class ActivityRecord:
             "entry_id",
             "source",
             "stage",
-            "processing_mode",
             "created_at",
             "updated_at",
             "camera",
@@ -584,14 +512,6 @@ class ActivityRecord:
             "zone_updates",
             "detection_zone_updates",
             "box_updates",
-            "opening_side",
-            "door_closed_at",
-            "door_remained_open",
-            "contact_seen_open",
-            "contact_seen_close",
-            "contact_reopened",
-            "doorbell_at",
-            "doorbell_times",
             "claimed_side_effects",
             "evidence_mode",
             "evidence_revision",
@@ -618,17 +538,12 @@ class ActivityRecord:
         except (KeyError, ValueError) as exc:
             raise ModelValidationError("invalid_stage") from exc
         try:
-            mode = ProcessingMode(payload["processing_mode"])
-        except (KeyError, ValueError) as exc:
-            raise ModelValidationError("invalid_processing_mode") from exc
-        try:
             return cls(
                 schema_version=int(payload["schema_version"]),
                 activity_id=str(payload["activity_id"]),
                 entry_id=str(payload["entry_id"]),
                 source=source,
                 stage=stage,
-                processing_mode=mode,
                 created_at=float(payload["created_at"]),
                 updated_at=float(payload["updated_at"]),
                 camera=str(payload["camera"]),
@@ -675,32 +590,6 @@ class ActivityRecord:
                         _required_box(update[1]),
                     )
                     for update in payload.get("box_updates", [])
-                ),
-                opening_side=str(payload.get("opening_side", "unknown")),
-                door_closed_at=(
-                    float(payload["door_closed_at"])
-                    if payload.get("door_closed_at") is not None
-                    else None
-                ),
-                door_remained_open=payload.get("door_remained_open"),
-                contact_seen_open=payload.get("contact_seen_open", False),
-                contact_seen_close=payload.get("contact_seen_close", False),
-                contact_reopened=payload.get("contact_reopened", False),
-                doorbell_at=(
-                    float(payload["doorbell_at"])
-                    if payload.get("doorbell_at") is not None
-                    else None
-                ),
-                doorbell_times=tuple(
-                    float(value)
-                    for value in payload.get(
-                        "doorbell_times",
-                        (
-                            [payload["doorbell_at"]]
-                            if payload.get("doorbell_at") is not None
-                            else []
-                        ),
-                    )
                 ),
                 claimed_side_effects=tuple(
                     str(value) for value in payload.get("claimed_side_effects", [])
@@ -769,10 +658,6 @@ class ActivityRecord:
             if isinstance(exc, ModelValidationError):
                 raise
             raise ModelValidationError("invalid_activity") from exc
-
-
-def door_activity_id(entry_id: str, opened_at: float) -> str:
-    return _derived_id("door", entry_id, str(round(opened_at * 1000)))
 
 
 def review_activity_id(entry_id: str, camera: str, review_id: str) -> str:
@@ -899,7 +784,6 @@ def retry_is_safe(error_code: str) -> bool:
             "unexpected_content_type",
             "invalid_json",
             "media_retry_exhausted",
-            "door_open_too_long",
             # The provider was never reached, so nothing can have been billed.
             # Excluded from this set until now, which left a connection failure
             # as the one unrecoverable transient error: it could not be replayed

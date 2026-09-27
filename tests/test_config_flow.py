@@ -296,7 +296,6 @@ async def test_user_flow_creates_entry_with_data_and_options(
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {
-                "processing_mode": "observe",
                 "target_width": 768,
                 "max_tokens": 300,
                 "output_language": "zh-CN",
@@ -432,7 +431,7 @@ async def test_options_flow_updates_behavior_settings(hass: HomeAssistant) -> No
         domain=DOMAIN,
         title="Front Door",
         data={},
-        options={"processing_mode": "observe"},
+        options={},
     )
     entry.add_to_hass(hass)
     result = await hass.config_entries.options.async_init(entry.entry_id)
@@ -453,7 +452,6 @@ async def test_options_flow_updates_behavior_settings(hass: HomeAssistant) -> No
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         {
-            "processing_mode": "shadow",
             "target_width": 768,
             # The cap must cover the reasoning budget the provider needs:
             # measured, max_tokens at 800 returned empty content every time
@@ -481,7 +479,7 @@ async def test_the_options_flow_still_saves_normally(hass: HomeAssistant) -> Non
         domain=DOMAIN,
         title="Front Door",
         data={},
-        options={"processing_mode": "observe"},
+        options={},
     )
     entry.add_to_hass(hass)
     result = await hass.config_entries.options.async_init(entry.entry_id)
@@ -494,7 +492,6 @@ async def test_the_options_flow_still_saves_normally(hass: HomeAssistant) -> Non
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         {
-            "processing_mode": "shadow",
             "target_width": 768,
             "max_tokens": 20000,
             "output_language": "zh-CN",
@@ -516,7 +513,7 @@ async def test_connection_test_reports_a_missing_key(hass: HomeAssistant) -> Non
         domain=DOMAIN,
         title="Front Door",
         data={},
-        options={"processing_mode": "observe", "llm_base_url": "https://x/v1"},
+        options={"llm_base_url": "https://x/v1"},
     )
     entry.add_to_hass(hass)
     result = await hass.config_entries.options.async_init(entry.entry_id)
@@ -541,7 +538,6 @@ async def test_connection_test_reports_success_with_details(
         title="Front Door",
         data={},
         options={
-            "processing_mode": "observe",
             "llm_base_url": "https://api.example.com/v1",
             "llm_api_key": "key",
             "llm_model": "vision-model",
@@ -1067,7 +1063,6 @@ async def test_door_step_can_be_skipped_without_lock(hass: HomeAssistant) -> Non
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {
-                "processing_mode": "observe",
                 "target_width": 768,
                 "max_tokens": 300,
                 "output_language": "zh-CN",
@@ -1154,7 +1149,6 @@ async def test_zone_lists_may_be_empty_for_review_only(hass: HomeAssistant) -> N
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {
-                "processing_mode": "observe",
                 "target_width": 768,
                 "max_tokens": 300,
                 "output_language": "zh-CN",
@@ -1180,7 +1174,7 @@ async def test_options_flow_round_trips_the_scene_description(
         domain=DOMAIN,
         title="Front Door",
         data={},
-        options={"processing_mode": "observe"},
+        options={},
     )
     entry.add_to_hass(hass)
     result = await hass.config_entries.options.async_init(entry.entry_id)
@@ -1194,7 +1188,6 @@ async def test_options_flow_round_trips_the_scene_description(
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         {
-            "processing_mode": "shadow",
             "target_width": 768,
             "max_tokens": 20000,
             "output_language": "zh-CN",
@@ -1326,7 +1319,6 @@ async def test_the_close_up_form_merges_instead_of_wiping_the_other_options(
         title="Front Door",
         data={},
         options={
-            "processing_mode": "observe",
             "llm_base_url": "http://keep.me/v1",
             "llm_api_key": "secret",
             "target_width": 767,
@@ -1428,7 +1420,7 @@ async def test_saving_bad_labels_shows_an_error_instead_of_storing_them(
         domain=DOMAIN,
         title="Front Door",
         data={},
-        options={"processing_mode": "observe", "scene_labels": ""},
+        options={"scene_labels": ""},
     )
     entry.add_to_hass(hass)
     result = await hass.config_entries.options.async_init(entry.entry_id)
@@ -1443,7 +1435,6 @@ async def test_saving_bad_labels_shows_an_error_instead_of_storing_them(
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         {
-            "processing_mode": "observe",
             "target_width": 768,
             "max_tokens": 20000,
             "output_language": "zh-CN",
@@ -1502,7 +1493,6 @@ async def _drive_the_initial_flow_to_the_options_step(hass: HomeAssistant) -> st
 
 
 _OPTIONS_PAYLOAD = {
-    "processing_mode": "observe",
     "target_width": 768,
     "max_tokens": 300,
     "output_language": "zh-CN",

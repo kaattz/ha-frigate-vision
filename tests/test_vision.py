@@ -459,7 +459,6 @@ async def test_client_completes_the_analysis_it_claimed(
         ActivityRecord,
         ActivitySource,
         ActivityStage,
-        ProcessingMode,
     )
     from custom_components.frigate_vision.store import ActivityStore
     from custom_components.frigate_vision.vision import VisionClient
@@ -475,7 +474,6 @@ async def test_client_completes_the_analysis_it_claimed(
             entry_id="entry_1",
             source=ActivitySource.STANDALONE_REVIEW,
             stage=ActivityStage.EVIDENCE_READY,
-            processing_mode=ProcessingMode.SHADOW,
             created_at=1,
             updated_at=1,
             camera="front",
@@ -768,7 +766,6 @@ async def test_a_configured_entry_analyses_and_completes_its_claim(
         ActivityRecord,
         ActivitySource,
         ActivityStage,
-        ProcessingMode,
     )
     from custom_components.frigate_vision.store import ActivityStore
     from custom_components.frigate_vision.vision import VisionClient
@@ -784,7 +781,6 @@ async def test_a_configured_entry_analyses_and_completes_its_claim(
             entry_id="entry_1",
             source=ActivitySource.STANDALONE_REVIEW,
             stage=ActivityStage.EVIDENCE_READY,
-            processing_mode=ProcessingMode.SHADOW,
             created_at=1,
             updated_at=1,
             camera="front",
@@ -856,7 +852,6 @@ async def _store_with_a_ready_activity(
         ActivityRecord,
         ActivitySource,
         ActivityStage,
-        ProcessingMode,
     )
     from custom_components.frigate_vision.store import ActivityStore
 
@@ -868,7 +863,6 @@ async def _store_with_a_ready_activity(
             entry_id=entry_id,
             source=ActivitySource.STANDALONE_REVIEW,
             stage=ActivityStage.EVIDENCE_READY,
-            processing_mode=ProcessingMode.SHADOW,
             created_at=1,
             updated_at=1,
             camera="front",

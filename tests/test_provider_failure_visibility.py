@@ -209,7 +209,6 @@ async def test_a_lost_503_activity_can_actually_be_replayed(
         ActivityRecord,
         ActivitySource,
         ActivityStage,
-        ProcessingMode,
     )
     from custom_components.frigate_vision.store import ActivityStore
 
@@ -221,7 +220,6 @@ async def test_a_lost_503_activity_can_actually_be_replayed(
             entry_id=ENTRY_ID,
             source=ActivitySource.STANDALONE_REVIEW,
             stage=ActivityStage.FAILED,
-            processing_mode=ProcessingMode.LIVE,
             created_at=1,
             updated_at=2,
             camera="front",
@@ -251,7 +249,6 @@ async def test_a_lost_503_activity_without_evidence_is_recollected(
         ActivityRecord,
         ActivitySource,
         ActivityStage,
-        ProcessingMode,
     )
     from custom_components.frigate_vision.store import ActivityStore
 
@@ -263,7 +260,6 @@ async def test_a_lost_503_activity_without_evidence_is_recollected(
             entry_id=ENTRY_ID,
             source=ActivitySource.STANDALONE_REVIEW,
             stage=ActivityStage.FAILED,
-            processing_mode=ProcessingMode.LIVE,
             created_at=1,
             updated_at=2,
             camera="front",

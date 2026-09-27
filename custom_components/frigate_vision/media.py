@@ -23,7 +23,7 @@ from .const import (
     HIGHLIGHT_SEAM,
     PERSON_HIGHLIGHT_WIDTH,
 )
-from .correlation import ZoneRoles, anchor_sequence, infer_direction
+from .correlation import ZoneRoles
 from .frigate import FrigateApiError, event_box
 from .media_source import DATA_MEDIA_REGISTRY
 from .models import ActivityRecord, ActivitySource, ActivityStage, media_key
@@ -76,219 +76,67 @@ class FrigateMediaClient(Protocol):
     ) -> bytes: ...
 
 
-def _strict_three(values: Sequence[float]) -> tuple[float, float, float]:
-    if len(values) < 2:
-        raise MediaError("direction_ambiguous")
-    start = float(values[0])
-    end = float(values[-1])
-    middle = float(values[len(values) // 2]) if len(values) >= 3 else (start + end) / 2
-    if not start < middle < end:
-        middle = (start + end) / 2
-    if not start < middle < end:
-        raise MediaError("invalid_sample_order")
-    return start, middle, end
-
-
-def _visible_sample_times(
-    updates: Sequence[tuple[float, Sequence[str]]], roles: ZoneRoles
-) -> list[float]:
-    """Prefer anchor points, then any frame with a visible subject."""
-    anchors = sorted({anchor.occurred_at for anchor in anchor_sequence(updates, roles)})
-    if len(anchors) >= 2:
-        return anchors
-    visible = sorted({occurred_at for occurred_at, zones in updates if zones})
-    if len(visible) >= 2:
-        return visible
-    return sorted({occurred_at for occurred_at, _ in updates})
-
-
-def _conservative_door_plan(
-    updates_by_event: Mapping[str, Sequence[tuple[float, Sequence[str]]]],
-    roles: ZoneRoles,
-) -> EvidencePlan | None:
-    """Build the 3-frame fallback when direction anchors are inconclusive.
-
-    REQ-6 forbids inventing a direction. The rules layer may still emit the
-    time-ordered near/path/far candidates and let the vision model decide; a
-    whole cycle must not fail only because zone updates stayed near the door.
-    """
-    times: list[float] = []
-    for updates in updates_by_event.values():
-        times.extend(_visible_sample_times(updates, roles))
-    ordered = sorted({value for value in times})
-    if len(ordered) < 3:
-        return None
-    return EvidencePlan(
-        mode="door_single",
-        sample_times=_strict_three(ordered),
-        selection_source="zone_anchor",
-    )
-
-
 def plan_evidence(
     record: ActivityRecord,
     events: Mapping[str, EventWindow],
     roles: ZoneRoles,
     motion_paths: Mapping[str, MotionPath] | None = None,
 ) -> EvidencePlan:
-    """Plan real timestamps without assigning visual semantics."""
-    if record.source in {
+    """Plan real timestamps without assigning visual semantics.
+
+    One source now: a Frigate Review. The door-cycle branch that once lived here
+    -- three frames for a single direction, two legs of three for a round trip --
+    was removed with the door-cycle state machine, so an activity that is not a
+    review is a programming error rather than a second layout.
+    """
+    if record.source not in {
         ActivitySource.STANDALONE_REVIEW,
         ActivitySource.MANUAL_REVIEW,
     }:
-        if not events or set(events) != set(record.detection_ids):
-            raise MediaError("event_window_missing")
-        review_start = record.created_at
-        review_end = record.updated_at
-        person_start = min(event.start_time for event in events.values())
-        person_end = max(event.end_time for event in events.values())
-        if (
-            review_end <= review_start
-            or person_end <= person_start
-            or person_end <= review_start
-            or person_start >= review_end
-        ):
-            raise MediaError("invalid_review_time")
-        person_duration = person_end - person_start
-        edge = min(0.2, person_duration * 0.05)
-        first = person_start + edge
-        last = person_end - edge
-        candidates = tuple(
-            first + (last - first) * ratio / 10 for ratio in range(1, 10)
-        )
-        if len(candidates) != 9 or not first < last:
-            raise MediaError("review_too_short")
-        if motion_paths:
-            paths = [
-                motion_paths[event_id]
-                for event_id in events
-                if event_id in motion_paths
-            ]
-            selected = select_motion_times(paths, lower=first, upper=last)
-            if selected is not None:
-                return EvidencePlan(
-                    mode="review_six",
-                    first_time=first,
-                    last_time=last,
-                    postroll_time=person_end + 2.8,
-                    selection_source="path_motion",
-                    motion_times=selected,
-                )
-        return EvidencePlan(
-            mode="review_six",
-            first_time=first,
-            change_candidates=candidates,
-            last_time=last,
-            postroll_time=person_end + 2.8,
-            selection_source="image_change",
-        )
-
-    if record.source is not ActivitySource.DOOR_CYCLE:
         raise MediaError("unsupported_activity_source")
-    if len(record.detection_ids) not in {1, 2}:
-        raise MediaError("ambiguous_segment_count")
-    tracks: dict[str, list[tuple[float, tuple[str, ...]]]] = {
-        event_id: [] for event_id in record.detection_ids
-    }
-    for event_id, occurred_at, zones in record.detection_zone_updates:
-        if event_id in tracks:
-            tracks[event_id].append((occurred_at, zones))
-    if set(events) != set(record.detection_ids):
+    if not events or set(events) != set(record.detection_ids):
         raise MediaError("event_window_missing")
-
-    if len(record.detection_ids) == 2:
-        segments: list[tuple[float, float, float]] = []
-        ordered_ids = sorted(
-            record.detection_ids, key=lambda value: events[value].start_time
-        )
-        directions: list[str] = []
-        for event_id in ordered_ids:
-            updates = sorted(tracks[event_id])
-            observations = [value[0] for value in updates]
-            window = events[event_id]
-            if any(
-                value < window.start_time or value > window.end_time
-                for value in observations
-            ):
-                raise MediaError("event_timeline_outside_window")
-            distinct = sorted(set(observations))
-            if len(distinct) < 2:
-                directions.append("ambiguous")
-                continue
-            directions.append(infer_direction(anchor_sequence(updates, roles)))
-            segments.append(
-                _strict_three(
-                    (
-                        max(window.start_time, distinct[0]),
-                        *distinct[1:-1],
-                        min(window.end_time, distinct[-1]),
-                    )
-                )
+    review_start = record.created_at
+    review_end = record.updated_at
+    person_start = min(event.start_time for event in events.values())
+    person_end = max(event.end_time for event in events.values())
+    if (
+        review_end <= review_start
+        or person_end <= person_start
+        or person_end <= review_start
+        or person_start >= review_end
+    ):
+        raise MediaError("invalid_review_time")
+    person_duration = person_end - person_start
+    edge = min(0.2, person_duration * 0.05)
+    first = person_start + edge
+    last = person_end - edge
+    candidates = tuple(
+        first + (last - first) * ratio / 10 for ratio in range(1, 10)
+    )
+    if len(candidates) != 9 or not first < last:
+        raise MediaError("review_too_short")
+    if motion_paths:
+        paths = [
+            motion_paths[event_id] for event_id in events if event_id in motion_paths
+        ]
+        selected = select_motion_times(paths, lower=first, upper=last)
+        if selected is not None:
+            return EvidencePlan(
+                mode="review_six",
+                first_time=first,
+                last_time=last,
+                postroll_time=person_end + 2.8,
+                selection_source="path_motion",
+                motion_times=selected,
             )
-        if directions == ["outbound", "inbound"] and len(segments) == 2:
-            samples = tuple(value for segment in segments for value in segment)
-            if tuple(sorted(set(samples))) == samples:
-                return EvidencePlan(
-                    mode="door_roundtrip",
-                    sample_times=samples,
-                    selection_source="zone_anchor",
-                )
-        fallback = _conservative_door_plan(tracks, roles)
-        if fallback is None:
-            raise MediaError("direction_ambiguous")
-        return fallback
-
-    event_id = record.detection_ids[0]
-    updates = sorted(tracks[event_id])
-    direction = infer_direction(anchor_sequence(updates, roles))
-    times = _visible_sample_times(updates, roles)
-    window = events[event_id]
-    if any(value < window.start_time or value > window.end_time for value in times):
-        raise MediaError("event_timeline_outside_window")
-    if direction in {"outbound", "inbound"}:
-        return EvidencePlan(
-            mode="door_single",
-            sample_times=_strict_three(times),
-            selection_source="zone_anchor",
-        )
-    if direction != "roundtrip" or len(times) < 3:
-        fallback = _conservative_door_plan({event_id: updates}, roles)
-        if fallback is None:
-            raise MediaError("direction_ambiguous")
-        return fallback
-    far_indexes = [
-        index
-        for index, (_, zones) in enumerate(updates)
-        if roles.classify(zones) == "far"
-    ]
-    if not far_indexes:
-        raise MediaError("direction_ambiguous")
-    pivot_index = far_indexes[0]
-    # `times` is the anchor sequence, where consecutive same-role samples are
-    # collapsed, while `pivot_index` was computed over `updates`, which keeps
-    # every sample. Indexing one list with the other's position lands early
-    # whenever a role repeats (a duplicated far sample, for instance), so the
-    # pivot is located in the list actually being sliced.
-    pivot_time = updates[pivot_index][0]
-    if pivot_time not in times:
-        raise MediaError("direction_ambiguous")
-    pivot_index = times.index(pivot_time)
-    before_times = times[: pivot_index + 1]
-    after_times = times[pivot_index + 1 :]
-    # Two anchors per leg are enough: _strict_three derives the middle frame.
-    # Demanding three rejected legs the helper handles, failing cycles that had
-    # a usable outbound/return split.
-    if len(before_times) < 2 or len(after_times) < 2:
-        raise MediaError("insufficient_reversal_anchors")
-    before = _strict_three(before_times)
-    after = _strict_three(after_times)
-    samples = (*before, *after)
-    if tuple(sorted(set(samples))) != samples:
-        raise MediaError("invalid_sample_order")
     return EvidencePlan(
-        mode="door_roundtrip",
-        sample_times=samples,
-        selection_source="zone_anchor",
+        mode="review_six",
+        first_time=first,
+        change_candidates=candidates,
+        last_time=last,
+        postroll_time=person_end + 2.8,
+        selection_source="image_change",
     )
 
 

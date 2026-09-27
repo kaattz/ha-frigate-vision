@@ -395,8 +395,6 @@ class VisionClient:
             raise VisionError("activity_missing")
         if record.stage is not ActivityStage.EVIDENCE_READY:
             raise VisionError("stage_conflict")
-        if record.processing_mode.value == "observe":
-            raise VisionError("observe_llm_forbidden")
         if record.evidence_path is None or record.evidence_mode is None:
             raise VisionError("evidence_incomplete")
         exists = await self._hass.async_add_executor_job(
@@ -460,8 +458,6 @@ class VisionClient:
                 evidence_path=record.evidence_path,
                 evidence_mode=record.evidence_mode,
                 allowed=allowed,
-                door_remained_open=record.door_remained_open,
-                opening_side=record.opening_side,
             )
         except VisionError as exc:
             await self._store.async_transition(
@@ -680,8 +676,6 @@ async def async_analyze(
     evidence_path: str,
     evidence_mode: str,
     allowed: set[str],
-    door_remained_open: bool | None = None,
-    opening_side: str = "unknown",
 ) -> tuple[str, str, int, str]:
     """Analyse one contact sheet.
 
@@ -711,10 +705,7 @@ async def async_analyze(
             # Only the signals this scene declared are passed on; the rest are
             # dropped here rather than filtered inside the scene, so an
             # undeclared input never reaches the renderer at all.
-            signals={
-                "door_remained_open": door_remained_open,
-                "opening_side": opening_side,
-            },
+            signals={},
             scene_description=config.scene_description,
             scene_labels=custom_labels,
             prompt_override=config.prompt_override,

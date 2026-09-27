@@ -7,7 +7,6 @@ from custom_components.frigate_vision.models import (
     ActivityRecord,
     ActivitySource,
     ActivityStage,
-    ProcessingMode,
 )
 from custom_components.frigate_vision.store import (
     ActivityStore,
@@ -26,7 +25,6 @@ async def test_state_machine_rejects_skipped_analysis_stage(
             entry_id="entry_1",
             source=ActivitySource.STANDALONE_REVIEW,
             stage=ActivityStage.EVIDENCE_READY,
-            processing_mode=ProcessingMode.LIVE,
             created_at=1,
             updated_at=1,
             camera="front",

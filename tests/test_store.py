@@ -13,7 +13,6 @@ from custom_components.frigate_vision.models import (
     IngressKind,
     IngressMessage,
     ModelValidationError,
-    ProcessingMode,
     analysis_key,
 )
 from custom_components.frigate_vision.store import (
@@ -26,9 +25,8 @@ def _record() -> ActivityRecord:
     return ActivityRecord(
         activity_id="activity_1",
         entry_id="entry_1",
-        source=ActivitySource.DOOR_CYCLE,
+        source=ActivitySource.STANDALONE_REVIEW,
         stage=ActivityStage.COLLECTING,
-        processing_mode=ProcessingMode.OBSERVE,
         created_at=100,
         updated_at=100,
         camera="front",

@@ -20,7 +20,6 @@ DOMAIN = "frigate_vision"
 
 # The live entry: a local router URL that matches no preset.
 LIVE = {
-    "processing_mode": "live",
     "llm_base_url": "http://192.168.166.50:7864/v1",
     "llm_api_key": "k",
     "llm_model": "Deepseek-V4.1-Flash",

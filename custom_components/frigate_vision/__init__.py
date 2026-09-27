@@ -22,7 +22,7 @@ from .repairs import async_clear_issue, async_set_issue
 from .runtime import IntegrationRuntime
 from .services import async_register_services
 
-PLATFORMS = [Platform.SELECT, Platform.SENSOR, Platform.BINARY_SENSOR, Platform.EVENT]
+PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.EVENT]
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:

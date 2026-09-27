@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 from .models import (
     ActivityRecord,
     ActivitySource,
     ActivityStage,
-    BufferedIngress,
     IngressKind,
     IngressMessage,
-    ProcessingMode,
     review_activity_id,
 )
 from .store import ActivityStore
@@ -41,45 +39,6 @@ class ZoneRoles:
             if values & configured
         ]
         return matched[0] if len(matched) == 1 else None
-
-
-@dataclass(frozen=True, slots=True)
-class ZoneAnchor:
-    occurred_at: float
-    role: str
-
-
-def anchor_sequence(
-    updates: Sequence[tuple[float, Sequence[str]]], roles: ZoneRoles
-) -> list[ZoneAnchor]:
-    anchors: list[ZoneAnchor] = []
-    for occurred_at, zones in sorted(updates, key=lambda item: item[0]):
-        role = roles.classify(zones)
-        if role is None or (anchors and anchors[-1].role == role):
-            continue
-        anchors.append(ZoneAnchor(occurred_at, role))
-    return anchors
-
-
-def infer_direction(anchors: Sequence[ZoneAnchor]) -> str:
-    """Infer a candidate direction from stable role anchors only.
-
-    REQ-6 defines the boundary, not the far zone itself: near -> non-near is
-    an outbound candidate and non-near -> near is an inbound candidate. A
-    single anchor (or a sequence that never leaves near) stays ambiguous
-    because the person may simply stand at the door.
-    """
-    roles = [anchor.role for anchor in anchors]
-    if len(roles) < 2:
-        return "ambiguous"
-    if roles[0] != "near" and roles[-1] == "near":
-        return "inbound"
-    if roles[0] == "near" and roles[-1] != "near":
-        return "outbound"
-    if roles[0] == "near" and roles[-1] == "near":
-        if any(role != "near" for role in roles[1:-1]):
-            return "roundtrip"
-    return "ambiguous"
 
 
 def find_review_owner(
@@ -112,7 +71,6 @@ class CorrelationEngine:
         *,
         entry_id: str,
         camera: str,
-        processing_mode: ProcessingMode,
         clock: Callable[[], float] = time.time,
         review_settle_seconds: float = 10,
         min_review_seconds: float = 0.0,
@@ -120,7 +78,6 @@ class CorrelationEngine:
         self._store = store
         self._entry_id = entry_id
         self._camera = camera
-        self._processing_mode = processing_mode
         self._clock = clock
         self._review_settle_seconds = review_settle_seconds
         self._min_review_seconds = min_review_seconds
@@ -196,33 +153,6 @@ class CorrelationEngine:
             )
             await self._async_attach_matching_reviews(updated)
             return updated
-        if message.kind is IngressKind.DOORBELL:
-            candidates = [
-                record
-                for record in self._store.all()
-                if record.camera == self._camera
-                and record.stage in {ActivityStage.COLLECTING, ActivityStage.SEALED}
-                and record.created_at - 30 <= message.occurred_at
-                and (
-                    record.finalization_deadline is None
-                    or message.occurred_at <= record.finalization_deadline
-                )
-            ]
-            if len(candidates) > 1:
-                raise CorrelationError("ambiguous_doorbell_ownership")
-            if candidates:
-                return await self._store.async_merge_context(
-                    candidates[0].activity_id,
-                    doorbell_at=message.occurred_at,
-                    updated_at=message.occurred_at,
-                )
-            await self._store.async_buffer_ingress(
-                message,
-                settle_after=max(self._clock(), message.occurred_at)
-                + self._review_settle_seconds
-                + 120,
-            )
-            return None
         if message.kind is not IngressKind.FRIGATE_REVIEW or message.review_id is None:
             raise CorrelationError("unsupported_ingress_kind")
         for record in self._store.all():
@@ -247,20 +177,14 @@ class CorrelationEngine:
                 message, "ambiguous_review_ownership"
             )
         if owner is not None:
-            record = await self._store.async_merge_context(
+            return await self._store.async_merge_context(
                 owner.activity_id,
                 detection_ids=message.detection_ids,
                 review_ids=(message.review_id,),
                 updated_at=message.occurred_at,
             )
-            return await self._async_attach_doorbell_context(
-                record, message.occurred_at
-            )
         await self._store.async_buffer_ingress(
-            replace(
-                message,
-                processing_mode=(message.processing_mode or self._processing_mode),
-            ),
+            message,
             settle_after=max(self._clock(), message.occurred_at)
             + self._review_settle_seconds,
         )
@@ -334,10 +258,6 @@ class CorrelationEngine:
                     ActivityStage.COMPLETED,
                     ActivityStage.FAILED,
                 }:
-                    for doorbell in self._matching_doorbells(message.occurred_at):
-                        await self._store.async_remove_buffered_ingress(
-                            doorbell.buffer_id
-                        )
                     await self._store.async_remove_buffered_ingress(buffered.buffer_id)
                     settled.append(record)
                     continue
@@ -364,9 +284,6 @@ class CorrelationEngine:
                     )
                 else:
                     record = await self._async_create_standalone(message)
-            record = await self._async_attach_doorbell_context(
-                record, message.occurred_at
-            )
             await self._store.async_remove_buffered_ingress(buffered.buffer_id)
             settled.append(record)
         return tuple(settled)
@@ -386,9 +303,7 @@ class CorrelationEngine:
                 review_ids=(message.review_id,),
                 updated_at=message.occurred_at,
             )
-            activity = await self._async_attach_doorbell_context(
-                updated, message.occurred_at
-            )
+            activity = updated
             await self._store.async_remove_buffered_ingress(buffered.buffer_id)
 
     async def _async_create_standalone(self, message: IngressMessage) -> ActivityRecord:
@@ -405,7 +320,6 @@ class CorrelationEngine:
                 else ActivitySource.STANDALONE_REVIEW
             ),
             stage=ActivityStage.SEALED,
-            processing_mode=(message.processing_mode or self._processing_mode),
             created_at=(
                 message.started_at
                 if message.started_at is not None
@@ -435,7 +349,6 @@ class CorrelationEngine:
                 else ActivitySource.STANDALONE_REVIEW
             ),
             stage=ActivityStage.FAILED,
-            processing_mode=(message.processing_mode or self._processing_mode),
             created_at=(
                 message.started_at
                 if message.started_at is not None
@@ -449,29 +362,3 @@ class CorrelationEngine:
             error_code=error_code,
         )
         return await self._store.async_create(record)
-
-    async def _async_attach_doorbell_context(
-        self, record: ActivityRecord, review_ended_at: float
-    ) -> ActivityRecord:
-        matches = self._matching_doorbells(review_ended_at)
-        if not matches:
-            return record
-        updated = await self._store.async_merge_context(
-            record.activity_id,
-            doorbell_times=tuple(matched.message.occurred_at for matched in matches),
-            updated_at=review_ended_at,
-        )
-        for matched in matches:
-            await self._store.async_remove_buffered_ingress(matched.buffer_id)
-        return updated
-
-    def _matching_doorbells(self, review_ended_at: float) -> list[BufferedIngress]:
-        return [
-            buffered
-            for buffered in self._store.buffered_ingress()
-            if buffered.message.kind is IngressKind.DOORBELL
-            and buffered.message.camera == self._camera
-            and review_ended_at - 120
-            <= buffered.message.occurred_at
-            <= review_ended_at + 10
-        ]

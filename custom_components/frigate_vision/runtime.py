@@ -12,19 +12,10 @@ from enum import StrEnum
 from typing import TypeVar, cast
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import Event, EventStateChangedData, HomeAssistant
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.core import HomeAssistant
 
 from .correlation import CorrelationEngine, CorrelationError, ZoneRoles
 from .delivery import DeliveryManager
-from .door import (
-    DoorCycleCoordinator,
-    DoorCycleError,
-    DoorMapping,
-    async_subscribe_lock,
-    contact_is_open,
-    doorbell_message,
-)
 from .frigate import (
     FrigateApiError,
     FrigateClient,
@@ -37,10 +28,8 @@ from .media import MediaError, MediaManager
 from .media_source import async_default_media_root
 from .models import (
     ActivityRecord,
-    ActivitySource,
     ActivityStage,
     IngressMessage,
-    ProcessingMode,
     is_provider_side_failure,
 )
 from .repairs import (
@@ -64,8 +53,6 @@ MEDIA_RETRY_SECONDS = 5.0
 MEDIA_RETRY_ATTEMPTS = 3
 IN_PROGRESS_RETRY_SECONDS = 10.0
 IN_PROGRESS_RETRY_ATTEMPTS = 18
-DOOR_OPEN_WATCHDOG_SECONDS = 1800.0
-DOOR_OPEN_WATCHDOG_INTERVAL_SECONDS = 60.0
 CLEANUP_INTERVAL_SECONDS = 86400.0
 ANALYSIS_PRECHECK_RETRY_SECONDS = 30.0
 SAFE_ANALYSIS_PRECHECK_ERRORS = {
@@ -89,11 +76,8 @@ class QueueFullError(RuntimeError):
 class RecoveryAction(StrEnum):
     """Deterministic handoff for safe persisted stages."""
 
-    RESTORE_DOOR_CYCLE = "restore_door_cycle"
     FINALIZE_SEALED = "finalize_sealed"
-    COMPLETE_OBSERVE = "complete_observe"
     CONTINUE_ANALYSIS = "continue_analysis"
-    COMPLETE_SHADOW = "complete_shadow"
     CONTINUE_DELIVERY = "continue_delivery"
 
 
@@ -110,28 +94,16 @@ def build_recovery_work(
     """Map safe persisted stages to downstream work without executing effects."""
     work: list[RecoveryWork] = []
     for record in records:
-        if record.stage is ActivityStage.COLLECTING:
-            action = RecoveryAction.RESTORE_DOOR_CYCLE
-            run_at = now
-        elif record.stage is ActivityStage.SEALED:
+        if record.stage is ActivityStage.SEALED:
             if record.finalization_deadline is None:
                 raise RuntimeError("recovery_deadline_missing")
             action = RecoveryAction.FINALIZE_SEALED
             run_at = record.finalization_deadline
         elif record.stage is ActivityStage.EVIDENCE_READY:
-            action = (
-                RecoveryAction.COMPLETE_OBSERVE
-                if record.processing_mode is ProcessingMode.OBSERVE
-                else RecoveryAction.CONTINUE_ANALYSIS
-            )
+            action = RecoveryAction.CONTINUE_ANALYSIS
             run_at = now
         elif record.stage is ActivityStage.ANALYSIS_DONE:
-            if record.processing_mode is ProcessingMode.SHADOW:
-                action = RecoveryAction.COMPLETE_SHADOW
-            elif record.processing_mode is ProcessingMode.LIVE:
-                action = RecoveryAction.CONTINUE_DELIVERY
-            else:
-                raise RuntimeError("invalid_recovery_mode")
+            action = RecoveryAction.CONTINUE_DELIVERY
             run_at = now
         else:
             continue
@@ -228,17 +200,14 @@ class IntegrationRuntime:
     store: ActivityStore
     queue: EntryRuntime[object]
     last_error: str | None = None
-    door_coordinator: DoorCycleCoordinator | None = None
     unsubscribe_callbacks: list[Callable[[], None]] | None = None
     correlation: CorrelationEngine | None = None
     frigate_client: FrigateClient | None = None
-    contact_open: bool | None = None
     settlement_tasks: dict[str, asyncio.Task[None]] | None = None
     recovery_work: tuple[RecoveryWork, ...] = ()
     media_manager: MediaManager | None = None
     media_tasks: dict[str, asyncio.Task[None]] | None = None
     cleanup_task: asyncio.Task[None] | None = None
-    door_watchdog_task: asyncio.Task[None] | None = None
     stopping: bool = False
     vision: VisionClient | None = None
     analysis_tasks: dict[str, asyncio.Task[None]] | None = None
@@ -259,27 +228,11 @@ class IntegrationRuntime:
 
         correlation: CorrelationEngine | None = None
         frigate_data = entry.data.get("frigate")
-        active_id: str | None = None
         if isinstance(frigate_data, dict) and frigate_data:
-            collecting = [
-                record
-                for record in recovered
-                if record.entry_id == entry.entry_id
-                and record.camera == frigate_data["camera"]
-                and record.source is ActivitySource.DOOR_CYCLE
-                and record.stage is ActivityStage.COLLECTING
-            ]
-            if len(collecting) > 1:
-                raise RuntimeError("multiple_collecting_cycles")
-            if collecting:
-                active_id = collecting[0].activity_id
             correlation = CorrelationEngine(
                 store,
                 entry_id=entry.entry_id,
                 camera=frigate_data["camera"],
-                processing_mode=ProcessingMode(
-                    entry.options.get("processing_mode", "observe")
-                ),
                 min_review_seconds=float(entry.options.get("min_review_seconds", 0)),
             )
 
@@ -330,119 +283,6 @@ class IntegrationRuntime:
                 async_set_issue(hass, entry.entry_id, recovered_record.error_code)
         try:
             await queue.async_start()
-            door_data = entry.data.get("door")
-            if (
-                isinstance(door_data, dict)
-                and door_data
-                and isinstance(frigate_data, dict)
-            ):
-                mapping = DoorMapping(
-                    action_attribute=door_data["action_attribute"],
-                    open_values=frozenset(door_data["open_values"]),
-                    close_values=frozenset(door_data["close_values"]),
-                    side_attribute=door_data["side_attribute"],
-                    inside_values=frozenset(door_data["inside_values"]),
-                    outside_values=frozenset(door_data["outside_values"]),
-                )
-                coordinator = DoorCycleCoordinator(
-                    store,
-                    entry_id=entry.entry_id,
-                    camera=frigate_data["camera"],
-                    processing_mode=ProcessingMode(
-                        entry.options.get("processing_mode", "observe")
-                    ),
-                    active_id=active_id,
-                )
-                runtime.door_coordinator = coordinator
-                runtime._start_door_watchdog(entry)
-
-                async def handle_door(
-                    action: str, side: str, occurred_at: float
-                ) -> None:
-                    try:
-                        if action == "open":
-                            result = await coordinator.async_open(occurred_at, side)
-                            if runtime.contact_open is True:
-                                await coordinator.async_contact(True, occurred_at)
-                            if correlation is not None:
-                                await correlation.async_replay_for_activity(
-                                    result.record.activity_id
-                                )
-                        else:
-                            result = await coordinator.async_close(occurred_at)
-                            runtime._schedule_media(entry, result.record)
-                        runtime.clear_error("door_mapping_invalid")
-                        runtime.clear_error("door_open_too_long")
-                    except (DoorCycleError, CorrelationError) as exc:
-                        runtime.last_error = str(exc)
-
-                runtime.unsubscribe_callbacks.append(
-                    async_subscribe_lock(
-                        hass,
-                        door_data["event_entity_id"],
-                        mapping,
-                        handle_door,
-                        lambda exc: runtime.record_error("door_mapping_invalid"),
-                    )
-                )
-                doorbell_entity = door_data.get("doorbell_event_entity_id")
-                if doorbell_entity:
-
-                    async def handle_doorbell(
-                        event: Event[EventStateChangedData],
-                    ) -> None:
-                        occurred_at = event.time_fired.timestamp()
-                        attached = await coordinator.async_doorbell(occurred_at)
-                        if attached is None:
-                            queue.enqueue(
-                                doorbell_message(
-                                    entry.entry_id,
-                                    str(doorbell_entity).replace(".", "_"),
-                                    occurred_at,
-                                    frigate_data["camera"],
-                                )
-                            )
-
-                    runtime.unsubscribe_callbacks.append(
-                        async_track_state_change_event(
-                            hass, [doorbell_entity], handle_doorbell
-                        )
-                    )
-                contact_entity = door_data.get("contact_entity_id")
-                if contact_entity:
-                    current_contact = hass.states.get(contact_entity)
-                    if current_contact is not None:
-                        runtime.contact_open = contact_is_open(current_contact.state)
-                        if runtime.contact_open is None:
-                            runtime.last_error = "door_contact_unavailable"
-                        else:
-                            if runtime.last_error == "door_contact_unavailable":
-                                runtime.last_error = None
-                            if active_id is not None:
-                                await coordinator.async_contact(
-                                    runtime.contact_open, time.time()
-                                )
-
-                    async def handle_contact(
-                        event: Event[EventStateChangedData],
-                    ) -> None:
-                        new_state = event.data.get("new_state")
-                        if new_state is not None:
-                            runtime.contact_open = contact_is_open(new_state.state)
-                            if runtime.contact_open is None:
-                                runtime.last_error = "door_contact_unavailable"
-                                return
-                            if runtime.last_error == "door_contact_unavailable":
-                                runtime.last_error = None
-                            await coordinator.async_contact(
-                                runtime.contact_open, event.time_fired.timestamp()
-                            )
-
-                    runtime.unsubscribe_callbacks.append(
-                        async_track_state_change_event(
-                            hass, [contact_entity], handle_contact
-                        )
-                    )
             zones_data = entry.data.get("zones")
             if isinstance(frigate_data, dict) and isinstance(zones_data, dict):
                 client = await FrigateClient.async_create(hass, frigate_data)
@@ -521,8 +361,6 @@ class IntegrationRuntime:
                     int(entry.options.get("media_retention_days", 7)),
                 )
             if correlation is not None:
-                if active_id is not None:
-                    await correlation.async_replay_for_activity(active_id)
                 for buffered in store.buffered_ingress():
                     runtime._schedule_ingress_settlement(entry, buffered.message)
             if runtime.media_manager is not None:
@@ -533,14 +371,6 @@ class IntegrationRuntime:
                         runtime._schedule_analysis(entry, record)
                     elif (
                         record.stage is ActivityStage.ANALYSIS_DONE
-                        and record.processing_mode is ProcessingMode.SHADOW
-                    ):
-                        await store.async_complete_mode(
-                            record.activity_id, mode="shadow", updated_at=time.time()
-                        )
-                    elif (
-                        record.stage is ActivityStage.ANALYSIS_DONE
-                        and record.processing_mode is ProcessingMode.LIVE
                         and runtime.delivery is not None
                     ):
                         await runtime.delivery.async_start(record.activity_id)
@@ -709,33 +539,6 @@ class IntegrationRuntime:
             )
         )
 
-    def _start_door_watchdog(self, entry: ConfigEntry) -> None:
-        coordinator = self.door_coordinator
-        if coordinator is None or self.door_watchdog_task is not None:
-            return
-
-        async def watchdog_loop() -> None:
-            while not self.stopping:
-                await asyncio.sleep(DOOR_OPEN_WATCHDOG_INTERVAL_SECONDS)
-                if self.stopping:
-                    return
-                try:
-                    result = await coordinator.async_abandon_stale_open(
-                        time.time(),
-                        threshold=DOOR_OPEN_WATCHDOG_SECONDS,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self.last_error = str(exc)
-                    continue
-                if result is not None:
-                    self.record_error("door_open_too_long")
-
-        self.door_watchdog_task = entry.async_create_background_task(
-            self.hass,
-            watchdog_loop(),
-            f"{entry.domain}-{entry.entry_id}-door-watchdog",
-        )
-
     def _start_periodic_cleanup(self, entry: ConfigEntry, retention_days: int) -> None:
         if self.media_manager is None or self.cleanup_task is not None:
             return
@@ -765,27 +568,13 @@ class IntegrationRuntime:
         async def analyze() -> None:
             if self.stopping:
                 return
-            if record.processing_mode is ProcessingMode.OBSERVE:
-                try:
-                    await self.store.async_complete_mode(
-                        record.activity_id, mode="observe", updated_at=time.time()
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self.last_error = str(exc)
-                return
             while not self.stopping:
                 if self.vision is None:
                     error = VisionError("vision_not_configured")
                 else:
                     try:
                         analyzed = await self.vision.async_analyze(record.activity_id)
-                        if analyzed.processing_mode is ProcessingMode.SHADOW:
-                            await self.store.async_complete_mode(
-                                analyzed.activity_id,
-                                mode="shadow",
-                                updated_at=time.time(),
-                            )
-                        elif self.delivery is not None:
+                        if self.delivery is not None:
                             await self.delivery.async_start(analyzed.activity_id)
                         self.clear_error("vision_not_configured")
                         # A success proves the provider is answering again, so
@@ -920,10 +709,6 @@ class IntegrationRuntime:
             self.cleanup_task.cancel()
             await asyncio.gather(self.cleanup_task, return_exceptions=True)
             self.cleanup_task = None
-        if self.door_watchdog_task is not None:
-            self.door_watchdog_task.cancel()
-            await asyncio.gather(self.door_watchdog_task, return_exceptions=True)
-            self.door_watchdog_task = None
         if self.frigate_client is not None:
             await self.frigate_client.async_close()
         if self.delivery is not None:

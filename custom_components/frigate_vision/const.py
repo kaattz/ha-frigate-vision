@@ -8,7 +8,6 @@ DOMAIN = "frigate_vision"
 
 AUTH_NONE = "none"
 AUTH_NATIVE = "native"
-PROCESSING_MODES = ("observe", "shadow", "live")
 
 CONF_NAME = "name"
 CONF_BASE_URL = "base_url"

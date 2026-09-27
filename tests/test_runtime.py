@@ -19,7 +19,6 @@ from custom_components.frigate_vision.models import (
     BufferedIngress,
     IngressKind,
     IngressMessage,
-    ProcessingMode,
 )
 from custom_components.frigate_vision.runtime import (
     EntryRuntime,
@@ -114,7 +113,7 @@ def _entry(data: dict[str, object]) -> MockConfigEntry:
         domain="frigate_vision",
         title="Front Door",
         data=data,
-        options={"processing_mode": "observe"},
+        options={},
         entry_id="entry_1",
     )
 
@@ -146,9 +145,8 @@ async def test_runtime_rebinds_the_unique_collecting_cycle(
     record = ActivityRecord(
         activity_id="door_entry_1_100000",
         entry_id="entry_1",
-        source=ActivitySource.DOOR_CYCLE,
+        source=ActivitySource.STANDALONE_REVIEW,
         stage=ActivityStage.COLLECTING,
-        processing_mode=ProcessingMode.OBSERVE,
         created_at=100,
         updated_at=100,
         camera="front",
@@ -195,9 +193,8 @@ async def test_runtime_rejects_multiple_recovered_collecting_cycles(
     first = ActivityRecord(
         activity_id="door_entry_1_100000",
         entry_id="entry_1",
-        source=ActivitySource.DOOR_CYCLE,
+        source=ActivitySource.STANDALONE_REVIEW,
         stage=ActivityStage.COLLECTING,
-        processing_mode=ProcessingMode.OBSERVE,
         created_at=100,
         updated_at=100,
         camera="front",
@@ -205,9 +202,8 @@ async def test_runtime_rejects_multiple_recovered_collecting_cycles(
     second = ActivityRecord(
         activity_id="door_entry_1_101000",
         entry_id="entry_1",
-        source=ActivitySource.DOOR_CYCLE,
+        source=ActivitySource.STANDALONE_REVIEW,
         stage=ActivityStage.COLLECTING,
-        processing_mode=ProcessingMode.OBSERVE,
         created_at=101,
         updated_at=101,
         camera="front",
@@ -394,22 +390,26 @@ async def test_runtime_retries_safe_buffer_settlement_failure(
 
 
 def test_recovery_work_covers_every_safe_stage_without_resetting_deadlines() -> None:
+    """Every non-terminal stage maps to exactly the work that finishes it.
+
+    The mapping changed when the door cycle and the processing modes were removed:
+    `COLLECTING` no longer has a restore action (nothing produces that stage any
+    more) and `EVIDENCE_READY` / `ANALYSIS_DONE` each have a single successor
+    rather than one per mode. The deadlines still travel untouched, which is what
+    keeps a restart from extending an activity's own finalization window.
+    """
     base = ActivityRecord(
-        activity_id="activity_collecting",
+        activity_id="activity_sealed",
         entry_id="entry_1",
-        source=ActivitySource.DOOR_CYCLE,
-        stage=ActivityStage.COLLECTING,
-        processing_mode=ProcessingMode.OBSERVE,
+        source=ActivitySource.STANDALONE_REVIEW,
+        stage=ActivityStage.SEALED,
         created_at=1,
         updated_at=1,
         camera="front",
     )
     records = (
-        base,
         replace(
             base,
-            activity_id="activity_sealed",
-            stage=ActivityStage.SEALED,
             association_deadline=10,
             finalization_deadline=20,
         ),
@@ -420,24 +420,21 @@ def test_recovery_work_covers_every_safe_stage_without_resetting_deadlines() -> 
         ),
         replace(
             base,
-            activity_id="activity_shadow",
+            activity_id="activity_done",
             stage=ActivityStage.ANALYSIS_DONE,
-            processing_mode=ProcessingMode.SHADOW,
         ),
+        # A stage with no downstream work must be skipped, not guessed at.
         replace(
             base,
-            activity_id="activity_live",
-            stage=ActivityStage.ANALYSIS_DONE,
-            processing_mode=ProcessingMode.LIVE,
+            activity_id="activity_terminal",
+            stage=ActivityStage.COMPLETED,
         ),
     )
     work = build_recovery_work(records, now=15)
     assert [(item.activity_id, item.action, item.run_at) for item in work] == [
-        ("activity_collecting", RecoveryAction.RESTORE_DOOR_CYCLE, 15),
         ("activity_sealed", RecoveryAction.FINALIZE_SEALED, 20),
-        ("activity_evidence", RecoveryAction.COMPLETE_OBSERVE, 15),
-        ("activity_shadow", RecoveryAction.COMPLETE_SHADOW, 15),
-        ("activity_live", RecoveryAction.CONTINUE_DELIVERY, 15),
+        ("activity_evidence", RecoveryAction.CONTINUE_ANALYSIS, 15),
+        ("activity_done", RecoveryAction.CONTINUE_DELIVERY, 15),
     ]
 
 
@@ -482,9 +479,8 @@ async def test_runtime_consumes_recovered_sealed_with_media_manager(
     record = ActivityRecord(
         activity_id="door_entry_1_100000",
         entry_id="entry_1",
-        source=ActivitySource.DOOR_CYCLE,
+        source=ActivitySource.STANDALONE_REVIEW,
         stage=ActivityStage.SEALED,
-        processing_mode=ProcessingMode.OBSERVE,
         created_at=100,
         updated_at=120,
         camera="front",
@@ -545,9 +541,8 @@ async def test_media_failure_during_stop_keeps_activity_sealed(
     record = ActivityRecord(
         activity_id="activity_1",
         entry_id="entry_1",
-        source=ActivitySource.DOOR_CYCLE,
+        source=ActivitySource.STANDALONE_REVIEW,
         stage=ActivityStage.SEALED,
-        processing_mode=ProcessingMode.OBSERVE,
         created_at=1,
         updated_at=2,
         camera="front",
@@ -615,7 +610,6 @@ async def test_the_runtime_loop_does_not_retry_a_spent_provider_failure(
         stage=ActivityStage.EVIDENCE_READY,
         # LIVE, not OBSERVE: an observe-mode activity short-circuits before the
         # provider is ever called, so it could not test the retry policy at all.
-        processing_mode=ProcessingMode.LIVE,
         created_at=100,
         updated_at=120,
         camera="front",
