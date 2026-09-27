@@ -670,7 +670,6 @@ def build_contact_sheet(
             )
             sheet.close()
             sheet = scaled
-        rows = len(frame_paths) // columns
         if highlight is not None:
             # Any format Pillow can decode is accepted: unlike a frame, this is
             # our own intermediate rather than something Frigate served.
@@ -691,15 +690,20 @@ def build_contact_sheet(
             # person LARGER (261x274 against 192x202) while also enlarging the grid,
             # which is why the placement is worth its extra height.
             #
-            # The crop is fitted to the sheet's width and the grid's height, so it is
-            # never enlarged past what the grid's own rows are and never distorted.
-            # A tall crop like the reference 249x261 is width-bound in this box and
-            # leaves bars at the sides; that is the honest cost of not stretching a
-            # body, and unlike the column case those bars cost the grid nothing.
+            # The crop is fitted to the sheet's full width and to the grid's own
+            # height, not to a single row. One row was tried first and was a
+            # regression: it caps a tall crop at ~137x144 drawn, SMALLER than the
+            # 165x173 the old side column showed, so moving the close-up below the
+            # grid would have made the thing it exists for worse. Capped at the
+            # grid's height it draws 261x274 -- 1.6x the old area -- which is what
+            # the placement is for.
+            #
+            # Fitted rather than stretched, so a body is never distorted: a tall
+            # crop like the measured 249x261 is width-bound here and leaves side
+            # bars, and unlike the old column those bars cost the grid nothing.
             try:
                 close_up = ImageOps.contain(
-                    close_up,
-                    (sheet.width, max(1, sheet.height // rows)),
+                    close_up, (sheet.width, max(1, sheet.height))
                 )
             except (OSError, UnidentifiedImageError) as exc:
                 raise MediaError("frame_decode_failed") from exc

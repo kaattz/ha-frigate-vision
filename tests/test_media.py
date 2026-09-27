@@ -308,15 +308,18 @@ def _close_up_strip_box(
 
 
 def _expected_strip_size(
-    crop_size: tuple[int, int], sheet_width: int, row_height: int
+    crop_size: tuple[int, int], sheet_width: int, grid_height: int
 ) -> tuple[int, int]:
     """The strip size the builder should produce for a crop of this shape.
 
-    The crop is fitted to (the sheet's width, one grid row's height), so a wide crop
-    is capped by the row height and a tall one by the sheet width.
+    The crop is fitted to (the sheet's width, the grid's height), so a wide crop is
+    capped by the grid height and a tall one by the sheet width. The cap is the
+    grid's height rather than a single row's: one row was tried and made the
+    close-up SMALLER than the side column it replaced -- 137x144 drawn against
+    275x288 -- which defeats the point of moving it below the grid at all.
     """
     crop_width, crop_height = crop_size
-    scale = min(sheet_width / crop_width, row_height / crop_height)
+    scale = min(sheet_width / crop_width, grid_height / crop_height)
     return max(1, round(crop_width * scale)), max(1, round(crop_height * scale))
 
 
@@ -362,8 +365,12 @@ def _assert_has_close_up_strip(
         f"grid {grid_height} ({rows} rows of {row_height})"
     )
     strip_height = sheet.height - grid_height - HIGHLIGHT_SEAM
-    assert strip_height <= row_height + 1, (
-        f"the strip is {strip_height} tall, taller than a grid row ({row_height})"
+    # The cap is the grid's own height, not a single row's. One row was tried and
+    # made the close-up smaller than the side column it replaced, so anything up to
+    # the grid's height is legitimate; past that the close-up would outgrow the
+    # frames it accompanies.
+    assert strip_height <= grid_height + 1, (
+        f"the strip is {strip_height} tall, taller than the grid ({grid_height})"
     )
     box = _close_up_strip_box(sheet.convert("RGB"), grid_height)
     left_gap = box[0]
@@ -404,8 +411,9 @@ def test_a_sheet_with_a_highlight_is_wider_and_keeps_the_cells_intact(
     build_contact_sheet(frames, plain, target_width=_TARGET_WIDTH)
     build_contact_sheet(frames, combo, highlight=highlight, target_width=_TARGET_WIDTH)
     with Image.open(plain) as plain_sheet, Image.open(combo) as combo_sheet:
-        row_height = _SCALED_HEIGHT // 3
-        strip_w, strip_h = _expected_strip_size((800, 400), _TARGET_WIDTH, row_height)
+        _strip_w, strip_h = _expected_strip_size(
+            (800, 400), _TARGET_WIDTH, _SCALED_HEIGHT
+        )
         assert combo_sheet.size == (
             _TARGET_WIDTH,
             _SCALED_HEIGHT + HIGHLIGHT_SEAM + strip_h,
@@ -453,9 +461,8 @@ def test_the_highlight_keeps_its_pixels_when_the_provider_scales_the_sheet(
     highlight.write_bytes(_solid_jpeg((1600, 400)))
     output = tmp_path / "combo.jpg"
     build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
-    row_height = _SCALED_HEIGHT // 3
     expected_w, expected_h = _expected_strip_size(
-        (1600, 400), _TARGET_WIDTH, row_height
+        (1600, 400), _TARGET_WIDTH, _SCALED_HEIGHT
     )
     with Image.open(output) as sheet:
         assert sheet.size == (
@@ -480,9 +487,8 @@ def test_a_tall_crop_is_bounded_by_the_sheet_width(tmp_path) -> None:
     highlight.write_bytes(_solid_jpeg((147, 185)))
     output = tmp_path / "combo.jpg"
     build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
-    row_height = _SCALED_HEIGHT // 3
     expected_w, expected_h = _expected_strip_size(
-        (147, 185), _TARGET_WIDTH, row_height
+        (147, 185), _TARGET_WIDTH, _SCALED_HEIGHT
     )
     with Image.open(output) as sheet:
         assert sheet.size == (
@@ -499,28 +505,58 @@ def test_a_tall_crop_is_bounded_by_the_sheet_width(tmp_path) -> None:
     assert abs(left - right) <= 2, f"not centred: {left} left against {right} right"
 
 
-def test_a_wide_crop_is_capped_by_the_row_height(tmp_path) -> None:
-    """A very wide crop is bounded by one grid row's height, not by its own width.
+def test_a_wide_crop_is_capped_by_the_grid_height(tmp_path) -> None:
+    """A very wide crop is bounded by the grid's height, not by its own width.
 
-    Letting the strip grow past a row would make the sheet taller than the frames
-    warrant, and the whole point of moving the close-up below was to stop it
-    costing the grid anything -- not to let it dominate the image instead.
+    Letting the strip grow past the grid would make the close-up outgrow the frames
+    it accompanies, and the close-up is an aid to the grid rather than the subject.
+    Capping it at the grid's height also keeps the two halves in proportion: a strip
+    as tall as the frames is already twice the area the old side column showed.
     """
     frames = _nine_frames(tmp_path)
     highlight = tmp_path / "wide.jpg"
     highlight.write_bytes(_solid_jpeg((4000, 200)))
     output = tmp_path / "combo.jpg"
     build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
-    row_height = _SCALED_HEIGHT // 3
     expected_w, expected_h = _expected_strip_size(
-        (4000, 200), _TARGET_WIDTH, row_height
+        (4000, 200), _TARGET_WIDTH, _SCALED_HEIGHT
     )
     with Image.open(output) as sheet:
         assert sheet.width == _TARGET_WIDTH, "the strip must not widen the sheet"
         strip_height = sheet.height - _SCALED_HEIGHT - HIGHLIGHT_SEAM
     assert strip_height == expected_h
-    assert strip_height <= row_height + 1, "the strip outgrew a grid row"
+    assert strip_height <= _SCALED_HEIGHT + 1, "the strip outgrew the grid"
     assert expected_w == _TARGET_WIDTH, "a very wide crop should fill the width"
+
+
+def test_a_tall_crop_is_not_shrunk_smaller_than_the_old_side_column(
+    tmp_path,
+) -> None:
+    """A tall crop must still be BIGGER than what the side column used to show.
+
+    This pins the regression that one-row capping caused. Measured on the real
+    shapes, a 249x261 crop in the strip capped at one grid row draws 137x144, while
+    the side column it replaced drew 275x288 -- so the placement the owner asked for
+    would have made the close-up smaller than before. Capped at the grid's height it
+    draws 275x288, and at the display width that is about 2.5x the old area.
+    """
+    frames = _nine_frames(tmp_path)
+    highlight = tmp_path / "person.jpg"
+    highlight.write_bytes(_solid_jpeg((249, 261)))
+    output = tmp_path / "combo.jpg"
+    build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
+    expected_w, expected_h = _expected_strip_size(
+        (249, 261), _TARGET_WIDTH, _SCALED_HEIGHT
+    )
+    with Image.open(output) as sheet:
+        box = _close_up_strip_box(sheet.convert("RGB"), _SCALED_HEIGHT)
+    drawn_w, drawn_h = box[2] - box[0], box[3] - box[1]
+    assert (drawn_w, drawn_h) == pytest.approx((expected_w, expected_h), abs=1)
+    # The old column drew the crop at 275x288 (fitted into 448 x the grid height).
+    assert drawn_h >= _SCALED_HEIGHT - 1, (
+        f"the strip drew the crop {drawn_h} tall against the grid's {_SCALED_HEIGHT}; "
+        "capping at one row would shrink it below the column it replaced"
+    )
 
 
 def test_a_broken_highlight_fails_like_a_broken_frame(tmp_path) -> None:
@@ -571,9 +607,8 @@ def test_a_composed_sheet_reaches_the_provider_unshrunk(tmp_path) -> None:
     highlight.write_bytes(_solid_jpeg((1600, 400)))
     sheet = tmp_path / "combo.jpg"
     build_contact_sheet(frames, sheet, highlight=highlight, target_width=_TARGET_WIDTH)
-    row_height = _SCALED_HEIGHT // 3
     expected_w, expected_h = _expected_strip_size(
-        (1600, 400), _TARGET_WIDTH, row_height
+        (1600, 400), _TARGET_WIDTH, _SCALED_HEIGHT
     )
     data = resize_for_provider(sheet, _TARGET_WIDTH, already_sized=True)
     with Image.open(BytesIO(data)) as sent:
