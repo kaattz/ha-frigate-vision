@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import math
 import os
@@ -448,6 +449,49 @@ def crop_person_box(
     return left, top, right, bottom
 
 
+def box_moment(
+    box: tuple[float, float, float, float],
+    points: Sequence[tuple[float, float, float]] | None,
+    *,
+    fallback_start: float,
+    fallback_end: float,
+) -> float:
+    """The instant a box describes, found from the tracked path.
+
+    Frigate hands back one box per detection, and it is NOT the box at the
+    detection's start: measured here, a 42.9-second detection started on an empty
+    hallway and the person only appeared ten seconds in. Cropping at `start_time`
+    therefore produced a close-up of the floor -- and, worse, a close-up that looks
+    like a working one until someone reads it.
+
+    `path_data` is the tracked centre per update, so the point nearest the box's
+    centre is the instant the box was measured at. Measured on a real detection the
+    distances fall monotonically to 0.057 and rise again, which is a person walking
+    towards the camera and past it -- the shape this relies on.
+
+    Each point is `(timestamp, x, y)`, matching `parse_path_data`.
+
+    The midpoint is the fallback when no path is available. It is not as precise,
+    but a detection's middle is far likelier to contain the person than its start.
+    """
+    centre_x = box[0] + box[2] / 2.0
+    centre_y = box[1] + box[3] / 2.0
+    best_distance: float | None = None
+    best_moment = (fallback_start + fallback_end) / 2.0
+    for point in points or ():
+        try:
+            moment, x, y = (float(value) for value in point)
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(moment)):
+            continue
+        distance = math.hypot(x - centre_x, y - centre_y)
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_moment = moment
+    return best_moment
+
+
 def largest_person_box(
     box_updates: Sequence[tuple[float, tuple[float, float, float, float]]],
 ) -> tuple[float, tuple[float, float, float, float]] | None:
@@ -478,6 +522,26 @@ def largest_person_box(
             best_area = area
             best = (float(timestamp), (float(box[0]), float(box[1]), width, height))
     return best
+
+
+def _crop_person_bytes(
+    frame_bytes: bytes, box: tuple[float, float, float, float]
+) -> Image.Image:
+    """Crop the person out of an in-memory frame.
+
+    The frame's own size is read rather than assumed: the box is normalised, so a
+    wrong frame size puts the crop in the wrong place. Frigate returns 637x360
+    rather than the 640x360 its configuration suggests, which is exactly why this
+    does not hardcode anything.
+    """
+    try:
+        with Image.open(io.BytesIO(frame_bytes)) as source:
+            source.load()
+            frame = source.convert("RGB")
+    except (OSError, UnidentifiedImageError) as exc:
+        raise MediaError("frame_decode_failed") from exc
+    region = crop_person_box(box, frame_size=frame.size, padding=PERSON_CROP_PADDING)
+    return frame.crop(region)
 
 
 def crop_person_from_frame(
@@ -683,6 +747,13 @@ POSTROLL_OFFSET_SECONDS = 2.8
 # objects -- the very things the close-up exists to show -- so the crop reaches
 # out past the detection on every side.
 PERSON_CROP_PADDING = 0.40
+
+# Height requested for the close-up's own frame. Frigate's snapshots come from the
+# detect stream, which this deployment runs at 640x360, so asking for more returns
+# the same pixels; asking for the native height keeps the request honest without
+# pretending there is detail that is not there. The crop is then scaled up into the
+# column, which is the whole point -- it makes the existing pixels readable.
+PERSON_HIGHLIGHT_FRAME_HEIGHT = 360
 
 # Offsets tried when a required frame falls inside a recording hole. Frigate
 # writes recordings as fixed segments that can leave sub-second (sometimes
@@ -953,16 +1024,19 @@ class MediaManager:
         )
         if found is None:
             return None
-        timestamp, box = found
-        # The frame the box was measured on. Any selected frame is a candidate;
-        # the nearest in time is the one whose pixels the box actually describes.
-        _frame_time, frame_path = min(
-            selected, key=lambda item: abs(item[0] - timestamp)
-        )
+        moment, box = found
         target = temporary / "person.jpg"
         try:
+            # The frame is fetched at the box's own moment rather than reused from
+            # the sheet. A selected frame can be tens of seconds from it -- measured
+            # on a real 42.9-second detection, the nearest selected frame was 1.6s
+            # in and showed an empty hallway, so the close-up came out as a picture
+            # of the floor. One extra snapshot is cheap next to that.
+            frame_bytes = await self._client.async_get_snapshot(
+                record.camera, moment, PERSON_HIGHLIGHT_FRAME_HEIGHT
+            )
             crop = await self._hass.async_add_executor_job(
-                crop_person_from_frame, frame_path, box
+                _crop_person_bytes, frame_bytes, box
             )
             try:
                 # `partial` because the executor takes positional arguments only.
@@ -973,7 +1047,7 @@ class MediaManager:
                 )
             finally:
                 crop.close()
-        except (MediaError, OSError, ValueError):
+        except (FrigateApiError, MediaError, OSError, ValueError):
             return None
         return target
 
@@ -1023,17 +1097,32 @@ class MediaManager:
             start_time = float(payload["start_time"])
             end_time = float(payload["end_time"])
             events[event_id] = EventWindow(event_id, start_time, end_time)
+            points: tuple[tuple[float, float, float], ...] | None = None
+            if parse_paths:
+                try:
+                    points = parse_path_data(payload)
+                except InvalidPathData as exc:
+                    raise MediaError("invalid_path_data") from exc
+                if points is not None:
+                    motion_paths[event_id] = MotionPath(start_time, end_time, points)
             box = event_box(payload)
             if box is not None:
-                found_boxes.append((start_time, box))
-            if not parse_paths:
-                continue
-            try:
-                points = parse_path_data(payload)
-            except InvalidPathData as exc:
-                raise MediaError("invalid_path_data") from exc
-            if points is not None:
-                motion_paths[event_id] = MotionPath(start_time, end_time, points)
+                # Timed at the box's own moment, not the detection's start. Frigate
+                # returns one box per detection and it is not the box at the start:
+                # measured on a real 42.9-second detection, the hallway was empty at
+                # the start and the person appeared ten seconds in. Recording the
+                # start time made the close-up crop the floor.
+                found_boxes.append(
+                    (
+                        box_moment(
+                            box,
+                            points,
+                            fallback_start=start_time,
+                            fallback_end=end_time,
+                        ),
+                        box,
+                    )
+                )
         plan = plan_evidence(record, events, self._roles, motion_paths)
         final = self._canonical_path(record)
         metadata = final.with_suffix(".json")

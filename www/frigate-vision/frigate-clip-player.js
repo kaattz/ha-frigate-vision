@@ -52,10 +52,21 @@ const UNAPPLIED = Symbol("unapplied");
 // "No clip and no sheet", shared so the two absent cases return one object.
 const EMPTY_SOURCE = { url: null, evidence: null };
 
-// The sheet is always three cells across -- `build_contact_sheet` rejects any
-// other column count -- so the overlay's geometry is fixed and can be declared
-// here rather than measured from the image.
+// The evidence sheet is built in three columns of frames, so the overlay's
+// geometry is declared here rather than measured from the image.
+//
+// The image can be wider than those three columns: when the person close-up is
+// enabled, `build_contact_sheet` appends a fourth column on the right. That column
+// is not a frame and has no offset, so it must be excluded from the overlay --
+// laying the buttons across the full width put every border in the wrong place and
+// numbered the close-up as though it were a frame.
 const SHEET_COLUMNS = 3;
+
+// Frame cells are a fixed 16:9 -- `build_contact_sheet` pastes every frame into a
+// 640x360 cell -- which is what lets the overlay work out where the frames end
+// without being told whether the close-up is on, and without duplicating the
+// close-up's column width.
+const CELL_ASPECT = 640 / 360;
 
 class FrigateClipPlayer extends HTMLElement {
   constructor() {
@@ -244,10 +255,13 @@ class FrigateClipPlayer extends HTMLElement {
           padding: 24px 16px; text-align: center; color: var(--secondary-text-color);
           font-size: 14px;
         }
-        /* The sheet is one image with a transparent grid laid over it, not six
-           separate crops. The cells in the source JPEG are exactly equal, so a
-           uniform grid lines up with them without measuring anything -- and
-           nothing can drift out of alignment while the image is loading. */
+        /* The sheet is one image with a transparent grid laid over it, not
+           separate crops. The frame cells in the source JPEG are exactly equal, so
+           a uniform grid lines up with them without measuring anything -- and
+           nothing can drift out of alignment while the image is loading.
+
+           The right inset reserves the close-up column when there is one; the
+           element sets it from the image's own proportions. */
         .evidence {
           position: relative; margin-top: 8px; border-radius: 12px;
           overflow: hidden; background: #000; line-height: 0;
@@ -433,6 +447,11 @@ class FrigateClipPlayer extends HTMLElement {
    * One `<img>` with a grid of transparent buttons over it. Cell *i* of the
    * image corresponds to `offsets[i]`: the model validates sample times as
    * sorted and strictly increasing, and the sheet is built in that same order.
+   *
+   * When the sheet carries a person close-up column it is wider than the frame
+   * grid, and the overlay has to stop short of it. Otherwise the grid is laid
+   * across the whole image, so every border lands at the wrong place and the
+   * close-up is numbered as though it were a frame.
    */
   _renderEvidence(evidence) {
     if (!this._evidence || !this._cells || !this._sheet) return;
@@ -457,6 +476,38 @@ class FrigateClipPlayer extends HTMLElement {
     this._cells.replaceChildren(...buttons);
     this._cellButtons = buttons;
     this._evidence.hidden = false;
+    this._insetFromExtraColumn();
+  }
+
+  /**
+   * Stop the overlay short of the close-up column, when the sheet has one.
+   *
+   * Derived from the image's own proportions rather than from a flag. The card is
+   * never told whether the close-up is on, and a stored sheet may predate the
+   * setting, so a flag would misalign exactly the sheets that already exist.
+   *
+   * The geometry makes it self-describing. Cells are 16:9 and stacked in rows, so
+   * with `rows` known from the offsets, the frame grid's width is
+   * `rows * cellHeight * CELL_ASPECT`, and anything wider is the close-up. The
+   * row count matters: a six-frame sheet is 1920x720, and assuming three rows
+   * there would invent a 33% inset that does not exist.
+   */
+  _insetFromExtraColumn() {
+    if (!this._cells) return;
+    const apply = () => {
+      const { naturalWidth: w, naturalHeight: h } = this._sheet;
+      const rows = Math.floor(this._offsets.length / SHEET_COLUMNS);
+      if (!w || !h || rows < 1) return;
+      const frames = (SHEET_COLUMNS * (h / rows) * CELL_ASPECT) / w;
+      // Guard against rounding putting a full-width sheet slightly over 1.
+      const inset = frames < 1 ? (1 - frames) * 100 : 0;
+      this._cells.style.right = inset ? inset.toFixed(4) + "%" : "0";
+    };
+    if (this._sheet.naturalWidth) {
+      apply();
+      return;
+    }
+    this._sheet.addEventListener("load", apply, { once: true });
   }
 
   /**
