@@ -187,3 +187,93 @@ async def test_an_unknown_repair_code_is_still_rejected(
     """The allowlist must keep rejecting codes that have no translation."""
     with pytest.raises(ValueError, match="unknown_repair_issue"):
         async_set_issue(hass, ENTRY_ID, "provider_http_503")
+
+
+async def test_a_lost_503_activity_can_actually_be_replayed(
+    hass: HomeAssistant,
+) -> None:
+    """The end-to-end promise, not just the predicate.
+
+    `retry_is_safe` returning True is only half of it: the store also has to
+    accept the record, and the resulting attempt has to land where a re-analysis
+    can pick it up. Asserting the predicate alone would pass even if the store
+    refused the handoff -- which is exactly the kind of gap that let the original
+    bug hide behind green unit tests.
+
+    The attempt must land on EVIDENCE_READY, not SEALED: the sheet still exists,
+    so the retry re-runs the model call and skips re-collecting media. Proving
+    that also proves the evidence survived, which is what makes the replay worth
+    offering at the user's request hours later.
+    """
+    from custom_components.frigate_vision.models import (
+        ActivityRecord,
+        ActivitySource,
+        ActivityStage,
+        ProcessingMode,
+    )
+    from custom_components.frigate_vision.store import ActivityStore
+
+    store = ActivityStore(hass, ENTRY_ID)
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="review_lost",
+            entry_id=ENTRY_ID,
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.FAILED,
+            processing_mode=ProcessingMode.LIVE,
+            created_at=1,
+            updated_at=2,
+            camera="front",
+            evidence_mode="review_six",
+            evidence_path="/tmp/sheet.png",
+            error_code="provider_http_503",
+        )
+    )
+
+    retry = await store.async_create_retry("review_lost", now=3)
+
+    assert retry.stage is ActivityStage.EVIDENCE_READY
+    assert retry.error_code is None, "the retry must not inherit the old failure"
+    assert retry.activity_id != "review_lost"
+    assert retry.classification is None
+
+
+async def test_a_lost_503_activity_without_evidence_is_recollected(
+    hass: HomeAssistant,
+) -> None:
+    """A replay whose sheet was already cleaned up must rebuild it.
+
+    Evidence expires on `media_retention_days` (7 by default). A user replaying a
+    week-old failure would otherwise hand the model a path that no longer exists.
+    """
+    from custom_components.frigate_vision.models import (
+        ActivityRecord,
+        ActivitySource,
+        ActivityStage,
+        ProcessingMode,
+    )
+    from custom_components.frigate_vision.store import ActivityStore
+
+    store = ActivityStore(hass, ENTRY_ID)
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="review_expired",
+            entry_id=ENTRY_ID,
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.FAILED,
+            processing_mode=ProcessingMode.LIVE,
+            created_at=1,
+            updated_at=2,
+            camera="front",
+            evidence_mode="review_six",
+            evidence_path="/tmp/gone.png",
+            evidence_expired_at=50,
+            error_code="provider_http_503",
+        )
+    )
+
+    retry = await store.async_create_retry("review_expired", now=3)
+
+    assert retry.stage is ActivityStage.SEALED, "media must be rebuilt first"
