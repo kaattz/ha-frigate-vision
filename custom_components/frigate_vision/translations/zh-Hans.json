@@ -84,8 +84,6 @@
       "invalid_url": "Frigate 地址无效",
       "invalid_auth": "原生认证必须填写用户名和密码",
       "invalid_zones": "区域列表无效",
-      "invalid_door_mapping": "门锁映射值重叠或无效",
-      "door_lock_required": "配置门磁或门铃前必须先选择门锁事件实体",
       "llm_incomplete": "接口地址与模型名称均为必填",
       "llm_missing_key": "必须填写 API 密钥",
       "label_malformed": "每行必须是「标签: 定义」，用半角冒号",

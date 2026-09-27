@@ -82,8 +82,6 @@
       "invalid_url": "Frigate URL is invalid",
       "invalid_auth": "Native authentication requires a username and password",
       "invalid_zones": "Zone lists are invalid",
-      "invalid_door_mapping": "Door mapping values overlap or are invalid",
-      "door_lock_required": "Door contact and doorbell require a lock event entity",
       "llm_incomplete": "Base URL and model are both required",
       "llm_missing_key": "An API key is required",
       "label_malformed": "Each line must be `name: definition`, with a half-width colon",

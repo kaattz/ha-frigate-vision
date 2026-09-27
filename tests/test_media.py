@@ -892,7 +892,7 @@ async def test_evidence_ready_requires_valid_registered_artifact(
         created_at=1,
         updated_at=2,
         camera="front",
-        evidence_mode="door_single",
+        evidence_mode="review_six",
         evidence_revision=1,
         evidence_path=str(tmp_path / "entry_1" / "activity_1.jpg"),
         evidence_media_url="media-source://frigate_vision/entry_1/activity_1",
@@ -918,7 +918,7 @@ async def test_evidence_ready_rejects_valid_file_outside_canonical_root(
     outside = tmp_path / "outside.jpg"
     outside.write_bytes(_jpeg(1))
     outside.with_suffix(".json").write_text(
-        '{"activity_id":"activity_1","plan_version":1,"mode":"door_single","sample_times":[1,2,3]}'
+        '{"activity_id":"activity_1","plan_version":1,"mode":"review_six","sample_times":[1,2,3]}'
     )
     store = ActivityStore(hass, "entry_1")
     await store.async_load()
@@ -931,7 +931,7 @@ async def test_evidence_ready_rejects_valid_file_outside_canonical_root(
             created_at=1,
             updated_at=2,
             camera="front",
-            evidence_mode="door_single",
+            evidence_mode="review_six",
             evidence_revision=1,
             evidence_path=str(outside),
             evidence_media_url="media-source://frigate_vision/entry_1/activity_1",
@@ -964,7 +964,7 @@ async def test_media_cleanup_deletes_only_expired_registered_files(
             created_at=1,
             updated_at=1,
             camera="front",
-            evidence_mode="door_single",
+            evidence_mode="review_six",
             evidence_revision=1,
             evidence_path=str(path),
             evidence_media_url="media-source://frigate_vision/entry_1/old",
@@ -1005,7 +1005,7 @@ async def test_cleanup_removes_registry_before_physical_delete_failure(
             created_at=1,
             updated_at=1,
             camera="front",
-            evidence_mode="door_single",
+            evidence_mode="review_six",
             evidence_revision=1,
             evidence_path=str(path),
             evidence_media_url="media-source://frigate_vision/entry_1/old",

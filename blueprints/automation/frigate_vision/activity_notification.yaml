@@ -69,7 +69,6 @@ variables:
   classification_labels:
     home_arrival: 回家
     home_departure: 离家
-    short_roundtrip: 短暂外出
     package_delivery: 快递
     food_delivery: 外卖
     cleaning: 保洁
