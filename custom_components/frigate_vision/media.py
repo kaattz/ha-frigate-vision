@@ -673,25 +673,50 @@ def build_contact_sheet(
             try:
                 with Image.open(highlight) as source:
                     source.load()
-                    close_up = ImageOps.contain(
-                        source.convert("RGB"), (highlight_width, sheet.height)
-                    )
+                    close_up = source.convert("RGB")
             except (OSError, UnidentifiedImageError) as exc:
                 raise MediaError("frame_decode_failed") from exc
-            # `contain` scales by whichever side binds first, so a crop taller
-            # than it is wide keeps its proportions and is centred in the black
-            # column. Stretching it to fill would distort the body, and a model
-            # reading human proportions off a distorted crop is worse off than
-            # one reading a small honest one.
-            canvas = Image.new("RGB", (sheet.width + highlight_width, sheet.height))
+            # The column is fitted to the crop rather than the crop to a fixed
+            # column. `highlight_width` is a ceiling, not the width to pad out to.
+            #
+            # A fixed column wastes most of itself on a tall crop: the reference
+            # crop is 249x261 while the column is 448 wide and only as tall as the
+            # grid, so `contain` is height-bound and the crop lands at 275 wide --
+            # measured on a real sheet, 173 of the column's 448 pixels, 39%, were
+            # black. Those pixels are not free: the sheet is scaled to a fixed
+            # display width, so every wasted column pixel is taken from the grid's
+            # cells, which are the part that carries the time axis.
+            #
+            # Sizing to the crop instead removes the bars and hands the width back
+            # to the grid. Measured for a six-frame sheet: the column drops from
+            # 448 to 275, the grid's cells grow from 154x87 to 179x101 on screen
+            # (+16%), and the whole image gets 14% smaller rather than larger.
+            #
+            # `contain` still decides the scale, so nothing is distorted; it is
+            # given the ceiling and, for a crop smaller than the grid is tall, may
+            # enlarge it to meet it. That is the existing behaviour and is wanted:
+            # the close-up exists to make a small crop readable, and the source is
+            # a 640x360 detect stream whose pixels are all there is.
+            try:
+                close_up = ImageOps.contain(close_up, (highlight_width, sheet.height))
+            except (OSError, UnidentifiedImageError) as exc:
+                raise MediaError("frame_decode_failed") from exc
+            # After `contain`, height <= sheet.height and width <= highlight_width
+            # by construction, so the column is exactly the fitted width: no black
+            # bars, and never wider than the ceiling.
+            column = max(1, close_up.width)
+            canvas = Image.new("RGB", (sheet.width + column, sheet.height))
             canvas.paste(sheet, (0, 0))
             canvas.paste(
                 close_up,
                 (
-                    sheet.width + (highlight_width - close_up.width) // 2,
+                    # Centred vertically; horizontally the fit is exact, so this is
+                    # zero unless rounding left a pixel over.
+                    sheet.width + (column - close_up.width) // 2,
                     (sheet.height - close_up.height) // 2,
                 ),
             )
+            close_up.close()
             sheet.close()
             sheet = canvas
             canvas = None

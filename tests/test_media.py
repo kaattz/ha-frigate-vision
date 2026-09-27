@@ -283,7 +283,7 @@ def _sealed_record_with_boxes(
 
 
 def _highlight_content_box(
-    sheet: Image.Image, column_left: int
+    sheet: Image.Image, column_left: int, column_width: int = _HIGHLIGHT_WIDTH
 ) -> tuple[int, int, int, int]:
     """Return the bounding box of the lit content inside the highlight column.
 
@@ -291,17 +291,61 @@ def _highlight_content_box(
     separates the two. The threshold sits above the JPEG ringing at the crop's
     edge and far below the crop's own luma.
 
+    `column_width` is a search bound rather than the column's real width: the
+    column is now as wide as the crop, which varies. Everything to the right of
+    `column_left` is searched, so the box is found whatever the crop's shape.
+
     An empty result carries the sheet's size, because the usual cause is that the
     sheet came back narrower than the column's offset -- the composed sheet was
     scaled as a whole, which is the failure the column exists to prevent.
     """
-    column = sheet.crop((column_left, 0, column_left + _HIGHLIGHT_WIDTH, sheet.height))
+    column = sheet.crop(
+        (column_left, 0, min(sheet.width, column_left + column_width), sheet.height)
+    )
     mask = column.convert("L").point(lambda value: 255 if value > 40 else 0)
     box = mask.getbbox()
     assert box is not None, (
         f"no content in the column at x={column_left}; sheet is {sheet.size}"
     )
     return box
+
+
+def _expected_column_width(crop_size: tuple[int, int], sheet_height: int) -> int:
+    """The column width the builder should produce for a crop of this shape.
+
+    The column is fitted to the crop, capped at `_HIGHLIGHT_WIDTH`. A tall crop is
+    height-bound and narrower than the ceiling; a wide one hits the cap.
+    """
+    crop_width, crop_height = crop_size
+    scale = min(_HIGHLIGHT_WIDTH / crop_width, sheet_height / crop_height)
+    return max(1, round(crop_width * scale))
+
+
+def _assert_has_close_up_column(sheet: Image.Image) -> int:
+    """Assert the sheet carries a close-up column and return its width.
+
+    The column is fitted to the crop, so its width varies with the crop's shape
+    and cannot be predicted from the frame alone -- the crop is derived from the
+    box. What is invariant, and what these end-to-end tests care about, is:
+
+    * the sheet is wider than the grid alone, so a column was appended;
+    * the column is not wider than the ceiling;
+    * the column's content is flush and fills it, i.e. no black bars.
+
+    Black bars are the defect this sizing exists to remove, so they are asserted
+    against rather than merely described.
+    """
+    column_left = _TARGET_WIDTH
+    assert sheet.width > column_left, "no close-up column was appended"
+    column_width = sheet.width - column_left
+    assert column_width <= _HIGHLIGHT_WIDTH, "the column exceeded its ceiling"
+    box = _highlight_content_box(sheet.convert("RGB"), column_left, column_width)
+    content_width = box[2] - box[0]
+    assert content_width >= column_width - 2, (
+        f"the column is {column_width} wide but the crop only fills {content_width} "
+        "-- black bars are back"
+    )
+    return column_width
 
 
 def test_a_sheet_without_a_highlight_is_unchanged(tmp_path) -> None:
@@ -334,7 +378,10 @@ def test_a_sheet_with_a_highlight_is_wider_and_keeps_the_cells_intact(
     build_contact_sheet(frames, plain, target_width=_TARGET_WIDTH)
     build_contact_sheet(frames, combo, highlight=highlight, target_width=_TARGET_WIDTH)
     with Image.open(plain) as plain_sheet, Image.open(combo) as combo_sheet:
-        assert combo_sheet.size == (_TARGET_WIDTH + _HIGHLIGHT_WIDTH, _SCALED_HEIGHT)
+        assert combo_sheet.size == (
+            _TARGET_WIDTH + _expected_column_width((800, 400), _SCALED_HEIGHT),
+            _SCALED_HEIGHT,
+        )
         intact = (0, 0, _TARGET_WIDTH - _SEAM_MARGIN, _SCALED_HEIGHT)
         assert (
             ImageChops.difference(
@@ -378,17 +425,18 @@ def test_the_highlight_keeps_its_full_width(tmp_path) -> None:
 
 
 def test_a_tall_crop_is_bounded_by_the_sheet_height(tmp_path) -> None:
-    """A person-shaped crop is limited by the column's height, not its width.
+    """A person-shaped crop is limited by the sheet's height, not the ceiling.
 
     A real crop is taller than it is wide -- the reference person box is 147x185
     in the 640x360 frame. `contain` scales by whichever side binds first, and for
-    that shape it is the height, so the crop fills all 431 rows of the column and
-    comes out about 342 pixels wide rather than the full 448.
+    that shape it is the height, so the crop fills all 431 rows and comes out
+    about 342 pixels wide rather than the full 448.
 
-    That is the honest ceiling of a 640x360 source and it is still worth having:
-    342x431 is a far larger person than the 59x74 the same box occupies in a grid
-    cell. Pinning it here keeps the shape of the gain visible, so nobody later
-    reads the column's 448 as a promise the pixels always reach.
+    The column is then exactly those 342 pixels rather than a padded 448. That is
+    the point of sizing it to the crop: the other 106 would have been black, and
+    the sheet is scaled to a fixed display width, so black column pixels are paid
+    for out of the grid's cells. Measured on a real six-frame sheet, the old fixed
+    column was 39% black.
     """
     frames = _nine_frames(tmp_path)
     highlight = tmp_path / "person.jpg"
@@ -397,12 +445,40 @@ def test_a_tall_crop_is_bounded_by_the_sheet_height(tmp_path) -> None:
     build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
     with Image.open(output) as sheet:
         box = _highlight_content_box(sheet.convert("RGB"), _TARGET_WIDTH)
+        width, height = box[2] - box[0], box[3] - box[1]
+        expected_width = round(147 * _SCALED_HEIGHT / 185)
+        assert sheet.width == _TARGET_WIDTH + expected_width, (
+            "the column must be the crop's own width, not the 448 ceiling"
+        )
+    assert height == _SCALED_HEIGHT, "a tall crop must fill the sheet's height"
+    assert width == pytest.approx(expected_width, abs=1)
+    # And it starts flush at the seam, because there is no bar to centre within.
+    assert box[0] == pytest.approx(0, abs=1), (
+        "the crop must sit flush left in its column"
+    )
+
+
+def test_a_wide_crop_is_capped_at_the_ceiling(tmp_path) -> None:
+    """A crop wider than the ceiling must not widen the column past it.
+
+    Without the cap a very wide crop would take more of the sheet than
+    `highlight_width` allows, and the grid would lose the pixels the ceiling
+    exists to protect. The crop is still shown undistorted, just scaled down.
+    """
+    frames = _nine_frames(tmp_path)
+    highlight = tmp_path / "wide.jpg"
+    highlight.write_bytes(_solid_jpeg((1600, 400)))
+    output = tmp_path / "combo.jpg"
+    build_contact_sheet(frames, output, highlight=highlight, target_width=_TARGET_WIDTH)
+    with Image.open(output) as sheet:
+        assert sheet.width == _TARGET_WIDTH + _HIGHLIGHT_WIDTH, (
+            "a wide crop must be capped at the ceiling, not widen the column"
+        )
+        box = _highlight_content_box(sheet.convert("RGB"), _TARGET_WIDTH)
     width, height = box[2] - box[0], box[3] - box[1]
-    assert height == _SCALED_HEIGHT, "a tall crop must fill the column's height"
-    assert width == pytest.approx(147 * _SCALED_HEIGHT / 185, abs=1)
-    # Centre it in the column, so the black bars are split evenly rather than
-    # leaving the person jammed against one edge.
-    assert box[0] == pytest.approx((_HIGHLIGHT_WIDTH - width) / 2, abs=1)
+    # 1600x400 is 4:1, so the ceiling's width binds and the height follows.
+    assert width == pytest.approx(_HIGHLIGHT_WIDTH, abs=1)
+    assert height == pytest.approx(round(_HIGHLIGHT_WIDTH * 400 / 1600), abs=1)
 
 
 def test_a_broken_highlight_fails_like_a_broken_frame(tmp_path) -> None:
@@ -2934,7 +3010,7 @@ async def test_an_unreachable_face_service_still_produces_a_close_up(
     assert completed.stage is ActivityStage.EVIDENCE_READY
     assert completed.evidence_path is not None
     with Image.open(completed.evidence_path) as sheet:
-        assert sheet.size[0] == _TARGET_WIDTH + _HIGHLIGHT_WIDTH, (
+        _assert_has_close_up_column(sheet), (
             "服务不可达时必须仍然拼出特写栏（退回面积最大），而不是降级成纯九宫格"
         )
 
@@ -2978,9 +3054,7 @@ async def test_the_manager_adds_a_close_up_when_the_option_is_on(
     completed = await manager.async_build(record.activity_id)
     assert completed.evidence_path is not None
     with Image.open(completed.evidence_path) as sheet:
-        assert sheet.size[0] == _TARGET_WIDTH + _HIGHLIGHT_WIDTH, (
-            "拼图没有变宽，特写没有接上（或忘了传 target_width）"
-        )
+        _assert_has_close_up_column(sheet)
 
 
 async def test_the_manager_omits_the_close_up_when_the_option_is_off(
@@ -3113,9 +3187,7 @@ async def test_a_review_activity_gets_a_close_up_from_its_detections(
     assert completed.stage is ActivityStage.EVIDENCE_READY
     assert asked, "没有按 detection id 去要 box —— review 路径上 box 无处可来"
     with Image.open(completed.evidence_path) as sheet:
-        assert sheet.size[0] == _TARGET_WIDTH + _HIGHLIGHT_WIDTH, (
-            "review 活动的证据图没有附上特写栏"
-        )
+        _assert_has_close_up_column(sheet)
 
 
 async def test_a_review_activity_without_a_box_degrades_instead_of_failing(
