@@ -2689,6 +2689,137 @@ def test_crop_person_from_frame_reads_the_real_frame_size(tmp_path) -> None:
         assert crop.size[1] < size[1]
 
 
+def test_a_face_wins_over_a_larger_box_without_one() -> None:
+    """正面帧优先于「面积最大但背对镜头」的那一帧 —— 这正是本次要修的问题。
+
+    真实数据：面积最大的 detection 取到的是背影，而四秒前的正面帧更小。
+    """
+    from custom_components.frigate_vision.media import _prefer_face
+
+    sources = [
+        ("back", (0.20, 0.30, 0.40, 0.60)),  # area 0.24, no face
+        ("front", (0.30, 0.35, 0.20, 0.30)),  # area 0.06, has a face
+    ]
+    picked = _prefer_face(sources, {"front": True, "back": False})
+    assert picked is not None
+    assert picked[0] == "front", "有正脸的帧必须胜过面积更大的背影帧"
+
+
+def test_within_faces_the_largest_box_wins() -> None:
+    """规则是「正脸且最大面积」：正脸是门槛，面积在门槛内决定。"""
+    from custom_components.frigate_vision.media import _prefer_face
+
+    sources = [
+        ("small", (0.10, 0.10, 0.20, 0.20)),  # face, area 0.04
+        ("large", (0.10, 0.10, 0.40, 0.50)),  # face, area 0.20
+    ]
+    picked = _prefer_face(sources, {"small": True, "large": True})
+    assert picked is not None
+    assert picked[0] == "large"
+
+
+def test_no_face_anywhere_falls_back_to_the_largest_box() -> None:
+    """全都检不出人脸时，退回面积最大 —— 而不是什么都不选。"""
+    from custom_components.frigate_vision.media import _prefer_face
+
+    sources = [
+        ("a", (0.10, 0.10, 0.20, 0.20)),
+        ("b", (0.10, 0.10, 0.40, 0.50)),
+    ]
+    picked = _prefer_face(sources, {"a": False, "b": False})
+    assert picked is not None
+    assert picked[0] == "b"
+
+
+def test_an_empty_answer_falls_back_to_the_largest_box() -> None:
+    """服务不可达时 answers 为空 —— 必须等同于「没开这个功能」。"""
+    from custom_components.frigate_vision.media import _prefer_face
+
+    sources = [
+        ("a", (0.10, 0.10, 0.20, 0.20)),
+        ("b", (0.10, 0.10, 0.40, 0.50)),
+    ]
+    picked = _prefer_face(sources, {})
+    assert picked is not None
+    assert picked[0] == "b", "空答案必须退回面积最大，与未启用时逐字节一致"
+
+
+def test_unasked_candidates_do_not_beat_a_confirmed_face() -> None:
+    """只问了部分候选时，没问过的算「未知」，不能压过已确认的正脸。"""
+    from custom_components.frigate_vision.media import _prefer_face
+
+    sources = [
+        ("unasked", (0.10, 0.10, 0.50, 0.60)),  # biggest, never asked about
+        ("asked", (0.10, 0.10, 0.20, 0.20)),  # has a face
+    ]
+    picked = _prefer_face(sources, {"asked": True})
+    assert picked is not None
+    assert picked[0] == "asked"
+
+
+def test_the_service_url_accepts_what_a_person_would_type() -> None:
+    """配置项要接受手输的各种写法，否则是个配置陷阱。"""
+    from custom_components.frigate_vision.faces import normalise_service_url
+
+    assert normalise_service_url("") == ""
+    assert normalise_service_url("   ") == ""
+    for typed in (
+        "http://192.168.166.50:8788",
+        "192.168.166.50:8788",
+        "http://192.168.166.50:8788/",
+        "http://192.168.166.50:8788/face",
+        "192.168.166.50:8788/face",
+    ):
+        assert normalise_service_url(typed) == "http://192.168.166.50:8788/face", typed
+
+
+async def test_an_unreachable_face_service_still_produces_a_close_up(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """人脸服务连不上时，特写照常生成 —— 它是提升项，不是关键路径。
+
+    这是整个功能的硬约束：服务没配、连不上、超时、答不上来，行为必须和
+    「没这个功能」完全一样，绝不能因此丢掉整条活动的分析。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _sealed_record_with_boxes("activity_1")
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id, "camera": camera, "label": "person",
+                "start_time": 100, "end_time": 120,
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            return [{"start_time": after - 1, "end_time": before + 1}]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+        async def async_get_event_snapshot(self, event_id, camera, height):
+            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
+
+    # A port nothing is listening on: every request fails immediately.
+    manager = MediaManager(
+        hass, store, Client(), tmp_path,
+        ZoneRoles(near=frozenset({"near"}), transition=frozenset({"mid"}),
+                  far=frozenset({"far"})),
+        person_highlight=True,
+        target_width=_TARGET_WIDTH,
+        face_service_url="http://127.0.0.1:1/face",
+    )
+    completed = await manager.async_build(record.activity_id)
+    assert completed.stage is ActivityStage.EVIDENCE_READY
+    assert completed.evidence_path is not None
+    with Image.open(completed.evidence_path) as sheet:
+        assert sheet.size[0] == _TARGET_WIDTH + _HIGHLIGHT_WIDTH, (
+            "服务不可达时必须仍然拼出特写栏（退回面积最大），而不是降级成纯九宫格"
+        )
+
+
 async def test_the_manager_adds_a_close_up_when_the_option_is_on(
     hass: HomeAssistant, tmp_path
 ) -> None:

@@ -503,6 +503,7 @@ class IntegrationRuntime:
                     roles,
                     person_highlight=media_config.person_highlight,
                     target_width=media_config.target_width,
+                    face_service_url=media_config.face_service_url,
                 )
                 await runtime.media_manager.async_restore_registry()
                 await runtime.media_manager.async_cleanup(

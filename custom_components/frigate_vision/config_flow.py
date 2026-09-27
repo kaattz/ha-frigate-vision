@@ -27,6 +27,8 @@ from .const import (
     CONF_AUTH_MODE,
     CONF_BASE_URL,
     CONF_CAMERA,
+    CONF_FACE_SERVICE_URL,
+    CONF_FACE_SERVICE_URL_DEFAULT,
     CONF_FAR_ZONES,
     CONF_LLM_API_KEY,
     CONF_LLM_BASE_URL,
@@ -168,6 +170,17 @@ def _options_schema() -> vol.Schema:
             vol.Required(
                 CONF_PERSON_HIGHLIGHT, default=CONF_PERSON_HIGHLIGHT_DEFAULT
             ): bool,
+            # 可选的人脸检测服务，用来挑【哪一帧】做特写。留空即关闭，行为与今天
+            # 完全一致：只按「检测框面积最大」选。
+            #
+            # 之所以是 URL 而不是开关：服务是用户自己另外跑的容器，「开没开」和
+            # 「在哪」是同一个问题，一个空串就回答了，不必再加一个要同步的开关。
+            #
+            # 它是【提升项】不是必须项。服务没配、连不上、超时、或答案不对时，
+            # 集成一律退回「面积最大」那条规则。
+            vol.Optional(
+                CONF_FACE_SERVICE_URL, default=CONF_FACE_SERVICE_URL_DEFAULT
+            ): selector.TextSelector(),
         }
     )
 

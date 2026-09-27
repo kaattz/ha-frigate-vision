@@ -43,6 +43,8 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from PIL import Image, UnidentifiedImageError
 
 from .const import (
+    CONF_FACE_SERVICE_URL,
+    CONF_FACE_SERVICE_URL_DEFAULT,
     CONF_PERSON_HIGHLIGHT,
     CONF_PERSON_HIGHLIGHT_DEFAULT,
     CONF_PROMPT_OVERRIDE,
@@ -129,6 +131,10 @@ class VisionConfig:
     # 证据图右侧是否附了一栏人物放大特写。默认关：关着的时候提示词与缓存键都
     # 逐字节不变，既有部署升级后行为与缓存完全不受影响。
     person_highlight: bool = CONF_PERSON_HIGHLIGHT_DEFAULT
+    # Optional OpenCV face-detection service, used only to choose which frame the
+    # close-up comes from. Empty means the largest-box rule decides alone, which
+    # is the behaviour every existing deployment already has.
+    face_service_url: str = CONF_FACE_SERVICE_URL_DEFAULT
 
     def endpoint(self) -> str:
         """Return the chat-completions URL for this base URL.
@@ -317,6 +323,7 @@ def vision_config_from(
         person_highlight=pick_flag(
             CONF_PERSON_HIGHLIGHT, CONF_PERSON_HIGHLIGHT_DEFAULT
         ),
+        face_service_url=pick(CONF_FACE_SERVICE_URL, CONF_FACE_SERVICE_URL_DEFAULT),
     )
 
 

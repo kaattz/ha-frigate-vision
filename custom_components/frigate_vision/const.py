@@ -63,6 +63,34 @@ CONF_PERSON_HIGHLIGHT_DEFAULT = False
 # the close-up with it -- the exact failure this column exists to avoid.
 PERSON_HIGHLIGHT_WIDTH = 448
 
+# Optional face-detection service, used to choose *which* frame the close-up comes
+# from. Empty by default, and empty means the close-up behaves exactly as it did
+# before this option existed.
+#
+# It is a URL rather than a switch on purpose: the service is a separate container
+# the user may or may not be running, so "where is it" and "is it on" are the same
+# question, and an empty string answers it without a second setting to keep in step.
+#
+# The value is an improvement, never a dependency. The integration's own rule --
+# the largest detection box -- always runs first and is what gets used when this is
+# unset, unreachable, slow, or wrong. Verified against a real activity: the largest
+# box was a frame of the person's back, and the face service moved the choice to a
+# frontal frame six frames earlier. With the service stopped, the same activity
+# must produce the same sheet it produces today.
+CONF_FACE_SERVICE_URL = "face_service_url"
+CONF_FACE_SERVICE_URL_DEFAULT = ""
+
+# How long to wait for one face check. The service measures ~25 ms on a real crop;
+# this is generous enough to absorb a cold start or a busy host, and short enough
+# that a wedged service cannot hold an activity's analysis open. A timeout is an
+# ordinary answer -- the largest-box choice stands.
+FACE_SERVICE_TIMEOUT = 4.0
+
+# Candidates sent for a face check. The close-up is only built once per activity
+# and these are HTTP round trips to another host, so this is deliberately small:
+# enough to cover a person walking through the frame, not the whole clip.
+FACE_SERVICE_CANDIDATES = 6
+
 # Known OpenAI-compatible endpoints, so the base URL does not have to be typed by
 # hand. That URL is the field most easily got wrong: it must be the
 # OpenAI-compatible *root*, and providers disagree about the shape. Google's is the

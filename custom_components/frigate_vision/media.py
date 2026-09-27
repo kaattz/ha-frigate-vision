@@ -19,7 +19,7 @@ from typing import Any, Protocol
 from homeassistant.core import HomeAssistant
 from PIL import Image, ImageChops, ImageOps, ImageStat, UnidentifiedImageError
 
-from .const import PERSON_HIGHLIGHT_WIDTH
+from .const import FACE_SERVICE_CANDIDATES, PERSON_HIGHLIGHT_WIDTH
 from .correlation import ZoneRoles, anchor_sequence, infer_direction
 from .frigate import FrigateApiError, event_box
 from .media_source import DATA_MEDIA_REGISTRY
@@ -451,6 +451,38 @@ def crop_person_box(
     right = min(frame_width, max(right, left + 1))
     bottom = min(frame_height, max(bottom, top + 1))
     return left, top, right, bottom
+
+
+def _prefer_face(
+    sources: Sequence[tuple[str, tuple[float, float, float, float]]],
+    has_face: Mapping[str, bool],
+) -> tuple[str, tuple[float, float, float, float]] | None:
+    """Pick the largest box among the ones whose frame shows a face.
+
+    The rule asked for is "a face, and the largest of those": a face is a gate, and
+    area decides within it. So the biggest box wins whenever it has a face, and
+    otherwise the biggest box that does -- a frame with a face but a small box
+    still beats a frame with no face and a large one, which is the whole point.
+
+    `has_face` is keyed by event id and may cover only some candidates: the caller
+    asks about a bounded number, and anything it did not ask about is treated as
+    unknown rather than as a no. Unknown loses to a confirmed face and beats
+    nothing -- so the answer is always some candidate, and a service that answered
+    nothing at all degrades to the plain largest-box choice.
+    """
+    best: tuple[str, tuple[float, float, float, float]] | None = None
+    best_area = 0.0
+    fallback: tuple[str, tuple[float, float, float, float]] | None = None
+    fallback_area = 0.0
+    for event_id, box in sources:
+        area = float(box[2]) * float(box[3])
+        if area > fallback_area:
+            fallback_area = area
+            fallback = (event_id, box)
+        if has_face.get(event_id) and area > best_area:
+            best_area = area
+            best = (event_id, box)
+    return best if best is not None else fallback
 
 
 def _pick_highlight_source(
@@ -959,6 +991,7 @@ class MediaManager:
         *,
         person_highlight: bool = False,
         target_width: int = 768,
+        face_service_url: str = "",
     ) -> None:
         self._hass = hass
         self._store = store
@@ -967,6 +1000,9 @@ class MediaManager:
         self._roles = roles
         self._person_highlight = person_highlight
         self._target_width = target_width
+        # Empty by default, and empty keeps the close-up on the largest-box rule
+        # alone -- the behaviour that exists today.
+        self._face_service_url = face_service_url
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def _async_person_highlight(
@@ -1008,14 +1044,55 @@ class MediaManager:
         found = _pick_highlight_source(recovered)
         if found is None:
             return None
-        event_id, box = found
+
+        # Fetch the snapshot for every candidate, not just the largest-box one:
+        # the face service needs alternatives to choose between, and its whole
+        # purpose is to overrule the largest-box pick. Bounded by
+        # FACE_SERVICE_CANDIDATES, and only done when a service is configured --
+        # with no service this fetches exactly one frame, as before.
+        candidates = self._face_candidates(recovered) if self._face_service_url else [
+            found
+        ]
+        frames: list[tuple[str, bytes, tuple[float, float, float, float]]] = []
+        for event_id, box in candidates:
+            try:
+                frame_bytes = await self._client.async_get_event_snapshot(
+                    event_id, record.camera, PERSON_HIGHLIGHT_FRAME_HEIGHT
+                )
+            except (FrigateApiError, OSError, ValueError):
+                continue
+            frames.append((event_id, frame_bytes, box))
+        if not frames:
+            return None
+
+        chosen = found
+        if self._face_service_url and len(frames) > 1:
+            from .faces import faces_for_frames
+
+            try:
+                has_face = await faces_for_frames(
+                    self._hass, self._face_service_url, frames
+                )
+            except Exception:  # noqa: BLE001 - the service must never break analysis
+                has_face = {}
+            if has_face:
+                by_id = {event_id: box for event_id, _bytes, box in frames}
+                picked = _prefer_face(
+                    [(event_id, by_id[event_id]) for event_id in by_id], has_face
+                )
+                if picked is not None:
+                    chosen = picked
+
+        chosen_id, chosen_box = chosen
+        chosen_bytes = next(
+            (data for event_id, data, _box in frames if event_id == chosen_id), None
+        )
+        if chosen_bytes is None:
+            return None
         target = temporary / "person.jpg"
         try:
-            frame_bytes = await self._client.async_get_event_snapshot(
-                event_id, record.camera, PERSON_HIGHLIGHT_FRAME_HEIGHT
-            )
             crop = await self._hass.async_add_executor_job(
-                _crop_person_bytes, frame_bytes, box
+                _crop_person_bytes, chosen_bytes, chosen_box
             )
             try:
                 # `partial` because the executor takes positional arguments only.
@@ -1029,6 +1106,23 @@ class MediaManager:
         except (FrigateApiError, MediaError, OSError, ValueError):
             return None
         return target
+
+    def _face_candidates(
+        self, sources: Sequence[tuple[str, tuple[float, float, float, float]]]
+    ) -> list[tuple[str, tuple[float, float, float, float]]]:
+        """The candidates to ask the face service about, largest box first.
+
+        Capped at FACE_SERVICE_CANDIDATES because each one is a snapshot fetch and
+        an HTTP round trip to another host, and this runs for every activity. The
+        largest boxes are kept because if only some can be checked, the frames with
+        the most person in them are the ones whose pose matters most.
+        """
+        ordered = sorted(
+            sources,
+            key=lambda item: float(item[1][2]) * float(item[1][3]),
+            reverse=True,
+        )
+        return ordered[:FACE_SERVICE_CANDIDATES]
 
     async def async_build(self, activity_id: str) -> ActivityRecord:
         lock = self._locks.setdefault(activity_id, asyncio.Lock())
