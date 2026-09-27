@@ -216,7 +216,7 @@
     },
     "provider_error": {
       "title": "视觉模型持续返回错误",
-      "description": "配置项 {entry_id} 收到视觉模型服务的服务端错误（5xx），因此活动不会被分析，也不会有通知。通常是模型服务过载或短暂不可用；集成已自动重试过。可在「Last error」传感器查看具体状态码，待服务恢复后用 frigate_vision.retry_failed 服务手动补跑。"
+      "description": "配置项 {entry_id} 收到视觉模型服务的错误（5xx 或 429 配额超限），因此活动不会被分析，也不会有通知。5xx 通常是模型服务过载或短暂不可用，集成已自动重试过；429 表示配额用尽，需要等待配额窗口重置或改用付费方案，集成不会自动重试。可在「Last error」传感器查看具体状态码，待服务恢复后用 frigate_vision.retry_failed 服务手动补跑。"
     },
     "frigate_unavailable": {
       "title": "Frigate 不可用",

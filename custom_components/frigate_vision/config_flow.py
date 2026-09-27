@@ -52,6 +52,7 @@ from .const import (
     DOMAIN,
     PROCESSING_MODES,
     PROVIDER_PRESETS,
+    provider_for_url,
 )
 from .scenes import parse_scene_labels
 from .vision import (
@@ -256,24 +257,18 @@ def _preset_base_url(provider: str) -> str | None:
 def _provider_for_url(base_url: str) -> str:
     """The provider a stored URL belongs to, or `custom` when none matches.
 
-    The dropdown is backed by a stored value that older entries do not have -- it
-    did not exist when they were created -- so without this the field fell through
-    to the schema default and the dialog claimed "DeepSeek" for an entry pointed at
-    a local router. A dialog that names the wrong provider is worse than no
-    dropdown: the next save would adopt that claim and rewrite the endpoint.
+    Delegates to `const.provider_for_url`, which is also what the request builder
+    uses to decide whether an endpoint accepts the `thinking` field. Two copies of
+    this comparison would be two chances to disagree, and the disagreement would
+    show up as requests that silently drop a cost control -- or that 400 on a
+    provider that rejects the key.
 
-    This deployment is exactly that case (`http://192.168.166.50:7864/v1`), which is
-    why `custom` exists as a choice at all.
+    The behaviour is unchanged from the local copy this replaced: an entry stored
+    before the dropdown existed has no provider value, so the URL is the only
+    honest signal. A dialog that names the wrong provider is worse than no
+    dropdown, because the next save adopts that claim and rewrites the endpoint.
     """
-    text = base_url.strip().rstrip("/")
-    if not text:
-        return CONF_LLM_PROVIDER_DEFAULT
-    for name, preset in PROVIDER_PRESETS.items():
-        # Compare with the trailing slash ignored, since both forms are reasonable
-        # things to have typed.
-        if preset["base_url"].rstrip("/") == text:
-            return name
-    return "custom"
+    return provider_for_url(base_url)
 
 
 def _llm_schema() -> vol.Schema:

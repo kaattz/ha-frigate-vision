@@ -836,6 +836,17 @@ def delivery_key(activity_id: str, attempt_id: str) -> str:
 PROVIDER_STATUS_PREFIX = "provider_http_"
 AUTOMATIC_RETRY_STATUSES = frozenset({502, 503, 504})
 
+# The status meaning "you are over your quota" -- measured here as a *daily*
+# free-tier cap (`...free_tier_requests, limit: 20`).
+#
+# Replayable by hand but never retried automatically, and the two halves have
+# different reasons. It is a provider-side, request-independent failure, like a
+# 5xx, so nothing was billed and a replay is safe. But it is not a burst that a
+# 26-second backoff can outlast: the window is a day, so an automatic retry would
+# burn the next window's budget instead of recovering. A person who can see the
+# quota and decide when to try again is the right actor.
+QUOTA_STATUS = 429
+
 
 def provider_status(error_code: str) -> int | None:
     """Read the HTTP status back out of a `provider_http_<status>` code.
@@ -855,6 +866,22 @@ def is_server_error(error_code: str) -> bool:
     """Whether the provider answered 5xx -- a fault on its side, not the request's."""
     status = provider_status(error_code)
     return status is not None and 500 <= status <= 599
+
+
+def is_provider_side_failure(error_code: str) -> bool:
+    """Whether the provider itself failed, so the request was never processed.
+
+    Covers 5xx and 429. Both are the provider refusing to do the work for a reason
+    that has nothing to do with the request: an internal fault, an overloaded
+    gateway, or an exhausted quota. Nothing is billed in any of them, so a replay
+    cannot duplicate a side effect -- which is what makes them safe to offer to a
+    human, and what distinguishes them from `analysis_outcome_unknown`.
+
+    This is the predicate behind the "the provider is failing and activities are
+    being lost" repair, so it must be at least as wide as anything that can
+    silently discard an activity.
+    """
+    return is_server_error(error_code) or provider_status(error_code) == QUOTA_STATUS
 
 
 def is_automatically_retryable(error_code: str) -> bool:
@@ -883,4 +910,9 @@ def retry_is_safe(error_code: str) -> bool:
         # one more attempt has weighed the cost, and the worst case is a single
         # wasted call rather than a loop.
         or is_server_error(error_code)
+        # An exhausted quota is the same shape of decision: nothing was billed, so
+        # the replay is safe, and only a human can judge when the window resets.
+        # Without this the provider's own "Please retry in 39s" advice pointed at a
+        # route the integration refused.
+        or provider_status(error_code) == QUOTA_STATUS
     )

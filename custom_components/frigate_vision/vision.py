@@ -53,6 +53,8 @@ from .const import (
     MAX_PROMPT_OVERRIDE_LENGTH,
     MAX_SCENE_DESCRIPTION_LENGTH,
     PERSON_HIGHLIGHT_WIDTH,
+    THINKING_UNSUPPORTED_PROVIDERS,
+    provider_for_url,
 )
 from .models import (
     AUTOMATIC_RETRY_STATUSES,
@@ -248,13 +250,21 @@ def build_payload(
     }
     # Sent at the body top level. The provider's own docs show this through the
     # OpenAI SDK's `extra_body`, which simply merges keys into the body; a
-    # non-OpenAI endpoint ignores the field rather than failing (verified: both
-    # configured endpoints accept an unknown field without error, so acceptance
-    # alone proves nothing -- the effect was measured separately).
-    if config.thinking == "disabled":
-        payload["thinking"] = {"type": "disabled"}
-    elif config.thinking == "enabled":
-        payload["thinking"] = {"type": "enabled"}
+    # non-OpenAI endpoint ignores the field rather than failing (verified on both
+    # configured endpoints -- acceptance alone proves nothing, so the effect was
+    # measured separately).
+    #
+    # Except on the endpoints that do NOT ignore it. Google's rejects the key with
+    # a hard 400, so for those the field is omitted and the provider's own default
+    # applies -- a working analysis at default reasoning cost, rather than a
+    # guaranteed failure. See `THINKING_UNSUPPORTED_PROVIDERS`.
+    if (
+        config.thinking in ("disabled", "enabled")
+        and provider_for_url(config.base_url) not in THINKING_UNSUPPORTED_PROVIDERS
+    ):
+        payload["thinking"] = {"type": config.thinking}
+    # `reasoning_effort` is deliberately not gated: the same endpoint that rejects
+    # `thinking` accepts this one, verified by probing rather than assumed.
     if config.reasoning_effort and config.reasoning_effort != "default":
         payload["reasoning_effort"] = config.reasoning_effort
     return payload
@@ -784,8 +794,14 @@ async def async_test_connection(
         "max_tokens": 16,
         "stream": False,
     }
-    if config.thinking == "disabled":
-        payload["thinking"] = {"type": "disabled"}
+    # The same gate as `build_payload`: a probe that sent a field the endpoint
+    # rejects would report HTTP 400 for a configuration that works perfectly, and
+    # the user would go looking at their key and model name instead.
+    if (
+        config.thinking in ("disabled", "enabled")
+        and provider_for_url(config.base_url) not in THINKING_UNSUPPORTED_PROVIDERS
+    ):
+        payload["thinking"] = {"type": config.thinking}
     if config.reasoning_effort and config.reasoning_effort != "default":
         payload["reasoning_effort"] = config.reasoning_effort
     started = time.monotonic()

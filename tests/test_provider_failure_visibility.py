@@ -277,3 +277,62 @@ async def test_a_lost_503_activity_without_evidence_is_recollected(
     retry = await store.async_create_retry("review_expired", now=3)
 
     assert retry.stage is ActivityStage.SEALED, "media must be rebuilt first"
+
+
+def test_a_quota_error_is_replayable_but_not_auto_retried() -> None:
+    """A 429 is the same *failure* class as the 503, with a different remedy.
+
+    Measured on this deployment's own provider while verifying the capability fix:
+
+        "Quota exceeded for metric:
+         generativelanguage.googleapis.com/generate_content_free_tier_requests,
+         limit: 20, model: gemini-3.8-flash
+         ... Please retry in 39.152574657s."
+
+    A *daily* free-tier cap of 20 requests. Two consequences, and both are the bug
+    this file exists for:
+
+    * It is neither 5xx nor in `retry_is_safe`, so `retry_failed` refuses it and no
+      repair is raised. An exhausted quota therefore reproduced the original
+      symptom exactly -- Frigate triggers, nothing is reported, nothing says why --
+      while the integration looked healthy.
+    * Automatic retrying is deliberately *not* added. The cap is per day, so a
+      26-second backoff cannot outlast it; retrying would spend the next window's
+      budget rather than recover. Manual replay once the window resets is the
+      honest remedy, and that is the route that was missing.
+    """
+    assert not is_server_error("provider_http_429"), (
+        "429 is not a 5xx; if this changes, the repair keyed on is_server_error "
+        "would silently start or stop covering quota errors"
+    )
+    assert not is_automatically_retryable("provider_http_429"), (
+        "a daily quota cannot be waited out by a 26-second backoff"
+    )
+    assert retry_is_safe("provider_http_429"), (
+        "but a person must be able to replay it once the window resets"
+    )
+
+
+async def test_a_quota_error_raises_a_repair(hass: HomeAssistant) -> None:
+    """The user has to be told, because the fix is not something HA can do.
+
+    Recovering from a quota error needs a human decision -- wait for the window, or
+    move to a paid plan. Without a repair the integration would quietly stop
+    analysing activities, which is indistinguishable from a quiet night.
+    """
+    store = ActivityStore(hass, ENTRY_ID)
+    await store.async_load()
+
+    async def handler(message: object) -> None:
+        return None
+
+    runtime = IntegrationRuntime(
+        hass=hass,
+        store=store,
+        queue=EntryRuntime(queue_size=1, handler=handler),
+        entry_id=ENTRY_ID,
+    )
+    runtime.record_error("provider_http_429")
+
+    registry = ir.async_get(hass)
+    assert ("frigate_vision", f"{ENTRY_ID}_provider_error") in registry.issues

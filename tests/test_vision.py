@@ -627,6 +627,31 @@ async def test_connection_probe_sends_the_thinking_toggle() -> None:
     assert "thinking" not in session.payloads[0]
 
 
+async def test_the_connection_probe_does_not_send_a_field_gemini_rejects() -> None:
+    """The probe must not fail on a configuration that works.
+
+    It sends the same body a real analysis does, so it inherited the same defect:
+    with the reasoning mode set to "disabled" it would attach `thinking`, Google
+    would answer 400, and the user testing a perfectly good key and model name
+    would be shown a failure and sent to check the wrong field.
+
+    The gate therefore has to be shared by both call sites rather than duplicated
+    in the one that was noticed first.
+    """
+    from custom_components.frigate_vision.vision import (
+        async_test_connection,
+    )
+
+    gemini = "https://generativelanguage.googleapis.com/v1beta/openai"
+    session = _FakeSession()
+    await async_test_connection(  # type: ignore[arg-type]
+        session, _config(base_url=gemini, thinking="disabled")
+    )
+    assert "thinking" not in session.payloads[0]
+    # The probe is still a probe: it must actually reach the endpoint.
+    assert session.payloads[0]["max_tokens"] == 16
+
+
 def test_a_custom_label_is_accepted_and_a_builtin_one_is_not() -> None:
     """自定义标签必须被校验器接受，内置标签必须被拒绝。
 

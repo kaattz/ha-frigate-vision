@@ -212,7 +212,7 @@
     },
     "provider_error": {
       "title": "Vision provider is answering with errors",
-      "description": "Entry {entry_id} received a server error (5xx) from the vision provider, so activities are not being analysed and no notifications are sent for them. The provider is usually overloaded or briefly unavailable; it already retried automatically. Check the 'Last error' sensor for the exact status, and use the 'frigate_vision.retry_failed' service once the provider recovers."
+      "description": "Entry {entry_id} received an error from the vision provider (5xx, or 429 quota exhausted), so activities are not being analysed and no notifications are sent for them. A 5xx is usually an overloaded or briefly unavailable provider, and was already retried automatically; a 429 means the quota is spent and needs the window to reset or a plan change, and is not retried automatically. Check the 'Last error' sensor for the exact status, and use the 'frigate_vision.retry_failed' service once the provider recovers."
     },
     "frigate_unavailable": {
       "title": "Frigate unavailable",

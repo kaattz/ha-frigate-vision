@@ -124,6 +124,55 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
 }
 # There is deliberately no "custom" entry with an empty URL: the base URL field is
 # free text and a preset only pre-fills it, so anything unlisted is typed directly.
+PROVIDER_CUSTOM = "custom"
+
+
+def provider_for_url(base_url: str) -> str:
+    """The provider a base URL belongs to, or `custom` when none matches.
+
+    Reads the URL rather than the stored provider name because the URL is what
+    actually decides which endpoint is spoken to. An entry created before the
+    provider field existed has no stored name, and a user may pick a preset and
+    then edit the URL; both would make a name-based check answer the wrong
+    question.
+    """
+    text = base_url.strip().rstrip("/")
+    if not text:
+        return CONF_LLM_PROVIDER_DEFAULT
+    for name, preset in PROVIDER_PRESETS.items():
+        # Trailing slash ignored: both forms are reasonable things to have typed.
+        if preset["base_url"].rstrip("/") == text:
+            return name
+    return PROVIDER_CUSTOM
+
+
+# Providers that reject the `thinking` body field outright.
+#
+# Google's OpenAI-compatible endpoint answers a hard HTTP 400:
+#
+#   Invalid JSON payload received. Unknown name "thinking": Cannot find field.
+#
+# That endpoint is the `gemini` preset -- this deployment's own -- and the UI
+# offers "disabled" as a Reasoning mode for every provider. Choosing it therefore
+# made *every* analysis fail with `provider_http_400`, and a 400 is not retried
+# (correctly: the request is malformed, so retrying cannot help). The option was a
+# trap rather than a cost control.
+#
+# The field is omitted for these providers instead of removing the option, so a
+# user who picks it still gets a working analysis -- at the provider's default
+# reasoning cost -- rather than a lost activity.
+#
+# Only `thinking` is listed. `reasoning_effort` is accepted by the same endpoint:
+# probed, the endpoint answered 429 on quota, and quota is checked *after*
+# validation, where `thinking` was rejected before quota was consulted. Gating a
+# field that works would remove a working cost control.
+THINKING_UNSUPPORTED_PROVIDERS = frozenset({"gemini"})
+
+# The preset whose endpoint was measured to reject the field. Kept next to the set
+# above so the two cannot drift: a rename in `PROVIDER_PRESETS` would otherwise
+# silently un-gate the provider, and the only symptom would be activities that
+# stop being analysed.
+GEMINI_PRESET = "gemini"
 
 # The deployment's own description of what the camera looks at: which door in
 # frame is a lift, where the front door is, which way a corridor leads. Optional
