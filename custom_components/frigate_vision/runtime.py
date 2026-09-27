@@ -41,8 +41,14 @@ from .models import (
     ActivityStage,
     IngressMessage,
     ProcessingMode,
+    is_server_error,
 )
-from .repairs import ISSUES, async_clear_issue, async_set_issue
+from .repairs import (
+    ISSUES,
+    PROVIDER_ERROR,
+    async_clear_issue,
+    async_set_issue,
+)
 from .store import ActivityStore
 from .vision import (
     VisionClient,
@@ -782,6 +788,11 @@ class IntegrationRuntime:
                         elif self.delivery is not None:
                             await self.delivery.async_start(analyzed.activity_id)
                         self.clear_error("vision_not_configured")
+                        # A success proves the provider is answering again, so
+                        # the outage alert comes down. Without this the repair
+                        # would outlive the outage and train the user to ignore
+                        # the list.
+                        self.clear_error(PROVIDER_ERROR)
                         return
                     except VisionError as exc:
                         error = exc
@@ -837,12 +848,38 @@ class IntegrationRuntime:
 
     def record_error(self, code: str) -> None:
         self.last_error = code
+        # A 5xx is reported under one shared repair rather than under its own
+        # status: the user's action does not depend on which digit it was, and
+        # the specific status stays on the `last_error` sensor.
+        #
+        # Without this the failure was invisible. `last_error` is memory-only and
+        # the sensor was already holding the same value from an earlier failure,
+        # so even `last_changed` did not move -- a lost activity and a quiet night
+        # looked identical from the dashboard.
+        if is_server_error(code):
+            _LOGGER.warning(
+                "Vision provider is answering with errors (%s); activities are "
+                "not being analysed",
+                code,
+            )
+            if self.entry_id:
+                async_set_issue(self.hass, self.entry_id, PROVIDER_ERROR)
+            return
         if code in ISSUES and self.entry_id:
             async_set_issue(self.hass, self.entry_id, code)
 
     def clear_error(self, code: str) -> None:
         if code in ISSUES and self.entry_id:
             async_clear_issue(self.hass, self.entry_id, code)
+        # `provider_error` is the shared alert for every 5xx, while `last_error`
+        # holds the specific status that caused it (`provider_http_503`). So
+        # clearing the shared code has to retire any recorded 5xx too, or the
+        # `Last error` sensor would keep reporting an outage that is over --
+        # which is the same stuck-value problem that made the original failure
+        # invisible.
+        if code == PROVIDER_ERROR and self.last_error is not None:
+            if is_server_error(self.last_error):
+                self.last_error = None
         if self.last_error == code:
             self.last_error = None
 

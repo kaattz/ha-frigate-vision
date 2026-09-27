@@ -32,7 +32,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -54,7 +54,13 @@ from .const import (
     MAX_SCENE_DESCRIPTION_LENGTH,
     PERSON_HIGHLIGHT_WIDTH,
 )
-from .models import ActivityRecord, ActivityStage, analysis_key
+from .models import (
+    AUTOMATIC_RETRY_STATUSES,
+    ActivityRecord,
+    ActivityStage,
+    analysis_key,
+    provider_status,
+)
 from .scenes import (
     SCENES,
     SceneRequest,
@@ -67,6 +73,23 @@ from .store import ActivityStore
 _LOGGER = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT_SECONDS = 180.0
+
+# How many times a transient provider status is attempted in total, including
+# the first try. Four attempts wait 2s + 6s + 18s = 26s between them, which is
+# short enough that an activity is still delivered while the person is likely
+# still nearby, and long enough to ride out the burst of 503s an overloaded
+# endpoint emits.
+#
+# Bounded on purpose. An uncapped loop against a provider that is down for the
+# night would never finish the activity and would keep issuing a billable request
+# every backoff interval; the cap converts that into a recorded failure the user
+# can see and replay by hand.
+PROVIDER_RETRY_ATTEMPTS = 4
+PROVIDER_RETRY_BACKOFF_SECONDS = 2.0
+# x3 rather than the usual x2: 503s from an overloaded endpoint tend to arrive in
+# a burst, so the useful signal is "has the burst passed", and the geometric
+# schedule spends its waits where that is decided.
+PROVIDER_RETRY_BACKOFF_FACTOR = 3.0
 
 # Which classifications each evidence mode may produce. Kept here because the
 # response validator enforces it: the provider has no working structured-output
@@ -528,7 +551,12 @@ async def async_request(
     config: VisionConfig,
     payload: Mapping[str, Any],
 ) -> Mapping[str, Any]:
-    """POST the payload and return the decoded body."""
+    """POST the payload and return the decoded body.
+
+    One attempt. Retrying lives in `async_request_with_retry` so that the
+    connection probe -- which a user runs by hand and which must report a status
+    immediately -- keeps answering on the first try.
+    """
     headers = {
         "Authorization": f"Bearer {config.api_key}",
         "Content-Type": "application/json",
@@ -542,8 +570,18 @@ async def async_request(
         ) as response:
             text = await response.text()
             if response.status != 200:
-                # Keep the provider's own message: it is what distinguishes a
-                # bad model name from a bad credential from a rejected field.
+                # The provider's own message is the only thing that separates an
+                # overloaded endpoint from a bad model name from a rejected
+                # field, so it is logged here and reported alongside the status.
+                # It cannot travel in the error code: that is persisted as the
+                # record's `error_code` and validation restricts it to `SAFE_ID`
+                # characters, so prose there would fail the write and downgrade a
+                # clear provider failure to `analysis_outcome_unknown`.
+                _LOGGER.warning(
+                    "Provider answered HTTP %s: %s",
+                    response.status,
+                    _summarise_provider_message(text),
+                )
                 raise VisionError(f"provider_http_{response.status}")
             try:
                 body = json.loads(text)
@@ -554,6 +592,75 @@ async def async_request(
             return body
     except _CONNECTION_ERRORS as exc:
         raise VisionError("provider_unavailable") from exc
+
+
+def _summarise_provider_message(text: str, limit: int = 300) -> str:
+    """Trim a provider error body to one log-friendly line.
+
+    Providers answer errors with JSON, HTML error pages, or nothing at all.
+    Whitespace is collapsed so a multi-line HTML page cannot flood the log, and
+    the result is bounded because the body is attacker-influenced only in the
+    sense that it comes from a remote host -- but it is remote text being written
+    to a log, so it is capped rather than trusted.
+    """
+    collapsed = " ".join(text.split())
+    if not collapsed:
+        return "(empty body)"
+    if len(collapsed) <= limit:
+        return collapsed
+    return f"{collapsed[:limit]}..."
+
+
+async def async_request_with_retry(
+    session: aiohttp.ClientSession,
+    config: VisionConfig,
+    payload: Mapping[str, Any],
+    *,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> Mapping[str, Any]:
+    """POST the payload, retrying the transient provider statuses.
+
+    Only 502/503/504 are retried: each one means the provider did not process the
+    request, so a second attempt cannot double-bill or duplicate a side effect.
+    A 500 is left alone -- the provider admits a fault but says nothing about
+    whether the request was handled, and that is the uncertainty that makes a
+    replay unsafe.
+
+    The attempt count is capped. An unbounded loop against a provider that is
+    down for the night would never finish the activity, and would keep billing a
+    request every backoff interval while it waited; a bounded one turns that into
+    a recorded failure the user can see and replay by hand.
+
+    `sleep` is injected so tests can assert the backoff schedule without serving
+    it. It defaults to `asyncio.sleep`, and every production caller omits it.
+    """
+    attempts = 0
+    while True:
+        try:
+            return await async_request(session, config, payload)
+        except VisionError as exc:
+            status = provider_status(str(exc))
+            if status not in AUTOMATIC_RETRY_STATUSES:
+                raise
+            attempts += 1
+            if attempts >= PROVIDER_RETRY_ATTEMPTS:
+                _LOGGER.warning(
+                    "Giving up on the vision provider after %s attempts (HTTP %s)",
+                    attempts,
+                    status,
+                )
+                raise
+            delay = PROVIDER_RETRY_BACKOFF_SECONDS * (
+                PROVIDER_RETRY_BACKOFF_FACTOR ** (attempts - 1)
+            )
+            _LOGGER.warning(
+                "Vision provider answered HTTP %s; retrying in %.1fs (attempt %s/%s)",
+                status,
+                delay,
+                attempts + 1,
+                PROVIDER_RETRY_ATTEMPTS,
+            )
+            await sleep(delay)
 
 
 async def async_analyze(
@@ -612,7 +719,7 @@ async def async_analyze(
     )
     payload = build_payload(config, prompt, image_bytes)
     started = time.monotonic()
-    body = await async_request(session, config, payload)
+    body = await async_request_with_retry(session, config, payload)
     elapsed = time.monotonic() - started
     classification, description, confidence = validate_response(body, allowed)
     usage = body.get("usage") if isinstance(body, Mapping) else None

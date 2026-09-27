@@ -210,6 +210,10 @@
       "title": "Vision provider unreachable",
       "description": "Entry {entry_id} cannot reach the configured vision provider."
     },
+    "provider_error": {
+      "title": "Vision provider is answering with errors",
+      "description": "Entry {entry_id} received a server error (5xx) from the vision provider, so activities are not being analysed and no notifications are sent for them. The provider is usually overloaded or briefly unavailable; it already retried automatically. Check the 'Last error' sensor for the exact status, and use the 'frigate_vision.retry_failed' service once the provider recovers."
+    },
     "frigate_unavailable": {
       "title": "Frigate unavailable",
       "description": "Entry {entry_id} cannot reach Frigate."

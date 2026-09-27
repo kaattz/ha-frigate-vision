@@ -821,12 +821,66 @@ def delivery_key(activity_id: str, attempt_id: str) -> str:
     return f"delivery:{activity_id}:{attempt_id}"
 
 
+# The prefix `async_request` builds its error code from, and the statuses it is
+# safe to try again on its own.
+#
+# 502/503/504 are the gateway-and-availability family: 503 is "busy, come back
+# later", 502/504 are an upstream that timed out or answered with nonsense. In all
+# three the provider is telling us it did not process the request, so a retry
+# cannot double-bill and cannot duplicate a side effect.
+#
+# Deliberately not "every 5xx": a 500 is the provider admitting an internal fault
+# with no statement about whether the request was processed, which is the same
+# uncertainty that makes `analysis_outcome_unknown` unsafe to replay. It stays
+# out of the automatic loop and is left to the explicit, human-initiated retry.
+PROVIDER_STATUS_PREFIX = "provider_http_"
+AUTOMATIC_RETRY_STATUSES = frozenset({502, 503, 504})
+
+
+def provider_status(error_code: str) -> int | None:
+    """Read the HTTP status back out of a `provider_http_<status>` code.
+
+    Returns None for anything that is not that shape, so a caller cannot mistake
+    an unrelated code for a status.
+    """
+    if not error_code.startswith(PROVIDER_STATUS_PREFIX):
+        return None
+    tail = error_code[len(PROVIDER_STATUS_PREFIX) :]
+    if not tail.isdigit():
+        return None
+    return int(tail)
+
+
+def is_server_error(error_code: str) -> bool:
+    """Whether the provider answered 5xx -- a fault on its side, not the request's."""
+    status = provider_status(error_code)
+    return status is not None and 500 <= status <= 599
+
+
+def is_automatically_retryable(error_code: str) -> bool:
+    """Whether a failed analysis may be tried again without a human deciding."""
+    status = provider_status(error_code)
+    return status is not None and status in AUTOMATIC_RETRY_STATUSES
+
+
 def retry_is_safe(error_code: str) -> bool:
-    return error_code in {
-        "evidence_incomplete",
-        "frigate_unavailable",
-        "unexpected_content_type",
-        "invalid_json",
-        "media_retry_exhausted",
-        "door_open_too_long",
-    }
+    return (
+        error_code
+        in {
+            "evidence_incomplete",
+            "frigate_unavailable",
+            "unexpected_content_type",
+            "invalid_json",
+            "media_retry_exhausted",
+            "door_open_too_long",
+            # The provider was never reached, so nothing can have been billed.
+            # Excluded from this set until now, which left a connection failure
+            # as the one unrecoverable transient error: it could not be replayed
+            # even by hand.
+            "provider_unavailable",
+        }
+        # Any 5xx. Wider than the automatic set on purpose: a person asking for
+        # one more attempt has weighed the cost, and the worst case is a single
+        # wasted call rather than a loop.
+        or is_server_error(error_code)
+    )
