@@ -223,6 +223,30 @@ def _nine_frames(tmp_path: Path) -> list[Path]:
     return frames
 
 
+def _sealed_review_record(activity_id: str) -> ActivityRecord:
+    """A SEALED record from a Frigate *review*, which carries no box of its own.
+
+    This is the shape that matters in practice: every activity this household has
+    recorded came from a review, not from a raw event. A review message lists
+    `detections` but no box -- the box only exists on the detection -- so this
+    record starts with `box_updates` empty and the manager has to go and ask.
+    """
+    return ActivityRecord(
+        activity_id=activity_id,
+        entry_id="entry_1",
+        source=ActivitySource.STANDALONE_REVIEW,
+        stage=ActivityStage.SEALED,
+        processing_mode=ProcessingMode.OBSERVE,
+        created_at=100,
+        updated_at=130,
+        camera="front",
+        review_ids=("review_1",),
+        detection_ids=("event_1",),
+        association_deadline=140,
+        finalization_deadline=220,
+    )
+
+
 def _sealed_record_with_boxes(
     activity_id: str,
     *,
@@ -2773,3 +2797,96 @@ async def test_the_manager_still_builds_when_no_box_was_recorded(
     assert completed.stage is ActivityStage.EVIDENCE_READY
     with Image.open(completed.evidence_path) as sheet:
         assert sheet.size[0] == 1920, "无 box 时应退回普通拼图"
+
+
+async def test_a_review_activity_gets_a_close_up_from_its_detections(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """review 活动也必须拿到特写 —— 它的 box 只能从 detection 上取。
+
+    实测发现的缺口：这个家里记录的**每一条**活动都来自 Frigate 的 review
+    （72 条 standalone_review + 11 条 manual_review，没有一条来自原始 event），
+    而 review 消息只列 `detections`、**本身不带 box** —— box 只存在于 detection
+    上。原先只有 `parse_event_payload` 记 box，于是 `box_updates` 永远是空的，
+    特写一次都没生成过，而开关看起来已经打开。
+
+    这条测试走真实路径：review 记录 -> 按 detection id 向 Frigate 要 box ->
+    裁剪 -> 拼到右侧。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _sealed_review_record("activity_1")
+    assert record.box_updates == (), "review 记录本身不带 box，这正是被测的前提"
+    await store.async_create(record)
+
+    asked: list[str] = []
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            asked.append(event_id)
+            return {
+                "id": event_id,
+                "camera": camera,
+                "label": "person",
+                "start_time": 100,
+                "end_time": 120,
+                # The box lives here, not on the review message.
+                "data": {"box": [0.30, 0.35, 0.32, 0.55]},
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            return [{"start_time": after - 1, "end_time": before + 1}]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+    manager = MediaManager(
+        hass, store, Client(), tmp_path,
+        ZoneRoles(near=frozenset({"near"}), transition=frozenset({"mid"}),
+                  far=frozenset({"far"})),
+        person_highlight=True,
+        target_width=_TARGET_WIDTH,
+    )
+    completed = await manager.async_build(record.activity_id)
+    assert completed.stage is ActivityStage.EVIDENCE_READY
+    assert asked, "没有按 detection id 去要 box —— review 路径上 box 无处可来"
+    with Image.open(completed.evidence_path) as sheet:
+        assert sheet.size[0] == _TARGET_WIDTH + _HIGHLIGHT_WIDTH, (
+            "review 活动的证据图没有附上特写栏"
+        )
+
+
+async def test_a_review_activity_without_a_box_degrades_instead_of_failing(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """detection 查不到 box（或查询失败）时降级，分析照常完成。"""
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _sealed_review_record("activity_1")
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id, "camera": camera, "label": "person",
+                "start_time": 100, "end_time": 120,
+                "data": {},  # no box
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            return [{"start_time": after - 1, "end_time": before + 1}]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+    manager = MediaManager(
+        hass, store, Client(), tmp_path,
+        ZoneRoles(near=frozenset({"near"}), transition=frozenset({"mid"}),
+                  far=frozenset({"far"})),
+        person_highlight=True,
+        target_width=_TARGET_WIDTH,
+    )
+    completed = await manager.async_build(record.activity_id)
+    assert completed.stage is ActivityStage.EVIDENCE_READY, "没有 box 不该让分析失败"
+    with Image.open(completed.evidence_path) as sheet:
+        assert sheet.size[0] == 1920, "没有 box 时应退回普通拼图"

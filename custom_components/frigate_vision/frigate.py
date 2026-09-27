@@ -294,7 +294,7 @@ def _load_payload(payload: str) -> Mapping[str, Any]:
     return value
 
 
-def _event_box(after: Mapping[str, Any]) -> tuple[float, float, float, float] | None:
+def event_box(after: Mapping[str, Any]) -> tuple[float, float, float, float] | None:
     """Return the person box from an event payload, or None when unusable.
 
     Measured on Frigate 0.17: the box lives in `after["data"]["box"]`, while the
@@ -306,6 +306,10 @@ def _event_box(after: Mapping[str, Any]) -> tuple[float, float, float, float] | 
     extra: the same message also carries the zone update that tells a door cycle
     where the person is. Rejecting the message over one malformed box would throw
     away evidence that has nothing to do with the box.
+
+    Public because there are two callers in different modules: the MQTT parser
+    here, and the media manager, which reads the same shape back from the events
+    API for activities whose own message carried no box.
     """
     data = after.get("data")
     nested = data.get("box") if isinstance(data, Mapping) else None
@@ -339,7 +343,7 @@ def parse_event_payload(
             camera=camera,
             current_zones=current,
             entered_zones=entered,
-            box=_event_box(after),
+            box=event_box(after),
         )
     except (KeyError, TypeError, ValueError, ModelValidationError) as exc:
         raise FrigatePayloadError("invalid_event_payload") from exc

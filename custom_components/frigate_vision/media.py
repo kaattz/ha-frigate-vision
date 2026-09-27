@@ -20,7 +20,7 @@ from PIL import Image, ImageChops, ImageOps, ImageStat, UnidentifiedImageError
 
 from .const import PERSON_HIGHLIGHT_WIDTH
 from .correlation import ZoneRoles, anchor_sequence, infer_direction
-from .frigate import FrigateApiError
+from .frigate import FrigateApiError, event_box
 from .media_source import DATA_MEDIA_REGISTRY
 from .models import ActivityRecord, ActivitySource, ActivityStage, media_key
 from .pathing import (
@@ -922,25 +922,35 @@ class MediaManager:
         record: ActivityRecord,
         selected: Sequence[tuple[float, Path]],
         temporary: Path,
+        recovered_boxes: Sequence[
+            tuple[float, tuple[float, float, float, float]]
+        ] = (),
     ) -> Path | None:
         """Crop the person's clearest frame, or None when that is not possible.
 
         None is the ordinary answer, not an error: the option may be off, or no box
-        may have been recorded. A missing close-up costs detail; failing the
-        analysis over it would cost the whole activity, so this degrades instead of
-        raising.
+        may be available. A missing close-up costs detail; failing the analysis
+        over it would cost the whole activity, so this degrades instead of raising.
+
+        Boxes come from the record when it has them, and otherwise from the
+        detections the caller looked up. The fallback is not a nicety: a Frigate
+        *review* carries no box of its own, and every activity this household
+        records arrives as a review, so without it the close-up was never built at
+        all while the option read as enabled.
 
         The second guard is NOT redundant with the first, and must not be removed as
-        dead code. The first rejects an empty `selected` but says nothing about
-        `box_updates`, so an activity that recorded no box -- every activity from
-        before this feature existed -- reaches `largest_person_box` with an empty
-        sequence, gets None back, and would fail to unpack it. A mutation that drops
-        this guard is caught by `test_the_manager_still_builds_when_no_box_was_recorded`
-        with `TypeError: cannot unpack non-iterable NoneType object`.
+        dead code. The first rejects an empty `selected` but says nothing about the
+        box sources, so an activity with neither recorded nor recoverable boxes
+        reaches `largest_person_box` with an empty sequence, gets None back, and
+        would fail to unpack it. A mutation that drops this guard is caught by
+        `test_the_manager_still_builds_when_no_box_was_recorded` with
+        `TypeError: cannot unpack non-iterable NoneType object`.
         """
         if not self._person_highlight or not selected:
             return None
-        found = largest_person_box(record.box_updates)
+        found = largest_person_box(record.box_updates) or largest_person_box(
+            recovered_boxes
+        )
         if found is None:
             return None
         timestamp, box = found
@@ -997,6 +1007,13 @@ class MediaManager:
             raise MediaError("stage_conflict")
         events: dict[str, EventWindow] = {}
         motion_paths: dict[str, MotionPath] = {}
+        # Boxes recovered from the detections, for activities that carry none of
+        # their own. A review message lists `detections` but has no box on it -- the
+        # box lives on the detection -- and every activity this household records
+        # arrives that way, so without this the close-up is never built even though
+        # the option is on. The payload is already being fetched below, so this
+        # costs no extra request.
+        found_boxes: list[tuple[float, tuple[float, float, float, float]]] = []
         parse_paths = record.source in {
             ActivitySource.STANDALONE_REVIEW,
             ActivitySource.MANUAL_REVIEW,
@@ -1006,6 +1023,9 @@ class MediaManager:
             start_time = float(payload["start_time"])
             end_time = float(payload["end_time"])
             events[event_id] = EventWindow(event_id, start_time, end_time)
+            box = event_box(payload)
+            if box is not None:
+                found_boxes.append((start_time, box))
             if not parse_paths:
                 continue
             try:
@@ -1193,7 +1213,9 @@ class MediaManager:
             # The close-up is built from the frame the box was measured on, not
             # from the cell it was pasted into: a cell is a third of the frame, so
             # cropping there would re-shrink the very pixels this exists to keep.
-            highlight = await self._async_person_highlight(record, selected, temporary)
+            highlight = await self._async_person_highlight(
+                record, selected, temporary, found_boxes
+            )
             if highlight is None:
                 await self._hass.async_add_executor_job(
                     build_contact_sheet, [path for _, path in selected], sheet
