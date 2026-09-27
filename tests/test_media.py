@@ -2611,63 +2611,6 @@ def test_largest_person_box_returns_none_when_nothing_is_usable() -> None:
     assert largest_person_box(((100.0, (0.1, 0.1, 0.0, 0.0)),)) is None
 
 
-def test_box_moment_finds_where_the_person_actually_was() -> None:
-    """box 的时刻要用轨迹找，不能用 detection 的 start_time。
-
-    实测发现的 bug：Frigate 每条 detection 只给一个 box，而那【不是】起始时刻的
-    box。真实的 42.9 秒 detection，起点是空走廊，人在十秒后才出现 —— 用 start
-    去配帧，特写裁出来是一张地板图（已用图证实：start 帧空无一人，中点帧人物
-    清晰且手里提着塑料袋）。
-
-    这里的点取自那条真实 detection 的 path_data，期望值与实测有人的那一帧一致。
-    """
-    from custom_components.frigate_vision.media import box_moment
-
-    box = (0.55625, 0.4305555555555556, 0.2203125, 0.55)
-    points = (
-        (1790473252.24, 0.697, 0.994),
-        (1790473252.44, 0.681, 0.992),
-        (1790473259.24, 0.681, 0.933),
-        (1790473260.04, 0.688, 0.875),
-        (1790473266.84, 0.694, 0.806),
-        (1790473280.14, 0.653, 0.761),  # nearest the box centre
-        (1790473281.54, 0.608, 0.722),
-        (1790473286.54, 0.555, 0.669),
-    )
-    moment = box_moment(
-        box, points, fallback_start=1790473250.6, fallback_end=1790473293.5
-    )
-    assert abs(moment - 1790473280.14) < 0.01
-    assert moment != 1790473250.6, "又用回了 start_time —— 那会裁到空走廊"
-
-
-def test_box_moment_falls_back_to_the_midpoint() -> None:
-    """没有轨迹时用中点，而不是起点。
-
-    中点是次优选择，但一条 detection 的中间远比起点更可能有人。
-    """
-    from custom_components.frigate_vision.media import box_moment
-
-    box = (0.2, 0.2, 0.3, 0.3)
-    assert (
-        box_moment(box, None, fallback_start=100.0, fallback_end=200.0) == 150.0
-    )
-    assert box_moment(box, (), fallback_start=100.0, fallback_end=200.0) == 150.0
-
-
-def test_box_moment_ignores_malformed_points() -> None:
-    """畸形路径点要跳过，不能让它们赢得「最近」的比较。"""
-    from custom_components.frigate_vision.media import box_moment
-
-    box = (0.0, 0.0, 1.0, 1.0)  # centre (0.5, 0.5)
-    points = (
-        (float("nan"), 0.5, 0.5),  # non-finite time
-        (10.0, float("inf"), 0.5),  # non-finite coordinate
-        (20.0, 0.51, 0.51),  # the only usable one
-    )
-    assert box_moment(box, points, fallback_start=0.0, fallback_end=100.0) == 20.0
-
-
 def test_the_sheet_and_the_budget_agree_on_the_column_width() -> None:
     """拼图用的栏宽与预算用的栏宽必须是同一个数字。
 
@@ -2772,6 +2715,9 @@ async def test_the_manager_adds_a_close_up_when_the_option_is_on(
         async def async_get_snapshot(self, camera, timestamp, height):
             return _changing_jpeg(timestamp)
 
+        async def async_get_event_snapshot(self, event_id, camera, height):
+            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
+
     manager = MediaManager(
         hass, store, Client(), tmp_path,
         ZoneRoles(near=frozenset({"near"}), transition=frozenset({"mid"}),
@@ -2809,6 +2755,9 @@ async def test_the_manager_omits_the_close_up_when_the_option_is_off(
         async def async_get_snapshot(self, camera, timestamp, height):
             return _changing_jpeg(timestamp)
 
+        async def async_get_event_snapshot(self, event_id, camera, height):
+            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
+
     manager = MediaManager(
         hass, store, Client(), tmp_path,
         ZoneRoles(near=frozenset({"near"}), transition=frozenset({"mid"}),
@@ -2842,6 +2791,9 @@ async def test_the_manager_still_builds_when_no_box_was_recorded(
 
         async def async_get_snapshot(self, camera, timestamp, height):
             return _changing_jpeg(timestamp)
+
+        async def async_get_event_snapshot(self, event_id, camera, height):
+            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
 
     manager = MediaManager(
         hass, store, Client(), tmp_path,
@@ -2897,6 +2849,9 @@ async def test_a_review_activity_gets_a_close_up_from_its_detections(
         async def async_get_snapshot(self, camera, timestamp, height):
             return _changing_jpeg(timestamp)
 
+        async def async_get_event_snapshot(self, event_id, camera, height):
+            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
+
     manager = MediaManager(
         hass, store, Client(), tmp_path,
         ZoneRoles(near=frozenset({"near"}), transition=frozenset({"mid"}),
@@ -2935,6 +2890,9 @@ async def test_a_review_activity_without_a_box_degrades_instead_of_failing(
 
         async def async_get_snapshot(self, camera, timestamp, height):
             return _changing_jpeg(timestamp)
+
+        async def async_get_event_snapshot(self, event_id, camera, height):
+            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
 
     manager = MediaManager(
         hass, store, Client(), tmp_path,

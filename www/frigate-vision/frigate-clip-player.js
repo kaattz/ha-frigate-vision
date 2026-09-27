@@ -62,11 +62,12 @@ const EMPTY_SOURCE = { url: null, evidence: null };
 // numbered the close-up as though it were a frame.
 const SHEET_COLUMNS = 3;
 
-// Frame cells are a fixed 16:9 -- `build_contact_sheet` pastes every frame into a
-// 640x360 cell -- which is what lets the overlay work out where the frames end
-// without being told whether the close-up is on, and without duplicating the
+// Frame cells are a fixed 640x360 -- `build_contact_sheet` pastes every frame into
+// a cell of that size -- which is what lets the overlay work out where the frames
+// end without being told whether the close-up is on, and without duplicating the
 // close-up's column width.
-const CELL_ASPECT = 640 / 360;
+const CELL_WIDTH = 640;
+const CELL_HEIGHT = 360;
 
 class FrigateClipPlayer extends HTMLElement {
   constructor() {
@@ -260,15 +261,20 @@ class FrigateClipPlayer extends HTMLElement {
            a uniform grid lines up with them without measuring anything -- and
            nothing can drift out of alignment while the image is loading.
 
-           The right inset reserves the close-up column when there is one; the
-           element sets it from the image's own proportions. */
+           The overlay is anchored to the left and to the full height, and its width
+           comes from the aspect-ratio set per sheet. Cells are 16:9, so a grid of
+           three columns and N rows is (3 * 640) / (N * 360) wide -- which covers
+           exactly the frames and stops before the close-up column when the sheet
+           has one. Doing it this way rather than from naturalWidth avoids a race:
+           the src is assigned just before this runs, and a cached image can finish
+           loading before any listener is attached. */
         .evidence {
           position: relative; margin-top: 8px; border-radius: 12px;
           overflow: hidden; background: #000; line-height: 0;
         }
         .sheet { display: block; width: 100%; }
         .cells {
-          position: absolute; inset: 0; display: grid;
+          position: absolute; top: 0; bottom: 0; left: 0; display: grid;
           grid-template-columns: repeat(${SHEET_COLUMNS}, 1fr);
           grid-auto-rows: 1fr;
         }
@@ -491,23 +497,25 @@ class FrigateClipPlayer extends HTMLElement {
    * `rows * cellHeight * CELL_ASPECT`, and anything wider is the close-up. The
    * row count matters: a six-frame sheet is 1920x720, and assuming three rows
    * there would invent a 33% inset that does not exist.
+   *
+   * The `src` is assigned just before this runs, so the dimensions are usually not
+   * there yet. `complete` is checked as well as the listener because a cached image
+   * can finish before the listener is attached, and that race is exactly what made
+   * this silently do nothing in production while the unit test -- which sets the
+   * dimensions directly -- passed.
    */
   _insetFromExtraColumn() {
     if (!this._cells) return;
-    const apply = () => {
-      const { naturalWidth: w, naturalHeight: h } = this._sheet;
-      const rows = Math.floor(this._offsets.length / SHEET_COLUMNS);
-      if (!w || !h || rows < 1) return;
-      const frames = (SHEET_COLUMNS * (h / rows) * CELL_ASPECT) / w;
-      // Guard against rounding putting a full-width sheet slightly over 1.
-      const inset = frames < 1 ? (1 - frames) * 100 : 0;
-      this._cells.style.right = inset ? inset.toFixed(4) + "%" : "0";
-    };
-    if (this._sheet.naturalWidth) {
-      apply();
-      return;
-    }
-    this._sheet.addEventListener("load", apply, { once: true });
+    const rows = Math.floor(this._offsets.length / SHEET_COLUMNS);
+    if (rows < 1) return;
+    // Three columns of `rows` 16:9 rows span (3*640)/(rows*360) of the sheet's
+    // height. Pinning the overlay to the full height and giving it that
+    // aspect-ratio anchors it to the frames and stops it before the close-up --
+    // and it needs no image dimensions, which is what makes it immune to the load
+    // race a `naturalWidth` read would have. A grid-only sheet already has exactly
+    // this ratio, so nothing is deducted when there is no close-up.
+    this._cells.style.aspectRatio =
+      (SHEET_COLUMNS * CELL_WIDTH) / (rows * CELL_HEIGHT);
   }
 
   /**

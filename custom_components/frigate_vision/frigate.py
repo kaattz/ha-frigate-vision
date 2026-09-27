@@ -174,6 +174,33 @@ class FrigateClient:
             raise FrigateApiError("empty_snapshot")
         return data
 
+    async def async_get_event_snapshot(
+        self, event_id: str, camera: str, height: int
+    ) -> bytes:
+        """Return the frame Frigate itself paired with this detection.
+
+        This is the snapshot the box describes, which is the whole reason to prefer
+        it: the box and the frame come from the same instant by construction, so no
+        moment has to be inferred. Deriving it from the tracked path was tried and
+        does not work -- the path records where the person is over the detection,
+        and its points do not line up with the box in a way that identifies when
+        the box was taken (two real detections gave contradictory answers via the
+        nearest-centre rule, and the nearest-bottom rule disagreed with the
+        verified-correct frame).
+        """
+        if not math.isfinite(height) or height < 1 or height > 4320:
+            raise FrigateApiError("invalid_snapshot_request")
+        content_type, data = await self._request_bytes(
+            "GET",
+            f"{self._base_url}/api/events/{quote(event_id, safe='')}/snapshot.jpg",
+            params={"h": str(height)},
+        )
+        if content_type != "image/jpeg":
+            raise FrigateApiError("unexpected_content_type")
+        if not data:
+            raise FrigateApiError("empty_snapshot")
+        return data
+
     async def _get_json(self, path: str) -> dict[str, Any]:
         payload = await self._request_json("GET", f"{self._base_url}/api/{path}")
         if not isinstance(payload, dict):

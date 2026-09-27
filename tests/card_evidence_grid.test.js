@@ -186,14 +186,15 @@ check("a nine-offset notification builds nine cells", () => {
   assert.strictEqual(cells.children[8].dataset.cell, "9");
 });
 
-check("the overlay stops short of a person close-up column", () => {
+check("the overlay covers the frames and stops before the close-up", () => {
   // Reported from the UI: the numbers were on the wrong frames and the close-up
   // was numbered as though it were one of them. The sheet carries a fourth column
   // when the close-up is on, and the overlay was laid across the whole image.
   //
-  // 1215x431 is the composed sheet measured on this deployment: 767 of grid plus a
-  // 448 column. Three 16:9 cells across 431/3 per row come to 766px of frames, so
-  // the overlay must stop at 1 - 766/1215 = 36.9%.
+  // The overlay is sized by aspect-ratio, so this asserts the ratio rather than a
+  // percentage inset -- and deliberately does NOT prime `naturalWidth`, because
+  // needing the image's dimensions is what made the first attempt race the load
+  // and silently do nothing in production.
   const { card, cells } = makeCard({ notification_id: "alert_nine" });
   cells.style = {};
   card.hass = storeWith({
@@ -202,41 +203,32 @@ check("the overlay stops short of a person close-up column", () => {
     evidence_image_url: "/api/frigate_vision/media/e/nine.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7|52.3|61.8|70.2",
   });
-  card._sheet.naturalWidth = 1215;
-  card._sheet.naturalHeight = 431;
   card._insetFromExtraColumn();
-  const inset = parseFloat(cells.style.right);
-  assert.ok(
-    Math.abs(inset - 36.9) < 0.5,
-    "the overlay must reserve the close-up column, got " + cells.style.right
+  // Nine frames is three rows: (3 * 640) / (3 * 360) = 16/9.
+  assert.strictEqual(
+    cells.style.aspectRatio,
+    1920 / 1080,
+    "overlay must cover exactly the frame columns, got " + cells.style.aspectRatio
   );
 });
 
-check("a grid-only sheet keeps the full width", () => {
-  // Both shapes have to be right: a six-frame sheet is 1920x720 in two rows, and
-  // assuming three rows there would invent a 33% inset that does not exist. The
-  // offsets and the image have to agree -- they describe the same sheet.
-  for (const [offsets, width, height, label] of [
-    ["1.5|9.2|17.8|26.4|35.1|44.7|52.3|61.8|70.2", 1920, 1080, "nine frames"],
-    ["1.5|9.2|17.8|26.4|35.1|44.7", 1920, 720, "six frames"],
-  ]) {
-    const { card, cells } = makeCard({ notification_id: "alert_nine" });
-    cells.style = {};
-    card.hass = storeWith({
-      id: "alert_nine",
-      hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
-      evidence_image_url: "/api/frigate_vision/media/e/nine.jpg?authSig=Y",
-      evidence_offsets: offsets,
-    });
-    card._sheet.naturalWidth = width;
-    card._sheet.naturalHeight = height;
-    card._insetFromExtraColumn();
-    assert.strictEqual(
-      cells.style.right,
-      "0",
-      label + " must not be inset, got " + cells.style.right
-    );
-  }
+check("a six-frame sheet gets a two-row ratio, not a three-row one", () => {
+  // The row count comes from the offsets. Assuming three rows here would make the
+  // overlay too narrow, leaving the bottom row's taps on the row above it.
+  const { card, cells } = makeCard({ notification_id: "alert_six" });
+  cells.style = {};
+  card.hass = storeWith({
+    id: "alert_six",
+    hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
+    evidence_image_url: "/api/frigate_vision/media/e/six.jpg?authSig=Y",
+    evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7",
+  });
+  card._insetFromExtraColumn();
+  assert.strictEqual(
+    cells.style.aspectRatio,
+    1920 / 720,
+    "six frames is two rows, got " + cells.style.aspectRatio
+  );
 });
 
 check("a source with a sheet builds one button per offset", () => {

@@ -68,6 +68,10 @@ class FrigateMediaClient(Protocol):
         self, camera: str, timestamp: float, height: int
     ) -> bytes: ...
 
+    async def async_get_event_snapshot(
+        self, event_id: str, camera: str, height: int
+    ) -> bytes: ...
+
 
 def _strict_three(values: Sequence[float]) -> tuple[float, float, float]:
     if len(values) < 2:
@@ -449,47 +453,24 @@ def crop_person_box(
     return left, top, right, bottom
 
 
-def box_moment(
-    box: tuple[float, float, float, float],
-    points: Sequence[tuple[float, float, float]] | None,
-    *,
-    fallback_start: float,
-    fallback_end: float,
-) -> float:
-    """The instant a box describes, found from the tracked path.
+def _pick_highlight_source(
+    sources: Sequence[tuple[str, tuple[float, float, float, float]]],
+) -> tuple[str, tuple[float, float, float, float]] | None:
+    """The detection and box to crop the close-up from, or None.
 
-    Frigate hands back one box per detection, and it is NOT the box at the
-    detection's start: measured here, a 42.9-second detection started on an empty
-    hallway and the person only appeared ten seconds in. Cropping at `start_time`
-    therefore produced a close-up of the floor -- and, worse, a close-up that looks
-    like a working one until someone reads it.
-
-    `path_data` is the tracked centre per update, so the point nearest the box's
-    centre is the instant the box was measured at. Measured on a real detection the
-    distances fall monotonically to 0.057 and rise again, which is a person walking
-    towards the camera and past it -- the shape this relies on.
-
-    Each point is `(timestamp, x, y)`, matching `parse_path_data`.
-
-    The midpoint is the fallback when no path is available. It is not as precise,
-    but a detection's middle is far likelier to contain the person than its start.
+    Largest box wins, so the frame with the most of the person in it is the one
+    shown. The detection id has to come along because the frame is Frigate's own
+    snapshot for that detection -- that pairing is what makes the crop land on the
+    person, and it is why this returns an id rather than a timestamp.
     """
-    centre_x = box[0] + box[2] / 2.0
-    centre_y = box[1] + box[3] / 2.0
-    best_distance: float | None = None
-    best_moment = (fallback_start + fallback_end) / 2.0
-    for point in points or ():
-        try:
-            moment, x, y = (float(value) for value in point)
-        except (TypeError, ValueError):
-            continue
-        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(moment)):
-            continue
-        distance = math.hypot(x - centre_x, y - centre_y)
-        if best_distance is None or distance < best_distance:
-            best_distance = distance
-            best_moment = moment
-    return best_moment
+    best: tuple[str, tuple[float, float, float, float]] | None = None
+    best_area = 0.0
+    for event_id, box in sources:
+        area = float(box[2]) * float(box[3])
+        if area > best_area:
+            best_area = area
+            best = (event_id, box)
+    return best
 
 
 def largest_person_box(
@@ -993,8 +974,8 @@ class MediaManager:
         record: ActivityRecord,
         selected: Sequence[tuple[float, Path]],
         temporary: Path,
-        recovered_boxes: Sequence[
-            tuple[float, tuple[float, float, float, float]]
+        recovered: Sequence[
+            tuple[str, tuple[float, float, float, float]]
         ] = (),
     ) -> Path | None:
         """Crop the person's clearest frame, or None when that is not possible.
@@ -1003,37 +984,35 @@ class MediaManager:
         may be available. A missing close-up costs detail; failing the analysis
         over it would cost the whole activity, so this degrades instead of raising.
 
-        Boxes come from the record when it has them, and otherwise from the
-        detections the caller looked up. The fallback is not a nicety: a Frigate
-        *review* carries no box of its own, and every activity this household
-        records arrives as a review, so without it the close-up was never built at
-        all while the option read as enabled.
+        The crop comes from Frigate's own snapshot for that detection, which is the
+        frame the box describes -- the two come from the same instant by
+        construction, so no moment has to be worked out. Inferring the moment from
+        the tracked path was tried and abandoned: two real detections gave
+        contradictory answers, and the frames it picked were empty hallway while the
+        person was elsewhere in the clip.
+
+        A Frigate *review* carries no box of its own, and every activity this
+        household records arrives as a review, so the detection ids are the normal
+        source rather than an edge case.
 
         The second guard is NOT redundant with the first, and must not be removed as
         dead code. The first rejects an empty `selected` but says nothing about the
         box sources, so an activity with neither recorded nor recoverable boxes
-        reaches `largest_person_box` with an empty sequence, gets None back, and
-        would fail to unpack it. A mutation that drops this guard is caught by
+        reaches the picker with an empty sequence, gets None back, and would fail to
+        unpack it. A mutation that drops this guard is caught by
         `test_the_manager_still_builds_when_no_box_was_recorded` with
         `TypeError: cannot unpack non-iterable NoneType object`.
         """
         if not self._person_highlight or not selected:
             return None
-        found = largest_person_box(record.box_updates) or largest_person_box(
-            recovered_boxes
-        )
+        found = _pick_highlight_source(recovered)
         if found is None:
             return None
-        moment, box = found
+        event_id, box = found
         target = temporary / "person.jpg"
         try:
-            # The frame is fetched at the box's own moment rather than reused from
-            # the sheet. A selected frame can be tens of seconds from it -- measured
-            # on a real 42.9-second detection, the nearest selected frame was 1.6s
-            # in and showed an empty hallway, so the close-up came out as a picture
-            # of the floor. One extra snapshot is cheap next to that.
-            frame_bytes = await self._client.async_get_snapshot(
-                record.camera, moment, PERSON_HIGHLIGHT_FRAME_HEIGHT
+            frame_bytes = await self._client.async_get_event_snapshot(
+                event_id, record.camera, PERSON_HIGHLIGHT_FRAME_HEIGHT
             )
             crop = await self._hass.async_add_executor_job(
                 _crop_person_bytes, frame_bytes, box
@@ -1081,13 +1060,14 @@ class MediaManager:
             raise MediaError("stage_conflict")
         events: dict[str, EventWindow] = {}
         motion_paths: dict[str, MotionPath] = {}
-        # Boxes recovered from the detections, for activities that carry none of
-        # their own. A review message lists `detections` but has no box on it -- the
-        # box lives on the detection -- and every activity this household records
+        # Detection ids and their boxes, for activities that carry no box of their
+        # own. A review message lists `detections` but has no box on it -- the box
+        # lives on the detection -- and every activity this household records
         # arrives that way, so without this the close-up is never built even though
         # the option is on. The payload is already being fetched below, so this
-        # costs no extra request.
-        found_boxes: list[tuple[float, tuple[float, float, float, float]]] = []
+        # costs no extra request. The id is kept because the frame comes from
+        # Frigate's snapshot for that detection, which is what pairs the two.
+        found_boxes: list[tuple[str, tuple[float, float, float, float]]] = []
         parse_paths = record.source in {
             ActivitySource.STANDALONE_REVIEW,
             ActivitySource.MANUAL_REVIEW,
@@ -1097,7 +1077,6 @@ class MediaManager:
             start_time = float(payload["start_time"])
             end_time = float(payload["end_time"])
             events[event_id] = EventWindow(event_id, start_time, end_time)
-            points: tuple[tuple[float, float, float], ...] | None = None
             if parse_paths:
                 try:
                     points = parse_path_data(payload)
@@ -1107,22 +1086,14 @@ class MediaManager:
                     motion_paths[event_id] = MotionPath(start_time, end_time, points)
             box = event_box(payload)
             if box is not None:
-                # Timed at the box's own moment, not the detection's start. Frigate
-                # returns one box per detection and it is not the box at the start:
-                # measured on a real 42.9-second detection, the hallway was empty at
-                # the start and the person appeared ten seconds in. Recording the
-                # start time made the close-up crop the floor.
-                found_boxes.append(
-                    (
-                        box_moment(
-                            box,
-                            points,
-                            fallback_start=start_time,
-                            fallback_end=end_time,
-                        ),
-                        box,
-                    )
-                )
+                found_boxes.append((event_id, box))
+        # A record built from raw events keeps its own boxes, so use those; the
+        # recovered ones are what make a review activity work at all.
+        highlight_sources = found_boxes or [
+            (record.detection_ids[0], box)
+            for _timestamp, box in record.box_updates
+            if record.detection_ids
+        ]
         plan = plan_evidence(record, events, self._roles, motion_paths)
         final = self._canonical_path(record)
         metadata = final.with_suffix(".json")
@@ -1303,7 +1274,7 @@ class MediaManager:
             # from the cell it was pasted into: a cell is a third of the frame, so
             # cropping there would re-shrink the very pixels this exists to keep.
             highlight = await self._async_person_highlight(
-                record, selected, temporary, found_boxes
+                record, selected, temporary, highlight_sources
             )
             if highlight is None:
                 await self._hass.async_add_executor_job(
