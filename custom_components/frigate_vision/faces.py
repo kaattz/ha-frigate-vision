@@ -30,7 +30,10 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from PIL import Image
 
-from .const import FACE_SERVICE_CANDIDATES, FACE_SERVICE_TIMEOUT
+from .const import (
+    FACE_SERVICE_CANDIDATES,
+    FACE_SERVICE_TIMEOUT,
+)
 
 
 class FaceServiceError(RuntimeError):
@@ -61,8 +64,15 @@ def _encode_crop(image_bytes: bytes, box: Sequence[float]) -> bytes | None:
 
     The crop is what gets sent, not the whole frame, and that is a measured choice:
     on a 640x360 detect stream a head is about 30 px across and the model missed
-    every one of them, while the same frames cropped to the person and sent at the
-    same cost were all found. Fewer pixels, more face.
+    every one of them, while the same frames cropped to the person were all found.
+    Fewer pixels, more face.
+
+    The padding comes from `crop_person_box`, the same function the close-up itself
+    uses, and that is load-bearing rather than tidy. Cutting to the box's exact
+    edges clips the top of the head, and the model then finds nothing: measured on
+    one activity, the unpadded 137x180 crop detected 0 of 6 frames while the padded
+    247x261 crop detected 2, the frontal ones. A tightly framed face is a face with
+    no forehead and no hairline, which is much of what the detector looks for.
 
     Returns None when the frame cannot be read or the box is unusable, which the
     caller treats as "unknown" rather than as "no face".
@@ -81,15 +91,23 @@ def _encode_crop(image_bytes: bytes, box: Sequence[float]) -> bytes | None:
             frame = source.convert("RGB")
     except (OSError, ValueError):
         return None
-    frame_width, frame_height = frame.size
-    left = max(0, int(x * frame_width))
-    top = max(0, int(y * frame_height))
-    right = min(frame_width, int((x + width) * frame_width))
-    bottom = min(frame_height, int((y + height) * frame_height))
-    if right - left < 8 or bottom - top < 8:
+    try:
+        # Imported here rather than at module scope: `media` imports this module,
+        # so a top-level import of `media` would be circular. The padding comes from
+        # the same constant the close-up uses, which is what keeps the two crops
+        # framed identically.
+        from .media import PERSON_CROP_PADDING, crop_person_box
+
+        region = crop_person_box(
+            (x, y, width, height), frame_size=frame.size, padding=PERSON_CROP_PADDING
+        )
+    except ValueError:
+        return None
+    cropped = frame.crop(region)
+    if cropped.size[0] < 8 or cropped.size[1] < 8:
         return None
     buffer = io.BytesIO()
-    frame.crop((left, top, right, bottom)).save(buffer, "JPEG", quality=90)
+    cropped.save(buffer, "JPEG", quality=90)
     return buffer.getvalue()
 
 

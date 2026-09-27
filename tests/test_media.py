@@ -2773,6 +2773,44 @@ def test_the_service_url_accepts_what_a_person_would_type() -> None:
         assert normalise_service_url(typed) == "http://192.168.166.50:8788/face", typed
 
 
+def test_the_face_crop_is_padded_like_the_close_up_itself() -> None:
+    """送给人脸服务的裁剪必须和特写用同样的 padding。
+
+    这是实测出的 bug：`_encode_crop` 一开始按 box 边缘直切（137x180），顶着发际线
+    切掉了头顶，模型在 6 帧里一帧都没检出；同一批帧用 `PERSON_CROP_PADDING`
+    （247x261）能检出 2 帧正脸。紧贴边缘的"人脸"是没有额头和发际线的人脸，而那
+    正是检测器要看的东西。
+
+    用同一张图分别走两条路，断言尺寸一致 —— 只要有人把 padding 去掉或改小，
+    这里立刻会红。
+    """
+    import io as _io
+
+    from custom_components.frigate_vision.faces import _encode_crop
+    from custom_components.frigate_vision.media import (
+        PERSON_CROP_PADDING,
+        crop_person_box,
+    )
+
+    frame = _changing_jpeg(1.0)
+    box = (0.30, 0.35, 0.20, 0.30)
+    encoded = _encode_crop(frame, box)
+    assert encoded is not None
+    with Image.open(_io.BytesIO(encoded)) as sent:
+        sent_size = sent.size
+    with Image.open(_io.BytesIO(frame)) as source:
+        expected = crop_person_box(
+            box, frame_size=source.size, padding=PERSON_CROP_PADDING
+        )
+    assert sent_size == (expected[2] - expected[0], expected[3] - expected[1]), (
+        "送给人脸服务的裁剪与特写用的 padding 不一致"
+    )
+    # And the padding must actually widen the crop past the box itself.
+    with Image.open(_io.BytesIO(frame)) as source:
+        bare = crop_person_box(box, frame_size=source.size, padding=0.0)
+    assert sent_size[0] > bare[2] - bare[0], "裁剪没有留边，头顶会被切掉"
+
+
 def test_candidates_spread_across_the_activity_not_just_its_start() -> None:
     """候选要覆盖整段活动，不能只取开头几帧。
 
