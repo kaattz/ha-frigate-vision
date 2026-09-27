@@ -66,8 +66,7 @@ const SHEET_COLUMNS = 3;
 // a cell of that size -- which is what lets the overlay work out where the frames
 // end without being told whether the close-up is on, and without duplicating the
 // close-up's column width.
-const CELL_WIDTH = 640;
-const CELL_HEIGHT = 360;
+const CELL_ASPECT = 640 / 360;
 
 class FrigateClipPlayer extends HTMLElement {
   constructor() {
@@ -258,23 +257,25 @@ class FrigateClipPlayer extends HTMLElement {
         }
         /* The sheet is one image with a transparent grid laid over it, not
            separate crops. The frame cells in the source JPEG are exactly equal, so
-           a uniform grid lines up with them without measuring anything -- and
-           nothing can drift out of alignment while the image is loading.
+           a uniform grid lines up with them without measuring anything.
 
-           The overlay is anchored to the left and to the full height, and its width
-           comes from the aspect-ratio set per sheet. Cells are 16:9, so a grid of
-           three columns and N rows is (3 * 640) / (N * 360) wide -- which covers
-           exactly the frames and stops before the close-up column when the sheet
-           has one. Doing it this way rather than from naturalWidth avoids a race:
-           the src is assigned just before this runs, and a cached image can finish
-           loading before any listener is attached. */
+           The overlay is anchored left and full height, and its width is set from
+           the image once it has loaded -- see _sizeCellsToFrames. It must stop
+           before the close-up column: the image carries a fourth column when the
+           close-up is on, and covering it puts the last column of numbers on a
+           picture that is not a frame.
+
+           The width is an explicit percentage rather than an aspect-ratio: this is
+           an absolutely positioned grid container, and a grid's shrink-to-fit width
+           ignores aspect-ratio, so the overlay stayed full width. */
         .evidence {
           position: relative; margin-top: 8px; border-radius: 12px;
           overflow: hidden; background: #000; line-height: 0;
         }
         .sheet { display: block; width: 100%; }
         .cells {
-          position: absolute; top: 0; bottom: 0; left: 0; display: grid;
+          position: absolute; top: 0; bottom: 0; left: 0; width: 100%;
+          display: grid;
           grid-template-columns: repeat(${SHEET_COLUMNS}, 1fr);
           grid-auto-rows: 1fr;
         }
@@ -504,18 +505,52 @@ class FrigateClipPlayer extends HTMLElement {
    * this silently do nothing in production while the unit test -- which sets the
    * dimensions directly -- passed.
    */
+  /**
+   * Size the overlay to the frames, leaving out the close-up column.
+   *
+   * The image is wider than the frames when the close-up is on, and the overlay
+   * must not cover that column -- otherwise the last column of numbers lands on a
+   * picture that is not a frame. The card is never told whether the close-up is on
+   * and a stored sheet may predate the setting, so this is derived from the image:
+   * cells are 16:9, so three columns of `rows` rows span
+   * `rows * (height/rows) * CELL_ASPECT` pixels of the image's width.
+   *
+   * The dimensions are only known after the image loads, and both ways of learning
+   * them have a trap. Reading `naturalWidth` immediately after assigning `src` gets
+   * zero. Waiting for a `load` event alone misses an already-cached image, which can
+   * finish before the listener is attached -- that is what made an earlier attempt
+   * silently do nothing in production while the unit test, which sets the
+   * dimensions directly, passed. So: apply now in case it is already loaded, and
+   * keep a listener for when it is not.
+   */
   _insetFromExtraColumn() {
     if (!this._cells) return;
     const rows = Math.floor(this._offsets.length / SHEET_COLUMNS);
     if (rows < 1) return;
-    // Three columns of `rows` 16:9 rows span (3*640)/(rows*360) of the sheet's
-    // height. Pinning the overlay to the full height and giving it that
-    // aspect-ratio anchors it to the frames and stops it before the close-up --
-    // and it needs no image dimensions, which is what makes it immune to the load
-    // race a `naturalWidth` read would have. A grid-only sheet already has exactly
-    // this ratio, so nothing is deducted when there is no close-up.
-    this._cells.style.aspectRatio =
-      (SHEET_COLUMNS * CELL_WIDTH) / (rows * CELL_HEIGHT);
+    const apply = () => {
+      const width = this._sheet.naturalWidth;
+      const height = this._sheet.naturalHeight;
+      if (!width || !height) return;
+      const naturalFrames = SHEET_COLUMNS * (height / rows) * CELL_ASPECT;
+      // The sheet is built by scaling the grid to a target width and rounding the
+      // height, so deriving the grid's width back from that rounded height lands a
+      // fraction of a pixel short. Without this snap a grid-only sheet would get an
+      // overlay 0.1% narrower than the picture, leaving the right edge of the last
+      // cell untappable. A real close-up column is hundreds of pixels, so a
+      // sub-pixel difference can only mean there is no column.
+      const share =
+        width - naturalFrames < 1.5 ? 1 : Math.min(1, naturalFrames / width);
+      this._cells.style.width = (share * 100).toFixed(4) + "%";
+    };
+    apply();
+    if (!this._sheet.complete || !this._sheet.naturalWidth) {
+      this._sheet.addEventListener("load", apply);
+    }
+  }
+
+  /** The natural width of one frame cell, given the sheet's natural width. */
+  _cellWidthNatural(naturalWidth) {
+    return naturalWidth / SHEET_COLUMNS;
   }
 
   /**

@@ -189,12 +189,11 @@ check("a nine-offset notification builds nine cells", () => {
 check("the overlay covers the frames and stops before the close-up", () => {
   // Reported from the UI: the numbers were on the wrong frames and the close-up
   // was numbered as though it were one of them. The sheet carries a fourth column
-  // when the close-up is on, and the overlay was laid across the whole image.
+  // when the close-up is on, and the overlay was covering it.
   //
-  // The overlay is sized by aspect-ratio, so this asserts the ratio rather than a
-  // percentage inset -- and deliberately does NOT prime `naturalWidth`, because
-  // needing the image's dimensions is what made the first attempt race the load
-  // and silently do nothing in production.
+  // 1215x431 is the composed sheet this deployment actually produces: 767 of grid
+  // plus a 448 close-up column. Three 16:9 cells across 431/3 per row come to 766px
+  // of frames, so the overlay must be 63.1% wide.
   const { card, cells } = makeCard({ notification_id: "alert_nine" });
   cells.style = {};
   card.hass = storeWith({
@@ -203,18 +202,20 @@ check("the overlay covers the frames and stops before the close-up", () => {
     evidence_image_url: "/api/frigate_vision/media/e/nine.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7|52.3|61.8|70.2",
   });
+  card._sheet.naturalWidth = 1215;
+  card._sheet.naturalHeight = 431;
   card._insetFromExtraColumn();
-  // Nine frames is three rows: (3 * 640) / (3 * 360) = 16/9.
-  assert.strictEqual(
-    cells.style.aspectRatio,
-    1920 / 1080,
-    "overlay must cover exactly the frame columns, got " + cells.style.aspectRatio
+  const width = parseFloat(cells.style.width);
+  assert.ok(
+    Math.abs(width - 63.1) < 0.3,
+    "the overlay must stop before the close-up column, got " + cells.style.width
   );
 });
 
-check("a six-frame sheet gets a two-row ratio, not a three-row one", () => {
-  // The row count comes from the offsets. Assuming three rows here would make the
-  // overlay too narrow, leaving the bottom row's taps on the row above it.
+check("a six-frame sheet with a close-up is two rows, not three", () => {
+  // The row count comes from the offsets, and real six-frame sheets are 1215x288
+  // -- the grid is scaled to the target width before the close-up column is added.
+  // Assuming three rows would make the overlay far too narrow.
   const { card, cells } = makeCard({ notification_id: "alert_six" });
   cells.style = {};
   card.hass = storeWith({
@@ -223,12 +224,40 @@ check("a six-frame sheet gets a two-row ratio, not a three-row one", () => {
     evidence_image_url: "/api/frigate_vision/media/e/six.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7",
   });
+  card._sheet.naturalWidth = 1215;
+  card._sheet.naturalHeight = 288;
   card._insetFromExtraColumn();
-  assert.strictEqual(
-    cells.style.aspectRatio,
-    1920 / 720,
-    "six frames is two rows, got " + cells.style.aspectRatio
+  const width = parseFloat(cells.style.width);
+  assert.ok(
+    Math.abs(width - 63.2) < 0.3,
+    "six frames is two rows, got " + cells.style.width
   );
+});
+
+check("a grid-only sheet keeps the full width", () => {
+  // Both shapes have to stay correct: with no close-up the image is exactly the
+  // frames, so the overlay covers all of it and no inset appears.
+  for (const [offsets, width, height, label] of [
+    ["1.5|9.2|17.8|26.4|35.1|44.7|52.3|61.8|70.2", 767, 431, "nine frames"],
+    ["1.5|9.2|17.8|26.4|35.1|44.7", 767, 288, "six frames"],
+  ]) {
+    const { card, cells } = makeCard({ notification_id: "alert_nine" });
+    cells.style = {};
+    card.hass = storeWith({
+      id: "alert_nine",
+      hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
+      evidence_image_url: "/api/frigate_vision/media/e/nine.jpg?authSig=Y",
+      evidence_offsets: offsets,
+    });
+    card._sheet.naturalWidth = width;
+    card._sheet.naturalHeight = height;
+    card._insetFromExtraColumn();
+    assert.strictEqual(
+      cells.style.width,
+      "100.0000%",
+      label + " must keep the full width, got " + cells.style.width
+    );
+  }
 });
 
 check("a source with a sheet builds one button per offset", () => {
