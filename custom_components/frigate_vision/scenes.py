@@ -186,7 +186,6 @@ CLASSIFICATION_GLOSSARY: Mapping[str, str] = {
     "visitor": "指访客到访，例如敲门、在门外等候或被迎入；",
     "maintenance": "指维修人员对楼道设施进行作业；",
     "suspicious_activity": "指试探门锁、反复徘徊或窥探等可疑行为；",
-    "short_roundtrip": "指短暂外出后随即返回。",
     "unknown_activity": "指画面确实无法支持任何其他判断；",
     "unable_to_confirm": "指证据不足或画面质量导致无法判断。",
 }

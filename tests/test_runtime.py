@@ -139,101 +139,13 @@ def _door_data() -> dict[str, object]:
     }
 
 
-async def test_runtime_rebinds_the_unique_collecting_cycle(
-    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    record = ActivityRecord(
-        activity_id="door_entry_1_100000",
-        entry_id="entry_1",
-        source=ActivitySource.STANDALONE_REVIEW,
-        stage=ActivityStage.COLLECTING,
-        created_at=100,
-        updated_at=100,
-        camera="front",
-    )
-
-    async def load(store: ActivityStore) -> None:
-        store._activities = {record.activity_id: record}
-
-    async def recover(store: ActivityStore, now: float) -> list[ActivityRecord]:
-        return [record]
-
-    client = SimpleNamespace(async_close=AsyncMock())
-    monkeypatch.setattr(ActivityStore, "async_load", load)
-    monkeypatch.setattr(ActivityStore, "async_recover", recover)
-    monkeypatch.setattr(
-        runtime_module.FrigateClient,
-        "async_create",
-        AsyncMock(return_value=client),
-    )
-    monkeypatch.setattr(
-        runtime_module, "async_subscribe_lock", Mock(return_value=Mock())
-    )
-    monkeypatch.setattr(
-        runtime_module, "async_subscribe_frigate", AsyncMock(return_value=Mock())
-    )
-    door_data = _door_data()
-    door_data["contact_entity_id"] = "binary_sensor.front_contact"
-    hass.states.async_set("binary_sensor.front_contact", "on")
-    entry = _entry({"frigate": _frigate_data(), "door": door_data, "zones": {}})
-    entry.add_to_hass(hass)
-    runtime = await IntegrationRuntime.async_create(hass, entry, 10)
-    assert runtime.door_coordinator is not None
-    result = await runtime.door_coordinator.async_open(110, "inside")
-    assert result.status == "duplicate_open"
-    assert result.record.activity_id == record.activity_id
-    closed = await runtime.door_coordinator.async_close(120)
-    assert closed.record.door_remained_open is True
-    await runtime.async_stop()
-
-
-async def test_runtime_rejects_multiple_recovered_collecting_cycles(
-    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    first = ActivityRecord(
-        activity_id="door_entry_1_100000",
-        entry_id="entry_1",
-        source=ActivitySource.STANDALONE_REVIEW,
-        stage=ActivityStage.COLLECTING,
-        created_at=100,
-        updated_at=100,
-        camera="front",
-    )
-    second = ActivityRecord(
-        activity_id="door_entry_1_101000",
-        entry_id="entry_1",
-        source=ActivitySource.STANDALONE_REVIEW,
-        stage=ActivityStage.COLLECTING,
-        created_at=101,
-        updated_at=101,
-        camera="front",
-    )
-
-    async def load(store: ActivityStore) -> None:
-        store._activities = {first.activity_id: first, second.activity_id: second}
-
-    async def recover(store: ActivityStore, now: float) -> list[ActivityRecord]:
-        return [first, second]
-
-    monkeypatch.setattr(ActivityStore, "async_load", load)
-    monkeypatch.setattr(ActivityStore, "async_recover", recover)
-    entry = _entry({"frigate": _frigate_data(), "door": _door_data(), "zones": {}})
-    entry.add_to_hass(hass)
-    with pytest.raises(RuntimeError, match="multiple_collecting_cycles"):
-        await IntegrationRuntime.async_create(hass, entry, 10)
-
-
 async def test_setup_failure_rolls_back_every_acquired_resource(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    unsubscribe_lock = Mock()
     client = SimpleNamespace(async_close=AsyncMock())
     stop = AsyncMock()
     monkeypatch.setattr(EntryRuntime, "async_start", AsyncMock())
     monkeypatch.setattr(EntryRuntime, "async_stop", stop)
-    monkeypatch.setattr(
-        runtime_module, "async_subscribe_lock", Mock(return_value=unsubscribe_lock)
-    )
     monkeypatch.setattr(
         runtime_module.FrigateClient,
         "async_create",
@@ -244,11 +156,10 @@ async def test_setup_failure_rolls_back_every_acquired_resource(
         "async_subscribe_frigate",
         AsyncMock(side_effect=RuntimeError("mqtt_subscribe_failed")),
     )
-    entry = _entry({"frigate": _frigate_data(), "door": _door_data(), "zones": {}})
+    entry = _entry({"frigate": _frigate_data(), "zones": {}})
     entry.add_to_hass(hass)
     with pytest.raises(RuntimeError, match="mqtt_subscribe_failed"):
         await IntegrationRuntime.async_create(hass, entry, 10)
-    unsubscribe_lock.assert_called_once_with()
     stop.assert_awaited_once_with()
     client.async_close.assert_awaited_once_with()
 
@@ -666,9 +577,14 @@ async def test_the_runtime_loop_does_not_retry_a_spent_provider_failure(
     ) in registry.issues, "a lost activity must raise a repair, not pass silently"
 
 
-async def test_runtime_loads_without_door_configuration(
+async def test_runtime_loads_with_review_only_configuration(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """没有门锁配置时，运行时以 review-only 形态启动。
+
+    门周期删除后这就是唯一的形态，但这个断言仍然值得保留：配置里残留的
+    `door` 键（旧 entry 升级上来）必须被无视而不是让启动失败。
+    """
     async def load(store: ActivityStore) -> None:
         return None
 
@@ -687,10 +603,27 @@ async def test_runtime_loads_without_door_configuration(
     monkeypatch.setattr(
         runtime_module, "async_subscribe_frigate", AsyncMock(return_value=Mock())
     )
-    entry = _entry({"frigate": _frigate_data(), "zones": {}})
+    # A legacy entry still carrying its old door mapping must not fail setup.
+    entry = _entry(
+        {"frigate": _frigate_data(), "door": _door_data_legacy(), "zones": {}}
+    )
     entry.add_to_hass(hass)
     runtime = await IntegrationRuntime.async_create(hass, entry, 10)
-    assert runtime.door_coordinator is None
     assert runtime.frigate_client is client
     assert runtime.correlation is not None
     await runtime.async_stop()
+
+
+def _door_data_legacy() -> dict:
+    """A stored door mapping from before the removal, kept verbatim."""
+    return {
+        "event_entity_id": "event.front_door_lock",
+        "action_attribute": "action",
+        "open_values": ["1"],
+        "close_values": ["2"],
+        "side_attribute": "side",
+        "inside_values": ["inside"],
+        "outside_values": ["outside"],
+        "contact_entity_id": "binary_sensor.front_contact",
+        "doorbell_event_entity_id": "event.front_door_doorbell",
+    }

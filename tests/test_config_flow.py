@@ -266,20 +266,8 @@ async def test_user_flow_creates_entry_with_data_and_options(
                 "far_zones": "elevator,elevator_2",
             },
         )
-        assert result["step_id"] == "door"
-
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "event_entity_id": "event.front_door_lock",
-                "action_attribute": "action",
-                "open_values": "open",
-                "close_values": "close",
-                "side_attribute": "side",
-                "inside_values": "inside",
-                "outside_values": "outside",
-            },
-        )
+        # The door step is gone: the flow goes straight from Frigate
+        # connection to the vision provider.
         assert result["step_id"] == "llmvision"
 
         result = await hass.config_entries.flow.async_configure(
@@ -312,7 +300,8 @@ async def test_user_flow_creates_entry_with_data_and_options(
     assert result["data"]["llm"]["llm_model"] == "vision-model"
     assert result["data"]["llm"]["llm_base_url"] == "https://api.deepseek.com/v1"
     assert result["data"]["llm"]["llm_thinking"] == "disabled"
-    assert result["options"]["processing_mode"] == "observe"
+    # No processing mode is stored at all: the pipeline is the only behaviour.
+    assert "processing_mode" not in result["options"]
 
 
 async def test_frigate_connection_error_stays_on_user_step(
@@ -465,7 +454,7 @@ async def test_options_flow_updates_behavior_settings(hass: HomeAssistant) -> No
         },
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["data"]["processing_mode"] == "shadow"
+    assert "processing_mode" not in result["data"]
     assert result["data"]["max_tokens"] == 20000
 
 
@@ -504,7 +493,7 @@ async def test_the_options_flow_still_saves_normally(hass: HomeAssistant) -> Non
         },
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["data"]["processing_mode"] == "shadow"
+    assert "processing_mode" not in result["data"]
 
 
 async def test_connection_test_reports_a_missing_key(hass: HomeAssistant) -> None:
@@ -588,44 +577,6 @@ async def test_native_auth_requires_credentials(hass: HomeAssistant) -> None:
     assert result["errors"]["base"] == "invalid_auth"
 
 
-async def test_door_mapping_values_must_be_disjoint(hass: HomeAssistant) -> None:
-    with patch.object(
-        config_flow,
-        "async_validate_frigate",
-        AsyncMock(return_value="0.17.2"),
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN, context={"source": config_entries.SOURCE_USER}
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "name": "Front Door",
-                "base_url": "http://frigate.local:5000",
-                "auth_mode": "none",
-                "mqtt_topic_prefix": "frigate",
-                "camera": "front_door",
-                "near_zones": "home_door",
-                "transition_zones": "bench",
-                "far_zones": "elevator",
-            },
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "event_entity_id": "event.front_door_lock",
-                "action_attribute": "action",
-                "open_values": "same",
-                "close_values": "same",
-                "side_attribute": "side",
-                "inside_values": "inside",
-                "outside_values": "outside",
-            },
-        )
-    assert result["step_id"] == "door"
-    assert result["errors"]["base"] == "invalid_door_mapping"
-
-
 async def test_reconfigure_updates_frigate_connection(hass: HomeAssistant) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -672,12 +623,9 @@ async def test_reconfigure_updates_frigate_connection(hass: HomeAssistant) -> No
                 "far_zones": "far",
             },
         )
-        assert result["step_id"] == "reconfigure_door"
-        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reconfigure_successful"
     assert entry.data["frigate"]["base_url"] == "http://new.local:5000"
-    assert entry.data["door"] == {}
 
 
 async def test_reconfigure_none_clears_native_credentials(hass: HomeAssistant) -> None:
@@ -725,383 +673,9 @@ async def test_reconfigure_none_clears_native_credentials(hass: HomeAssistant) -
                 "far_zones": "far",
             },
         )
-        assert result["step_id"] == "reconfigure_door"
-        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
     assert result["type"] is FlowResultType.ABORT
     assert entry.data["frigate"]["username"] is None
     assert entry.data["frigate"]["password"] is None
-
-
-async def test_reconfigure_can_clear_the_lock_to_run_review_only(
-    hass: HomeAssistant,
-) -> None:
-    """An existing door-cycle entry must be movable to review-only without
-    deleting the entry, which would discard its stored activity history."""
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        title="Front Door",
-        unique_id="http://old.local:5000|front",
-        data={
-            "name": "Front Door",
-            "frigate": {
-                "base_url": "http://old.local:5000",
-                "auth_mode": "none",
-                "mqtt_topic_prefix": "frigate",
-                "camera": "front",
-                "username": None,
-                "password": None,
-            },
-            "zones": {
-                "near": ["home_door"],
-                "transition": ["bench"],
-                "far": ["elevator"],
-            },
-            "door": {
-                "event_entity_id": "event.lock_events",
-                "action_attribute": "锁动作",
-                "open_values": ["2"],
-                "close_values": ["1"],
-                "side_attribute": "操作位置",
-                "inside_values": ["1"],
-                "outside_values": ["2"],
-                "contact_entity_id": None,
-                "doorbell_event_entity_id": None,
-            },
-            "llmvision": {},
-        },
-    )
-    entry.add_to_hass(hass)
-    with patch.object(
-        config_flow, "async_validate_frigate", AsyncMock(return_value="0.17.2")
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={
-                "source": config_entries.SOURCE_RECONFIGURE,
-                "entry_id": entry.entry_id,
-            },
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "base_url": "http://old.local:5000",
-                "auth_mode": "none",
-                "mqtt_topic_prefix": "frigate",
-                "camera": "front",
-                "near_zones": "home_door",
-                "transition_zones": "bench",
-                "far_zones": "elevator",
-            },
-        )
-        assert result["step_id"] == "reconfigure_door"
-        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "reconfigure_successful"
-    assert entry.data["door"] == {}
-    assert entry.data["zones"]["near"] == ["home_door"]
-
-
-async def test_reconfigure_door_keeps_existing_mapping_when_resubmitted(
-    hass: HomeAssistant,
-) -> None:
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        title="Front Door",
-        unique_id="http://old.local:5000|front",
-        data={
-            "name": "Front Door",
-            "frigate": {
-                "base_url": "http://old.local:5000",
-                "auth_mode": "none",
-                "mqtt_topic_prefix": "frigate",
-                "camera": "front",
-                "username": None,
-                "password": None,
-            },
-            "zones": {"near": ["home_door"], "transition": [], "far": []},
-            "door": {
-                "event_entity_id": "event.lock_events",
-                "action_attribute": "锁动作",
-                "open_values": ["2"],
-                "close_values": ["1"],
-                "side_attribute": "操作位置",
-                "inside_values": ["1"],
-                "outside_values": ["2"],
-                "contact_entity_id": None,
-                "doorbell_event_entity_id": None,
-            },
-            "llmvision": {},
-        },
-    )
-    entry.add_to_hass(hass)
-    with patch.object(
-        config_flow, "async_validate_frigate", AsyncMock(return_value="0.17.2")
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={
-                "source": config_entries.SOURCE_RECONFIGURE,
-                "entry_id": entry.entry_id,
-            },
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "base_url": "http://old.local:5000",
-                "auth_mode": "none",
-                "mqtt_topic_prefix": "frigate",
-                "camera": "front",
-                "near_zones": "home_door",
-                "transition_zones": "",
-                "far_zones": "",
-            },
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "event_entity_id": "event.lock_events",
-                "action_attribute": "锁动作",
-                "open_values": "2",
-                "close_values": "1",
-                "side_attribute": "操作位置",
-                "inside_values": "1",
-                "outside_values": "2",
-            },
-        )
-    assert result["type"] is FlowResultType.ABORT
-    assert entry.data["door"]["open_values"] == ["2"]
-    assert entry.data["door"]["close_values"] == ["1"]
-
-
-async def test_reconfigure_door_rejects_contact_without_lock(
-    hass: HomeAssistant,
-) -> None:
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        title="Front Door",
-        unique_id="http://old.local:5000|front",
-        data={
-            "name": "Front Door",
-            "frigate": {
-                "base_url": "http://old.local:5000",
-                "auth_mode": "none",
-                "mqtt_topic_prefix": "frigate",
-                "camera": "front",
-                "username": None,
-                "password": None,
-            },
-            "zones": {"near": ["home_door"], "transition": [], "far": []},
-            "door": {},
-            "llmvision": {},
-        },
-    )
-    entry.add_to_hass(hass)
-    with patch.object(
-        config_flow, "async_validate_frigate", AsyncMock(return_value="0.17.2")
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={
-                "source": config_entries.SOURCE_RECONFIGURE,
-                "entry_id": entry.entry_id,
-            },
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "base_url": "http://old.local:5000",
-                "auth_mode": "none",
-                "mqtt_topic_prefix": "frigate",
-                "camera": "front",
-                "near_zones": "home_door",
-                "transition_zones": "",
-                "far_zones": "",
-            },
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {"contact_entity_id": "binary_sensor.front_contact"},
-        )
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "reconfigure_door"
-    assert result["errors"]["base"] == "door_lock_required"
-    assert entry.data["door"] == {}
-
-
-async def test_reconfigure_door_error_echoes_submitted_input(
-    hass: HomeAssistant,
-) -> None:
-    """A rejected submission must re-render what the user typed.
-
-    Rendering the stored mapping instead silently restores the lock the user
-    just cleared, so they can clear the lock, get a door_lock_required error,
-    clear the doorbell, and submit believing the lock is gone while the stored
-    mapping is still intact.
-    """
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        title="Front Door",
-        unique_id="http://old.local:5000|front",
-        data={
-            "name": "Front Door",
-            "frigate": {
-                "base_url": "http://old.local:5000",
-                "auth_mode": "none",
-                "mqtt_topic_prefix": "frigate",
-                "camera": "front",
-                "username": None,
-                "password": None,
-            },
-            "zones": {"near": ["home_door"], "transition": [], "far": []},
-            "door": {
-                "event_entity_id": "event.lock_events",
-                "action_attribute": "锁动作",
-                "open_values": ["2"],
-                "close_values": ["1"],
-                "side_attribute": "操作位置",
-                "inside_values": ["1"],
-                "outside_values": ["2"],
-                "contact_entity_id": None,
-                "doorbell_event_entity_id": "event.doorbell",
-            },
-            "llmvision": {},
-        },
-    )
-    entry.add_to_hass(hass)
-    with patch.object(
-        config_flow, "async_validate_frigate", AsyncMock(return_value="0.17.2")
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={
-                "source": config_entries.SOURCE_RECONFIGURE,
-                "entry_id": entry.entry_id,
-            },
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "base_url": "http://old.local:5000",
-                "auth_mode": "none",
-                "mqtt_topic_prefix": "frigate",
-                "camera": "front",
-                "near_zones": "home_door",
-                "transition_zones": "",
-                "far_zones": "",
-            },
-        )
-        # User cleared the lock but left the doorbell: rejected.
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "action_attribute": "锁动作",
-                "open_values": "2",
-                "close_values": "1",
-                "side_attribute": "操作位置",
-                "inside_values": "1",
-                "outside_values": "2",
-                "doorbell_event_entity_id": "event.doorbell",
-            },
-        )
-    assert result["type"] is FlowResultType.FORM
-    assert result["errors"]["base"] == "door_lock_required"
-
-    schema = result["data_schema"].schema
-    suggested = {
-        str(getattr(key, "schema", key)): (key.description or {}).get("suggested_value")
-        for key in schema
-    }
-    # The lock the user cleared must stay cleared in the re-rendered form.
-    assert suggested.get("event_entity_id") in (None, ""), suggested
-    # The doorbell the user left in place must still be shown.
-    assert suggested.get("doorbell_event_entity_id") == "event.doorbell", suggested
-
-
-async def test_door_step_can_be_skipped_without_lock(hass: HomeAssistant) -> None:
-    provider = MockConfigEntry(
-        domain="llmvision",
-        title="Vision Provider",
-        entry_id="provider-1",
-    )
-    provider.add_to_hass(hass)
-    provider.mock_state(hass, config_entries.ConfigEntryState.LOADED)
-    hass.services.async_register("llmvision", "image_analyzer", lambda call: None)
-
-    with patch.object(
-        config_flow,
-        "async_validate_frigate",
-        AsyncMock(return_value="0.17.2"),
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN, context={"source": config_entries.SOURCE_USER}
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "name": "Front Door",
-                "base_url": "http://frigate.local:5000",
-                "auth_mode": "none",
-                "mqtt_topic_prefix": "frigate",
-                "camera": "front_door",
-                "near_zones": "home_door",
-                "transition_zones": "bench",
-                "far_zones": "elevator",
-            },
-        )
-        assert result["step_id"] == "door"
-        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
-        assert result["step_id"] == "llmvision"
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "llm_base_url": "https://api.deepseek.com/v1",
-                "llm_api_key": "test-key",
-                "llm_model": "vision-model",
-                "llm_thinking": "disabled",
-            },
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "target_width": 768,
-                "max_tokens": 300,
-                "output_language": "zh-CN",
-                "history_retention_days": 30,
-                "media_retention_days": 7,
-                "queue_size": 10,
-            },
-        )
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["data"].get("door") == {}
-
-
-async def test_door_contact_without_lock_is_rejected(hass: HomeAssistant) -> None:
-    with patch.object(
-        config_flow,
-        "async_validate_frigate",
-        AsyncMock(return_value="0.17.2"),
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN, context={"source": config_entries.SOURCE_USER}
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "name": "Front Door",
-                "base_url": "http://frigate.local:5000",
-                "auth_mode": "none",
-                "mqtt_topic_prefix": "frigate",
-                "camera": "front_door",
-                "near_zones": "home_door",
-                "transition_zones": "bench",
-                "far_zones": "elevator",
-            },
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], {"contact_entity_id": "binary_sensor.front_contact"}
-        )
-    assert result["step_id"] == "door"
-    assert result["errors"]["base"] == "door_lock_required"
 
 
 async def test_zone_lists_may_be_empty_for_review_only(hass: HomeAssistant) -> None:
@@ -1135,8 +709,7 @@ async def test_zone_lists_may_be_empty_for_review_only(hass: HomeAssistant) -> N
                 "far_zones": "",
             },
         )
-        assert result["step_id"] == "door"
-        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+        assert result["step_id"] == "llmvision"
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {
@@ -1346,7 +919,6 @@ async def test_the_close_up_form_merges_instead_of_wiping_the_other_options(
     assert saved["llm_base_url"] == "http://keep.me/v1", "合并丢了 LLM 地址"
     assert saved["llm_api_key"] == "secret", "合并丢了密钥"
     assert saved["target_width"] == 767, "合并丢了宽度"
-    assert saved["processing_mode"] == "observe", "合并丢了处理模式"
     assert saved[CONF_PERSON_HIGHLIGHT] is True
     assert saved[CONF_FACE_SERVICE_URL] == "http://192.168.166.50:8788"
 
@@ -1454,8 +1026,9 @@ async def test_saving_bad_labels_shows_an_error_instead_of_storing_them(
 async def _drive_the_initial_flow_to_the_options_step(hass: HomeAssistant) -> str:
     """把初始配置流开到 options 这一步，返回 flow_id。
 
-    初始流是 user → door → llmvision → options 四步，只有最后一步碰标签。把驱动
-    过程抽出来是为了让每个断言只讲它要讲的事，而不是把 30 行表单填写抄一遍。
+    初始流是 user → llmvision → options 三步（door 步已随门周期删除），只有
+    最后一步碰标签。把驱动过程抽出来是为了让每个断言只讲它要讲的事，而不是把
+    30 行表单填写抄一遍。
     """
     with patch.object(
         config_flow,
@@ -1478,7 +1051,6 @@ async def _drive_the_initial_flow_to_the_options_step(hass: HomeAssistant) -> st
                 "far_zones": "elevator",
             },
         )
-        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {
@@ -1549,9 +1121,9 @@ async def test_the_initial_flow_still_creates_an_entry_with_valid_labels(
 def test_the_label_prefill_covers_every_scene_not_just_the_lobby() -> None:
     """预填必须覆盖所有场景的标签并集，不能只列电梯厅的 11 个。
 
-    scene_labels 非空时会**全局替换** allowed 集合，不区分场景。door_roundtrip
-    的 short_roundtrip 只属于它自己，若预填漏掉，门锁场景的「短暂外出」就永远
-    无法报出——而且没有任何报错。
+    scene_labels 非空时会**全局替换** allowed 集合，不区分场景。漏掉某个标签它
+    就永远无法报出，而且没有任何报错——short_roundtrip 在门场景删除后就落进过
+    这个坑，靠这个测试抓出来。
     """
     from custom_components.frigate_vision.const import DEFAULT_SCENE_LABELS
     from custom_components.frigate_vision.scenes import SCENES, parse_scene_labels

@@ -21,11 +21,12 @@ def test_activity_round_trip_keeps_only_whitelisted_fields() -> None:
     assert "raw_payload" not in payload
     assert models.ActivityRecord.from_dict(payload) == record
 
+    # A payload carrying a removed field must be rejected rather than silently
+    # dropped: the owner chose to delete old records rather than migrate them,
+    # and an unknown field is the loudest way for that choice to surface.
     legacy = payload | {"doorbell_at": 101.0}
-    legacy.pop("doorbell_times")
-    restored = models.ActivityRecord.from_dict(legacy)
-    assert restored.doorbell_at == 101
-    assert restored.doorbell_times == (101,)
+    with pytest.raises(models.ModelValidationError, match="unknown_activity_field"):
+        models.ActivityRecord.from_dict(legacy)
 
 
 def test_activity_rejects_unsafe_identity_and_unknown_stage() -> None:
@@ -64,7 +65,11 @@ def test_activity_rejects_unsafe_identity_and_unknown_stage() -> None:
                 "camera": "front",
             }
         )
-    with pytest.raises(models.ModelValidationError, match="invalid_door_state"):
+    with pytest.raises(
+        models.ModelValidationError, match="unknown_activity_field"
+    ):
+        # `door_remained_open` was removed with the door cycle; a stored record
+        # carrying it must fail loudly rather than load with the field dropped.
         models.ActivityRecord.from_dict(
             {
                 "schema_version": 1,
@@ -95,7 +100,6 @@ def test_activity_rejects_unsafe_identity_and_unknown_stage() -> None:
 
 
 def test_stable_keys_are_deterministic_and_attempt_is_explicit() -> None:
-    assert models.door_activity_id("entry_1", 123.5) == "door_entry_1_123500"
     assert models.review_activity_id("entry_1", "front", "review.abc") == (
         "review_entry_1_front_review.abc"
     )
@@ -116,9 +120,9 @@ def test_ingress_message_rejects_duplicate_zones_and_invalid_time() -> None:
         )
     with pytest.raises(models.ModelValidationError, match="invalid_timestamp"):
         models.IngressMessage(
-            kind=models.IngressKind.DOOR,
+            kind=models.IngressKind.FRIGATE_REVIEW,
             entry_id="entry_1",
-            source_id="door_1",
+            source_id="review_1",
             occurred_at=float("nan"),
         )
 
@@ -323,8 +327,12 @@ def test_a_legacy_payload_without_a_box_still_loads() -> None:
     """旧存档没有 box 键，必须仍能读回 —— 否则升级后历史活动全部解析失败。
 
     `ActivityRecord` 会写到磁盘，`IngressMessage` 也会进缓冲区存档。升级后第一次
-    读到升级前写下的 payload 时，两层缺的键都必须落到默认值，而不是抛
+    读到升级前写下的 payload 时，缺的键必须落到默认值，而不是抛
     `ModelValidationError`（那会让整个 store 读不出来，看起来像存档损坏）。
+
+    `processing_mode` 的兼容方向相反：它随三档模式一起删除了，业主选择直接清空
+    历史而不是迁移，所以带这个键的旧 payload 必须被拒 —— 拒绝是那个决定的声音，
+    静默吞掉反而会让人以为历史还在。
     """
     legacy_ingress = {
         "kind": "frigate_event",
@@ -339,13 +347,15 @@ def test_a_legacy_payload_without_a_box_still_loads() -> None:
         "current_zones": ["near"],
         "entered_zones": ["near"],
         "detection_ids": [],
-        "processing_mode": None,
         "manual": False,
     }
     assert "box" not in legacy_ingress
     message = models.IngressMessage.from_dict(legacy_ingress)
     assert message.box is None
     assert message.current_zones == ("near",)
+
+    with pytest.raises(models.ModelValidationError, match="unknown_ingress_field"):
+        models.IngressMessage.from_dict(legacy_ingress | {"processing_mode": None})
 
     legacy_activity = _standalone_payload()
     assert "box_updates" not in legacy_activity

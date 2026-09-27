@@ -45,23 +45,24 @@ def test_a_scene_version_changes_only_its_own_cache_key() -> None:
     """Versions must be per scene, not global.
 
     The version is part of the analysis cache key. With one shared version, a
-    wording change for the door invalidates every unrelated analysis -- and a
-    scene's cached result would survive a change to its own prompt if some other
-    scene's version happened to cover it.
+    wording change for one purpose invalidates every unrelated analysis.
 
-    Distinct *current* values are not required; what matters is that each scene
-    owns its version, so the two can diverge independently.
+    The registry holds a single scene now, so the second scene this test once
+    compared against is gone. What survives is the property the key must keep:
+    the version is the only input that separates two analyses of one activity,
+    so changing it must change the key, every time.
     """
     from custom_components.frigate_vision.vision import analysis_key
 
     base = scene_for("review_six")
-    other = scene_for("door_single")
-    assert base is not None and other is not None
+    assert base is not None
 
     # Bumping a scene's own version must invalidate just that scene's analyses.
     bumped = analysis_key("activity", base.mode, "bumped_version")
     assert bumped != analysis_key("activity", base.mode, base.prompt_version)
     assert bumped.endswith("bumped_version")
+    # A second scene at the same version must still not collide.
+    assert bumped != analysis_key("activity", "another_mode", "bumped_version")
 
 
 def test_the_cache_key_separates_scenes() -> None:
@@ -70,14 +71,18 @@ def test_the_cache_key_separates_scenes() -> None:
     The key must identify the question as well as the record, or a result
     produced under one scene's rules would be reused for another's -- and two
     scenes that happen to share a prompt version would collide outright.
+
+    The registry holds one scene now, but the key must still separate modes:
+    `effective_prompt_version` folds a description into the version, and an
+    unknown mode must never silently reuse the review's key.
     """
     from custom_components.frigate_vision.vision import analysis_key
 
     review = analysis_key("activity", "review_six", "prompt_3")
-    door = analysis_key("activity", "door_single", "prompt_3")
-    assert review != door, "the same activity under two scenes must not collide"
+    other = analysis_key("activity", "unregistered_mode", "prompt_3")
+    assert review != other, "the same activity under two scenes must not collide"
     assert "review_six" in review
-    assert "door_single" in door
+    assert "unregistered_mode" in other
 
 
 def test_every_scene_owns_its_version_field() -> None:
@@ -101,18 +106,14 @@ def test_unknown_mode_is_rejected_rather_than_guessed() -> None:
 def test_a_scene_declares_the_signals_it_consumes() -> None:
     """Auxiliary inputs are declared, so the seam is explicit.
 
-    The door scenes read door-lock state; the general review scene does not.
-    Declaring it makes the dependency visible and reviewable rather than buried
-    in a prompt string.
+    The general review scene deliberately declares no signals: it gets all of
+    its context from the frames and the deployment's description. Declaring the
+    dependency would be the only thing making it visible and reviewable, so the
+    empty set is itself the contract now.
     """
     review = scene_for("review_six")
     assert review is not None
     assert review.signals == frozenset(), "the general scene needs no extra input"
-
-    roundtrip = scene_for("door_roundtrip")
-    assert roundtrip is not None
-    assert "door_remained_open" in roundtrip.signals
-    assert "opening_side" in roundtrip.signals
 
 
 def test_a_scene_receives_only_the_signals_it_declared() -> None:
@@ -120,7 +121,8 @@ def test_a_scene_receives_only_the_signals_it_declared() -> None:
 
     This is the isolation that makes a new scene safe to add: it cannot come to
     depend on another scene's context by accident, because that context is never
-    handed to it.
+    handed to it. The door scenes that consumed lock state are gone, but the
+    guarantee must hold for whatever scene is added next.
     """
     general = scene_for("review_six")
     assert general is not None
@@ -130,21 +132,10 @@ def test_a_scene_receives_only_the_signals_it_declared() -> None:
         signals={"door_remained_open": True, "opening_side": "inside"},
     )
     prompt = general.render(request)
-    # The door state is present in the request but the scene declared none, so
+    # The extra state is present in the request but the scene declared none, so
     # none of it may appear in the prompt.
     assert "持续开启" not in prompt
     assert "inside" not in prompt
-
-    door = scene_for("door_roundtrip")
-    assert door is not None
-    door_prompt = door.render(
-        SceneRequest(
-            language="中文",
-            allowed=door.classifications,
-            signals={"door_remained_open": True, "opening_side": "inside"},
-        )
-    )
-    assert "持续开启" in door_prompt
 
 
 def test_rendering_lists_the_allowed_classifications() -> None:
@@ -229,18 +220,21 @@ def test_changing_the_prompt_body_changes_the_cache_key() -> None:
         "the old wording."
     )
 
+
+def test_every_glossary_definition_is_offered_by_a_scene() -> None:
     """Every definition must name its label, or the model cannot bind it.
 
     Repeating a label the template already defines would also show two versions
-    of one rule, so the two sets must not overlap.
+    of one rule, so the two sets must not overlap. And a definition for a label
+    no scene offers is dead weight the user would copy into their own labels:
+    `short_roundtrip` was exactly this after the door scenes were removed, which
+    is what turned this from a stray docstring back into a checked test.
     """
     from custom_components.frigate_vision.scenes import (
         CLASSIFICATION_GLOSSARY,
         SCENES,
     )
 
-    # The map is shared across scenes, so a label is fair game if *any* scene
-    # offers it -- `short_roundtrip` belongs to the door scene, not this one.
     offered = {label for scene in SCENES.values() for label in scene.classifications}
     for label, text in CLASSIFICATION_GLOSSARY.items():
         assert text.startswith("指"), f"{label}'s definition does not read as one"
@@ -496,32 +490,6 @@ def test_review_scene_does_not_claim_door_lock_knowledge() -> None:
     assert "持续开启" not in prompt
 
 
-def test_door_scene_treats_frames_as_candidates_not_conclusions() -> None:
-    """The lock bounds the activity; it does not name the person's intent."""
-    prompt = _render("door_single", opening_side="inside")
-    assert "候选" in prompt
-    assert "门锁" in prompt
-    assert "不能" in prompt
-    assert "离家候选" in prompt and "不是结论" in prompt
-
-
-def test_roundtrip_scene_reports_the_lock_evidence_it_was_given() -> None:
-    """Each lock state must produce a different, honest statement."""
-    open_prompt = _render(
-        "door_roundtrip", door_remained_open=True, opening_side="inside"
-    )
-    assert "上排" in open_prompt and "下排" in open_prompt
-    assert "持续开启" in open_prompt
-
-    conflict = _render(
-        "door_roundtrip", door_remained_open=False, opening_side="inside"
-    )
-    assert "冲突" in conflict and "不能确认" in conflict
-
-    unknown = _render("door_roundtrip", door_remained_open=None, opening_side="inside")
-    assert "未知" in unknown
-
-
 # --- deployment-supplied scene description (diagnosis defect C) -------------
 # The general prompt's arrival/departure rules speak of "the front door", but
 # nothing told the model which door in frame that is. Measured on this
@@ -601,28 +569,12 @@ def test_the_description_carries_no_authority_of_its_own() -> None:
 def test_only_the_general_scene_accepts_a_description() -> None:
     """Declared, not assumed -- the same isolation `signals` uses.
 
-    The door scenes carry their own preamble about the lift and the off-camera
-    door; a description written for the general scene would duplicate or
-    contradict it. A scene that did not ask for the text must never see it.
+    A scene that did not ask for the description must never see it, even when
+    the caller supplies one. The door scenes that once held their own preamble
+    are gone; what remains is the declaration itself, which is the contract a
+    future scene will be held to.
     """
     assert SCENES["review_six"].accepts_scene_description is True
-    assert SCENES["door_single"].accepts_scene_description is False
-    assert SCENES["door_roundtrip"].accepts_scene_description is False
-
-    marker = "入户门在画面左侧画外"
-    for mode in ("door_single", "door_roundtrip"):
-        scene = SCENES[mode]
-        prompt = scene.render(
-            SceneRequest(
-                language="中文",
-                allowed=scene.classifications,
-                signals=dict.fromkeys(scene.signals, "unknown"),
-                scene_description=marker,
-            )
-        )
-        assert marker not in prompt, (
-            f"{mode} must ignore a description it did not declare"
-        )
 
 
 def test_editing_the_description_changes_the_cache_key() -> None:
@@ -648,9 +600,6 @@ def test_an_unset_description_keeps_the_plain_version() -> None:
     base = SCENES["review_six"].prompt_version
     assert effective_prompt_version("review_six", "") == base
     assert effective_prompt_version("review_six", "   ") == base
-    # A scene that never accepts a description is unaffected even if handed one.
-    door = SCENES["door_single"].prompt_version
-    assert effective_prompt_version("door_single", "任何描述") == door
 
 
 def test_the_effective_version_is_a_valid_cache_key_component() -> None:
@@ -1035,26 +984,6 @@ def test_nothing_configured_keeps_the_bare_base_version() -> None:
     assert effective_prompt_version("review_six", "", prompt_override="") == "prompt_6"
     blank = effective_prompt_version("review_six", "", prompt_override="   ")
     assert blank == "prompt_6"
-
-
-def test_door_scenes_still_key_on_custom_labels() -> None:
-    """门锁场景不接受「现场布局」，但仍必须让标签参与缓存键。
-
-    早返回 `if not scene.accepts_scene_description: return base` 的语义是
-    「这个场景是否接受现场布局描述」，不代表「是否接受自定义标签」。若把新输入
-    接在那个早返回之后，门锁场景改标签就不会换键，用户会拿到上一次提示词的
-    存储结果——这正是本项目已踩过两次的失败形状。
-    """
-    from custom_components.frigate_vision.scenes import effective_prompt_version
-
-    for mode in ("door_single", "door_roundtrip"):
-        base = effective_prompt_version(mode, "")
-        with_labels = effective_prompt_version(
-            mode, "", scene_labels=(("短暂外出", "出门后很快返回"),)
-        )
-        assert with_labels != base, f"{mode} 的标签没有参与缓存键"
-        with_override = effective_prompt_version(mode, "", prompt_override="自定义规则")
-        assert with_override != base, f"{mode} 的提示词覆盖没有参与缓存键"
 
 
 def _review_prompt(*, highlight: bool, description: str = "") -> str:

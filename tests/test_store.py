@@ -63,17 +63,22 @@ async def test_store_same_identity_is_idempotent(hass: HomeAssistant) -> None:
     assert first == second
 
 
-async def test_recovery_preserves_conflicting_cycles_as_failures(
+async def test_recovery_leaves_collecting_records_alone(
     hass: HomeAssistant,
 ) -> None:
+    """恢复不得碰它无法判定结果未知与否的阶段。
+
+    门周期删除前，「同一摄像头多个 collecting」会被恢复成 FAILED——那是门锁
+    状态机的专有冲突。现在 `async_recover` 只标记 ANALYSIS_STARTED /
+    DELIVERY_STARTED（结果未知，可能已扣费），其余非终态留给 RecoveryWork。
+    一份 COLLECTING 记录经过恢复后必须原样保留。
+    """
     store = ActivityStore(hass, "entry_1")
     await store.async_load()
     await store.async_create(_record())
     await store.async_create(replace(_record(), activity_id="activity_2"))
     recovered = await store.async_recover(200)
-    assert len(recovered) == 2
-    assert all(item.stage is ActivityStage.FAILED for item in recovered)
-    assert all(item.error_code == "conflicting_door_cycles" for item in recovered)
+    assert all(item.stage is ActivityStage.COLLECTING for item in recovered)
     assert len(store.all()) == 2
 
 

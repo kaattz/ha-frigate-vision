@@ -9,7 +9,6 @@ from homeassistant.core import HomeAssistant
 from custom_components.frigate_vision.correlation import (
     CorrelationEngine,
     CorrelationError,
-    ZoneRoles,
     find_review_owner,
 )
 from custom_components.frigate_vision.models import (
@@ -280,15 +279,23 @@ async def test_failed_review_delete_failure_retries_as_terminal_cleanup(
         camera="front",
         detection_ids=("shared",),
     )
-    doorbell = IngressMessage(
-        kind=IngressKind.DOORBELL,
+    # A second buffered review of the same ambiguous detection: both entries
+    # must survive a failed settle and be cleaned up together once it succeeds.
+    # (This scenario once used a buffered doorbell for the second entry; the
+    # doorbell buffer is gone with the door cycle, but the cleanup guarantee --
+    # a failed delete must not silently drop buffered work -- is unchanged.)
+    second_review = IngressMessage(
+        kind=IngressKind.FRIGATE_REVIEW,
         entry_id="entry_1",
-        source_id="bell_1",
-        occurred_at=85,
+        source_id="review_ambiguous_2",
+        review_id="review_ambiguous_2",
+        started_at=80,
+        occurred_at=90,
         camera="front",
+        detection_ids=("shared",),
     )
     assert await engine.async_handle(review) is None
-    assert await engine.async_handle(doorbell) is None
+    assert await engine.async_handle(second_review) is None
     for activity_id in ("door_1", "door_2"):
         await store.async_create(_activity(activity_id, ("shared",)))
 
@@ -303,7 +310,13 @@ async def test_failed_review_delete_failure_retries_as_terminal_cleanup(
 
     store._store.async_save = AsyncMock()  # type: ignore[method-assign]
     settled = await engine.async_settle_due(110)
-    assert settled == (failed,)
+    # Both buffered reviews settle as failed activities now -- the doorbell
+    # entry once skipped this by attaching as context, but it is gone.
+    assert sorted(item.activity_id for item in settled) == [
+        "review_entry_1_front_review_ambiguous",
+        "review_entry_1_front_review_ambiguous_2",
+    ]
+    assert all(item.stage is ActivityStage.FAILED for item in settled)
     assert store.buffered_ingress() == ()
 
 

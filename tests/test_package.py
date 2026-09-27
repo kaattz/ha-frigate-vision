@@ -43,11 +43,9 @@ def test_manifest_and_strings_expose_supported_contract() -> None:
     assert "after_dependencies" not in manifest
     assert set(strings["config"]["step"]) == {
         "user",
-        "door",
         "llmvision",
         "options",
         "reconfigure",
-        "reconfigure_door",
     }
     assert {"cannot_connect", "invalid_zones", "llm_missing_key"} <= set(
         strings["config"]["error"]

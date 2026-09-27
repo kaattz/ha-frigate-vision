@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 
 from custom_components.frigate_vision.correlation import ZoneRoles
 from custom_components.frigate_vision.media import (
     EventWindow,
-    MediaError,
     plan_evidence,
 )
 from custom_components.frigate_vision.models import (
@@ -41,7 +38,14 @@ ROLES = ZoneRoles(
 )
 
 
-def test_single_direction_plans_three_strictly_ordered_frames() -> None:
+def test_review_planning_ignores_door_style_detection_tracks() -> None:
+    """门方向规划（door_single 三帧 / door_roundtrip 六帧）已随门周期删除。
+
+    一条仍带检测轨迹的 review 记录必须走 review 布局并忽略那些轨迹：
+    把 3 帧的方向证据画进 6 格的 review 拼图，模型会给出一个看似合法、
+    实则答非所问的分类。轨迹只能通过 motion_paths 进来，不能靠
+    detection_zone_updates 自己生效。
+    """
     record = _door(
         (
             ("event_1", 102, ("near",)),
@@ -49,100 +53,18 @@ def test_single_direction_plans_three_strictly_ordered_frames() -> None:
             ("event_1", 120, ("far",)),
         )
     )
-    plan = plan_evidence(record, {"event_1": EventWindow("event_1", 101, 121)}, ROLES)
-    assert plan.mode == "door_single"
-    assert plan.sample_times == (102, 110, 120)
-
-
-def test_direction_reversal_and_two_events_plan_six_frames() -> None:
-    reversal = _door(
-        (
-            ("event_1", 102, ("near",)),
-            ("event_1", 106, ("mid",)),
-            ("event_1", 110, ("far",)),
-            ("event_1", 114, ("far",)),
-            ("event_1", 116, ("mid",)),
-            ("event_1", 120, ("near",)),
-        )
-    )
-    assert (
-        len(
-            plan_evidence(
-                reversal, {"event_1": EventWindow("event_1", 101, 121)}, ROLES
-            ).sample_times
-        )
-        == 6
-    )
-
-    split = replace(
-        _door(
-            (
-                ("event_1", 102, ("near",)),
-                ("event_1", 110, ("far",)),
-                ("event_2", 140, ("far",)),
-                ("event_2", 148, ("near",)),
-            ),
-            detections=("event_1", "event_2"),
-        ),
-        updated_at=150,
-        association_deadline=160,
-        finalization_deadline=240,
-    )
     plan = plan_evidence(
-        split,
-        {
-            "event_1": EventWindow("event_1", 101, 112),
-            "event_2": EventWindow("event_2", 139, 149),
-        },
-        ROLES,
+        record, {"event_1": EventWindow("event_1", 101, 121)}, ROLES
     )
-    assert plan.mode == "door_roundtrip"
-    assert len(plan.sample_times) == 6
-    assert list(plan.sample_times) == sorted(plan.sample_times)
-
-    # Two segments that do not form an outbound/inbound pair fall back to the
-    # conservative plan rather than failing. A door cycle must not be lost just
-    # because zone updates stayed near the door, so `door_single` is the
-    # deliberate outcome -- the vision model then decides from the frames.
-    # Here both events read near -> far, so no reversal is detectable.
-    no_reversal = replace(
-        split,
-        detection_zone_updates=(
-            ("event_1", 102, ("near",)),
-            ("event_1", 110, ("far",)),
-            ("event_2", 140, ("near",)),
-            ("event_2", 148, ("far",)),
-        ),
+    # The review layout wins: 9 change candidates, and the door-era
+    # zone-anchor sample times are nowhere in the plan.
+    assert plan.mode == "review_six"
+    assert plan.selection_source == "image_change"
+    assert len(plan.change_candidates) == 9
+    assert plan.sample_times == ()
+    assert not any(
+        time in (102, 110, 120) for time in plan.change_candidates
     )
-    fallback = plan_evidence(
-        no_reversal,
-        {
-            "event_1": EventWindow("event_1", 101, 112),
-            "event_2": EventWindow("event_2", 139, 149),
-        },
-        ROLES,
-    )
-    assert fallback.mode == "door_single"
-    assert fallback.selection_source == "zone_anchor"
-    assert len(fallback.sample_times) == 3
-    assert list(fallback.sample_times) == sorted(fallback.sample_times)
-
-    # An observation outside its own event window is a hard error: the
-    # correlation itself is wrong, not merely inconclusive.
-    outside = replace(
-        split,
-        detection_ids=("event_1",),
-        detection_zone_updates=(
-            ("event_1", 90, ("near",)),
-            ("event_1", 110, ("far",)),
-        ),
-    )
-    with pytest.raises(MediaError, match="event_timeline_outside_window"):
-        plan_evidence(
-            outside,
-            {"event_1": EventWindow("event_1", 101, 112)},
-            ROLES,
-        )
 
 
 def test_standalone_review_plans_change_candidates_and_postroll() -> None:
@@ -167,12 +89,6 @@ def test_standalone_review_plans_change_candidates_and_postroll() -> None:
     assert all(
         plan.first_time < value < plan.last_time for value in plan.change_candidates
     )
-
-
-def test_ambiguous_single_detection_fails() -> None:
-    record = _door((("event_1", 102, ("near",)),))
-    with pytest.raises(MediaError, match="direction_ambiguous"):
-        plan_evidence(record, {"event_1": EventWindow("event_1", 101, 121)}, ROLES)
 
 
 def test_person_may_start_before_review_when_detection_id_matches() -> None:
@@ -247,19 +163,6 @@ def test_standalone_review_falls_back_when_path_points_are_insufficient() -> Non
     assert plan.selection_source == "image_change"
     assert plan.motion_times == ()
     assert len(plan.change_candidates) == 9
-
-
-def test_door_cycle_plan_marks_zone_anchor_source() -> None:
-    record = _door(
-        (
-            ("event_1", 102, ("near",)),
-            ("event_1", 110, ("mid",)),
-            ("event_1", 120, ("far",)),
-        )
-    )
-    plan = plan_evidence(record, {"event_1": EventWindow("event_1", 101, 121)}, ROLES)
-    assert plan.selection_source == "zone_anchor"
-    assert plan.motion_times == ()
 
 
 def test_person_track_may_outlive_review_window() -> None:

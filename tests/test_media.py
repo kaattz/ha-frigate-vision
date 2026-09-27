@@ -256,10 +256,12 @@ def _sealed_record_with_boxes(
         (110.0, (0.30, 0.35, 0.32, 0.55)),
     ),
 ) -> ActivityRecord:
-    """A SEALED door-cycle record, the shape the media manager can build from.
+    """A SEALED review record, the shape the media manager can build from.
 
-    Door-cycle detection updates are what place the sample times; `boxes` is the
-    per-instant person box the close-up is chosen from.
+    The review layout derives its sample times from the event window; `boxes`
+    is the per-instant person box the close-up is chosen from. The detection
+    zone updates a door cycle once planned from are carried along verbatim:
+    the review planner must ignore them, and keeping them here proves it does.
     """
     return ActivityRecord(
         activity_id=activity_id,
@@ -810,10 +812,11 @@ async def test_media_manager_builds_once_and_atomically_registers(
     completed = await manager.async_build(record.activity_id)
     assert completed.stage is ActivityStage.EVIDENCE_READY
     assert completed.evidence_path is not None
-    assert client.snapshot_calls == 3
+    # The review layout fetches first + last + 9 change candidates + postroll.
+    assert client.snapshot_calls == 12
     again = await manager.async_build(record.activity_id)
     assert again == completed
-    assert client.snapshot_calls == 3
+    assert client.snapshot_calls == 12
 
 
 async def test_media_manager_serializes_concurrent_builds(
@@ -871,7 +874,9 @@ async def test_media_manager_serializes_concurrent_builds(
         manager.async_build(record.activity_id), manager.async_build(record.activity_id)
     )
     assert first == second
-    assert client.calls == 3
+    # The review layout fetches first + last + 9 change candidates + postroll;
+    # a concurrent second build must not re-fetch any of them.
+    assert client.calls == 12
 
 
 async def test_evidence_ready_requires_valid_registered_artifact(
@@ -3094,7 +3099,7 @@ async def test_an_unreachable_face_service_still_produces_a_close_up(
     assert completed.evidence_path is not None
     with Image.open(completed.evidence_path) as sheet:
         # 服务不可达时仍须拼出特写（退回面积最大），而不是降级成纯九宫格。
-        _assert_has_close_up_strip(sheet, rows=1)
+        _assert_has_close_up_strip(sheet, rows=2)
 
 
 async def test_the_manager_adds_a_close_up_when_the_option_is_on(
@@ -3139,7 +3144,7 @@ async def test_the_manager_adds_a_close_up_when_the_option_is_on(
     completed = await manager.async_build(record.activity_id)
     assert completed.evidence_path is not None
     with Image.open(completed.evidence_path) as sheet:
-        _assert_has_close_up_strip(sheet, rows=1)
+        _assert_has_close_up_strip(sheet, rows=2)
 
 
 async def test_the_manager_omits_the_close_up_when_the_option_is_off(

@@ -30,7 +30,6 @@ def _record(**overrides: object) -> ActivityRecord:
         "entry_id": "entry_1",
         "source": ActivitySource.STANDALONE_REVIEW,
         "stage": ActivityStage.COMPLETED,
-        "processing_mode": ProcessingMode.LIVE,
         "created_at": 100.0,
         "updated_at": 140.0,
         "camera": "front",
