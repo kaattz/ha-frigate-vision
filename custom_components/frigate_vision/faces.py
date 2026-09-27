@@ -154,18 +154,25 @@ async def faces_for_frames(
 
 
 def candidate_frames(
-    frames: Iterable[tuple[str, bytes, Sequence[float]]],
+    frames: Iterable[tuple[str, Any]],
     limit: int = FACE_SERVICE_CANDIDATES,
-) -> list[tuple[str, bytes, Sequence[float]]]:
-    """The frames worth asking about, largest box first.
+) -> list[tuple[str, Any]]:
+    """The frames worth asking about, spread across the activity.
 
-    Ordered by box area so that the cap keeps the most promising candidates: if
-    only some can be checked, the ones with the most person in them are the ones
-    whose pose matters.
+    Ordered by timestamp and then thinned evenly, rather than simply truncated.
+    The candidates are the sheet's own sample frames, which already span the
+    activity in order, and taking the first N would check only its opening -- the
+    part where the person is furthest away and least likely to be facing the
+    camera. Spreading keeps candidates from across the clip, which is where a
+    frontal frame appears.
+
+    The element type is opaque here on purpose: the caller passes `(id, path)` and
+    reads the paths back. Only the count and the order are this function's business.
     """
-    ordered = sorted(
-        frames,
-        key=lambda item: float(item[2][2]) * float(item[2][3]),
-        reverse=True,
-    )
-    return ordered[:limit]
+    ordered = sorted(frames, key=lambda item: item[0])
+    if len(ordered) <= limit or limit < 2:
+        return ordered[:limit]
+    # Evenly spaced with both endpoints included: the last frame is as much a
+    # candidate as the first, and truncating the index would never look at it.
+    step = (len(ordered) - 1) / (limit - 1)
+    return [ordered[round(index * step)] for index in range(limit)]

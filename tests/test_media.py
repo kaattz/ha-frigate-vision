@@ -2773,6 +2773,87 @@ def test_the_service_url_accepts_what_a_person_would_type() -> None:
         assert normalise_service_url(typed) == "http://192.168.166.50:8788/face", typed
 
 
+def test_candidates_spread_across_the_activity_not_just_its_start() -> None:
+    """候选要覆盖整段活动，不能只取开头几帧。
+
+    这是真实测出来的：用 detection 快照当候选时只有 1 个候选（检出人脸 0 个），
+    无从挑选，特写还是背影。改用九宫格自己的 sample_times（6 帧）后有 2 帧检出
+    正脸 —— 而正面帧出现在活动中段，取前 N 个就永远看不到。
+    """
+    from custom_components.frigate_vision.faces import candidate_frames
+
+    frames = [(str(100 + i), f"p{i}") for i in range(9)]
+    picked = candidate_frames(frames, 6)
+    assert len(picked) == 6
+    assert picked[0][0] == "100", "丢了首帧"
+    assert picked[-1][0] == "108", "丢了末帧 —— 末帧和首帧一样是候选"
+    # Spread, not truncated: the middle frames must be represented.
+    assert picked[3][0] not in ("100", "101", "102", "103"), "只取了开头一段"
+    # Under the cap everything is kept, in order.
+    assert [t for t, _ in candidate_frames(frames[:3], 6)] == ["100", "101", "102"]
+
+
+async def test_the_close_up_prefers_a_frontal_frame_from_the_sheet(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """九宫格里有正脸时，特写改用它 —— 用真实回调，不是模拟。
+
+    服务被替换成"只有中段那帧有脸"，以复现用户的场景：detection 快照是背影，
+    而九宫格自己的帧里有正面。
+    """
+    import custom_components.frigate_vision.faces as faces_module
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _sealed_record_with_boxes("activity_1")
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id, "camera": camera, "label": "person",
+                "start_time": 100, "end_time": 120,
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            return [{"start_time": after - 1, "end_time": before + 1}]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+        async def async_get_event_snapshot(self, event_id, camera, height):
+            return _changing_jpeg(float(hash(event_id) % 200) + 20.0)
+
+    asked: list[str] = []
+
+    async def fake_faces(_hass, _url, frames, **_kwargs):
+        # The third frame is the frontal one; everything else is a back.
+        for index, (frame_id, _data, _box) in enumerate(frames):
+            asked.append(frame_id)
+            if index == 2:
+                return {frame_id: True}
+        return {}
+
+    original = faces_module.faces_for_frames
+    faces_module.faces_for_frames = fake_faces
+    try:
+        manager = MediaManager(
+            hass, store, Client(), tmp_path,
+            ZoneRoles(near=frozenset({"near"}), transition=frozenset({"mid"}),
+                      far=frozenset({"far"})),
+            person_highlight=True,
+            target_width=_TARGET_WIDTH,
+            face_service_url="http://face.invalid/face",
+        )
+        completed = await manager.async_build(record.activity_id)
+    finally:
+        faces_module.faces_for_frames = original
+
+    assert completed.stage is ActivityStage.EVIDENCE_READY
+    assert asked, "候选帧没被送去问人脸 —— 说明候选源还是 detection 快照"
+    assert len(asked) > 1, "只问了一个候选，无从挑选"
+
+
 async def test_an_unreachable_face_service_still_produces_a_close_up(
     hass: HomeAssistant, tmp_path
 ) -> None:

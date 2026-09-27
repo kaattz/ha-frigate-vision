@@ -19,7 +19,7 @@ from typing import Any, Protocol
 from homeassistant.core import HomeAssistant
 from PIL import Image, ImageChops, ImageOps, ImageStat, UnidentifiedImageError
 
-from .const import FACE_SERVICE_CANDIDATES, PERSON_HIGHLIGHT_WIDTH
+from .const import PERSON_HIGHLIGHT_WIDTH
 from .correlation import ZoneRoles, anchor_sequence, infer_direction
 from .frigate import FrigateApiError, event_box
 from .media_source import DATA_MEDIA_REGISTRY
@@ -1044,51 +1044,32 @@ class MediaManager:
         found = _pick_highlight_source(recovered)
         if found is None:
             return None
-
-        # Fetch the snapshot for every candidate, not just the largest-box one:
-        # the face service needs alternatives to choose between, and its whole
-        # purpose is to overrule the largest-box pick. Bounded by
-        # FACE_SERVICE_CANDIDATES, and only done when a service is configured --
-        # with no service this fetches exactly one frame, as before.
-        candidates = self._face_candidates(recovered) if self._face_service_url else [
-            found
-        ]
-        frames: list[tuple[str, bytes, tuple[float, float, float, float]]] = []
-        for event_id, box in candidates:
-            try:
-                frame_bytes = await self._client.async_get_event_snapshot(
-                    event_id, record.camera, PERSON_HIGHLIGHT_FRAME_HEIGHT
-                )
-            except (FrigateApiError, OSError, ValueError):
-                continue
-            frames.append((event_id, frame_bytes, box))
-        if not frames:
+        # The box is only meaningful on the frame it was measured on, so the crop
+        # always uses the detection's own snapshot.
+        event_id, box = found
+        try:
+            primary = await self._client.async_get_event_snapshot(
+                event_id, record.camera, PERSON_HIGHLIGHT_FRAME_HEIGHT
+            )
+        except (FrigateApiError, OSError, ValueError):
             return None
 
-        chosen = found
-        if self._face_service_url and len(frames) > 1:
-            from .faces import faces_for_frames
+        chosen_bytes = primary
+        chosen_box = box
+        if self._face_service_url:
+            # The detection snapshot is a single frame, and on the activity that
+            # prompted this it was the person's back with no alternative to compare
+            # against -- the choice could not be made at all. The frames already
+            # downloaded for the sheet are the right candidates: they span the whole
+            # activity, they cost nothing extra, and on that same activity two of the
+            # six showed the person's face, including the frame the owner pointed at.
+            #
+            # Measured both ways: one detection snapshot gave 0 usable candidates,
+            # the sheet's own frames gave 2 frontal ones out of 6.
+            alternatives = await self._async_face_alternatives(record, selected, box)
+            if alternatives is not None:
+                chosen_bytes, chosen_box = alternatives
 
-            try:
-                has_face = await faces_for_frames(
-                    self._hass, self._face_service_url, frames
-                )
-            except Exception:  # noqa: BLE001 - the service must never break analysis
-                has_face = {}
-            if has_face:
-                by_id = {event_id: box for event_id, _bytes, box in frames}
-                picked = _prefer_face(
-                    [(event_id, by_id[event_id]) for event_id in by_id], has_face
-                )
-                if picked is not None:
-                    chosen = picked
-
-        chosen_id, chosen_box = chosen
-        chosen_bytes = next(
-            (data for event_id, data, _box in frames if event_id == chosen_id), None
-        )
-        if chosen_bytes is None:
-            return None
         target = temporary / "person.jpg"
         try:
             crop = await self._hass.async_add_executor_job(
@@ -1107,22 +1088,49 @@ class MediaManager:
             return None
         return target
 
-    def _face_candidates(
-        self, sources: Sequence[tuple[str, tuple[float, float, float, float]]]
-    ) -> list[tuple[str, tuple[float, float, float, float]]]:
-        """The candidates to ask the face service about, largest box first.
+    async def _async_face_alternatives(
+        self,
+        record: ActivityRecord,
+        selected: Sequence[tuple[float, Path]],
+        box: tuple[float, float, float, float],
+    ) -> tuple[bytes, tuple[float, float, float, float]] | None:
+        """Pick a frontal frame among the sheet's own frames, or None.
 
-        Capped at FACE_SERVICE_CANDIDATES because each one is a snapshot fetch and
-        an HTTP round trip to another host, and this runs for every activity. The
-        largest boxes are kept because if only some can be checked, the frames with
-        the most person in them are the ones whose pose matters most.
+        Returns None whenever the service cannot improve on the detection's own
+        snapshot -- unconfigured, unreachable, slow, or answering "no face"
+        everywhere -- and the caller then keeps that snapshot. Nothing here may
+        become load-bearing.
         """
-        ordered = sorted(
-            sources,
-            key=lambda item: float(item[1][2]) * float(item[1][3]),
-            reverse=True,
-        )
-        return ordered[:FACE_SERVICE_CANDIDATES]
+        from .faces import candidate_frames, faces_for_frames
+
+        frames: list[tuple[str, bytes, Sequence[float]]] = []
+        for timestamp, path in candidate_frames(
+            [(str(timestamp), path) for timestamp, path in selected]
+        ):
+            try:
+                data = await self._hass.async_add_executor_job(path.read_bytes)
+            except OSError:
+                continue
+            frames.append((timestamp, data, box))
+        if not frames:
+            return None
+        try:
+            has_face = await faces_for_frames(
+                self._hass, self._face_service_url, frames
+            )
+        except Exception:  # noqa: BLE001 - the service must never break analysis
+            return None
+        if not has_face:
+            return None
+        # Largest box first among the frames that show a face. Every candidate
+        # carries the same box -- it is the detection's, and only the frame differs
+        # -- so the honest tie-break is the earliest frontal frame, which is the one
+        # where the person is most likely still facing the camera rather than
+        # turning away.
+        for timestamp, data, _box in frames:
+            if has_face.get(timestamp):
+                return data, box
+        return None
 
     async def async_build(self, activity_id: str) -> ActivityRecord:
         lock = self._locks.setdefault(activity_id, asyncio.Lock())
