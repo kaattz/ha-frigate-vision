@@ -1256,31 +1256,107 @@ def test_the_options_form_offers_labels_and_a_prompt_override() -> None:
     assert CONF_PROMPT_OVERRIDE in fields
 
 
-def test_the_options_form_offers_the_person_highlight_switch() -> None:
-    """开关必须出现在设置表单上，否则用户打不开它。
+def test_the_close_up_fields_are_reachable_and_on_their_own_form() -> None:
+    """特写与人脸服务必须在【能到达的表单】上，且不再埋在 20 字段底部。
 
-    只加在 `_llm_schema()`（初始流的服务商那一步）是不够的：那个表单在 entry
-    建好之后再也到不了，用户之后只能从选项流改设置。所以它属于 `_options_schema()`
-    —— 初始流的最后一步与选项流都用这一个 schema。
+    这两项原本是 `_options_schema()` 的最后两行 —— 表单第 19/20 位。用户去找人脸
+    服务地址时没找到，报了「没有这个字段」：一个要滚到底才看得见的字段，等于没有。
+
+    同时钉住初始流仍然问这两项：初始流是一次性表单，拆分的只是选项流。
     """
-    from custom_components.frigate_vision.const import CONF_PERSON_HIGHLIGHT
+    from custom_components.frigate_vision.const import (
+        CONF_FACE_SERVICE_URL,
+        CONF_PERSON_HIGHLIGHT,
+    )
     from custom_components.frigate_vision.vision import (
         vision_config_from,
     )
 
-    schema = config_flow._options_schema()
-    fields = {getattr(m, "schema", None) for m in schema.schema}
-    assert CONF_PERSON_HIGHLIGHT in fields, "设置表单上没有人物特写开关"
+    # 选项流：两项在各自的短表单里。
+    close_up = {
+        getattr(m, "schema", None) for m in config_flow._close_up_schema().schema
+    }
+    assert CONF_PERSON_HIGHLIGHT in close_up, "特写表单上没有人物特写开关"
+    assert CONF_FACE_SERVICE_URL in close_up, "特写表单上没有人脸服务地址"
+
+    # 大表单不再重复它们，否则同一项有两个入口、两处默认值。
+    settings = {
+        getattr(m, "schema", None) for m in config_flow._options_schema().schema
+    }
+    assert CONF_PERSON_HIGHLIGHT not in settings
+    assert CONF_FACE_SERVICE_URL not in settings
+
+    # 初始流是一次性表单，仍要问到这两项。
+    setup = {getattr(m, "schema", None) for m in config_flow._setup_schema().schema}
+    assert CONF_PERSON_HIGHLIGHT in setup
+    assert CONF_FACE_SERVICE_URL in setup
 
     # 默认值是关的：既有部署保存一次表单不会意外打开一个会改变缓存键的开关。
     marker = next(
-        m for m in schema.schema if getattr(m, "schema", None) == CONF_PERSON_HIGHLIGHT
+        m
+        for m in config_flow._close_up_schema().schema
+        if getattr(m, "schema", None) == CONF_PERSON_HIGHLIGHT
     )
     default = marker.default
     assert (default() if callable(default) else default) is False
 
     # 表单存下的值要能被读回配置对象，否则开关存了也不生效。
     assert vision_config_from({}, {CONF_PERSON_HIGHLIGHT: True}).person_highlight
+    assert (
+        vision_config_from({}, {CONF_FACE_SERVICE_URL: "http://h:8788"}).face_service_url
+        == "http://h:8788"
+    )
+
+
+async def test_the_close_up_form_merges_instead_of_wiping_the_other_options(
+    hass: HomeAssistant,
+) -> None:
+    """子菜单提交必须【合并】——否则它会静默清空另外 18 项设置。
+
+    `async_create_entry(data=...)` 是整体替换。这个子菜单只提交 2 个字段，直接写回
+    就会把 LLM 地址、密钥、分区、保留天数全部抹掉，而用户只看到「保存成功」。
+    """
+    from custom_components.frigate_vision.const import (
+        CONF_FACE_SERVICE_URL,
+        CONF_PERSON_HIGHLIGHT,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={
+            "processing_mode": "observe",
+            "llm_base_url": "http://keep.me/v1",
+            "llm_api_key": "secret",
+            "target_width": 767,
+            CONF_PERSON_HIGHLIGHT: False,
+        },
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings"}
+    )
+    # The new submenu row is what makes these fields reachable at all.
+    assert "close_up_form" in result["menu_options"], "配置参数下没有人物特写入口"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "close_up_form"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            CONF_PERSON_HIGHLIGHT: True,
+            CONF_FACE_SERVICE_URL: "http://192.168.166.50:8788",
+        },
+    )
+    saved = entry.options
+    assert saved["llm_base_url"] == "http://keep.me/v1", "合并丢了 LLM 地址"
+    assert saved["llm_api_key"] == "secret", "合并丢了密钥"
+    assert saved["target_width"] == 767, "合并丢了宽度"
+    assert saved["processing_mode"] == "observe", "合并丢了处理模式"
+    assert saved[CONF_PERSON_HIGHLIGHT] is True
+    assert saved[CONF_FACE_SERVICE_URL] == "http://192.168.166.50:8788"
 
 
 def test_every_options_field_has_a_translated_label() -> None:

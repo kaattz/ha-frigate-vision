@@ -161,22 +161,29 @@
           "queue_size": "队列上限",
           "min_review_seconds": "最短活动时长（秒）",
           "analyze_night_unknown": "分析夜间未知活动",
-          "analyze_all_far_reviews": "分析所有远端区域 Review",
-          "person_highlight": "人物特写",
-          "face_service_url": "人脸检测服务地址（可选）"
+          "analyze_all_far_reviews": "分析所有远端区域 Review"
         },
         "data_description": {
           "llm_reasoning_effort": "降低推理强度可省费用且不影响推理能力。推理模式可用于完全关闭思考，但关闭后多步推理任务会失败。",
           "min_review_seconds": "短于该时长的活动会被完全忽略：不取帧、不分析。设为 0 表示不过滤。",
           "scene_labels": "每行一条「标签: 定义」，用半角冒号（形如 name: definition，不是中文全角「：」）。留空则使用内置的电梯厅标签集。定义不能省：不给定义模型只能猜，实测弃权率会从 11% 升到 55%。",
-          "prompt_override": "留空则使用内置判断规则。输出契约与现场布局描述仍会自动附加，因为解析器与规则都依赖它们。",
-          "person_highlight": "在证据图右侧附一栏人物放大图，便于辨认衣着与携带物；会略微增加费用。",
-          "face_service_url": "OpenCV 人脸检测服务，用来挑人物特写取哪一帧，例如 http://192.168.166.50:8788。留空则不启用，只按「检测框面积最大」选帧，行为与现在完全一致。服务连不上或超时会自动退回同一规则。"
+          "prompt_override": "留空则使用内置判断规则。输出契约与现场布局描述仍会自动附加，因为解析器与规则都依赖它们。"
         }
       },
       "test_connection": {
         "title": "连通性测试",
         "description": "使用已保存的配置测试：模型 {model}，耗时 {seconds} 秒，消耗 {tokens} Token。能收到回复即表示地址、密钥与模型名称均可用。"
+      },
+      "close_up_form": {
+        "title": "人物特写 / Person close-up",
+        "data": {
+          "person_highlight": "人物特写",
+          "face_service_url": "人脸检测服务地址（可选）"
+        },
+        "data_description": {
+          "person_highlight": "在证据图右侧附一栏人物放大图，便于辨认衣着与携带物；会略微增加费用。",
+          "face_service_url": "OpenCV 人脸检测服务，用来挑人物特写取哪一帧，例如 http://192.168.166.50:8788。留空则不启用，只按「检测框面积最大」选帧，行为与现在完全一致。服务连不上或超时会自动退回同一规则。"
+        }
       }
     },
     "error": {

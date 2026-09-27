@@ -265,7 +265,14 @@ async def test_the_settings_menu_groups_the_form_with_the_connection_test(
         result["flow_id"], {"next_step_id": "settings"}
     )
     assert result["type"] is FlowResultType.MENU, "「配置参数」应是子菜单"
-    assert set(result["menu_options"]) == {"settings_form", "test_connection"}
+    # `close_up_form` joins the other two: the close-up settings were the last rows
+    # of the 20-field form, below the fold, and the owner reported the face-service
+    # field as missing rather than as off-screen.
+    assert set(result["menu_options"]) == {
+        "settings_form",
+        "close_up_form",
+        "test_connection",
+    }
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"next_step_id": "settings_form"}

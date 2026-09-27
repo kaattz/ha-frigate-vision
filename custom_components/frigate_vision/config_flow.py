@@ -161,12 +161,45 @@ def _options_schema() -> vol.Schema:
             ),
             vol.Required("analyze_night_unknown", default=True): bool,
             vol.Required("analyze_all_far_reviews", default=True): bool,
+        }
+    )
+
+
+def _setup_schema() -> vol.Schema:
+    """Everything the initial flow's last step asks for.
+
+    The initial flow is a single form built once, so it carries the close-up fields
+    too; only the options flow splits them onto their own submenu. Built from the
+    two halves rather than as one big literal, which is what stops them from
+    drifting -- each half is defined once and both callers agree by construction.
+
+    `vol.Schema.extend` cannot be used here: it asserts both operands are plain
+    dicts, and both halves are Schemas. Merging the marker dicts is equivalent and
+    is what the schema object is built from anyway.
+    """
+    combined: dict[Any, Any] = {}
+    for schema in (_options_schema(), _close_up_schema()):
+        for marker in schema.schema:
+            combined[marker] = schema.schema[marker]
+    return vol.Schema(combined)
+
+
+def _close_up_schema() -> vol.Schema:
+    """The person close-up's own settings.
+
+    Split out of `_options_schema()` and given its own submenu row, because as the
+    final two rows of that 20-field form they sat below the fold. The owner went
+    looking for the face-service field, did not find it, and reported it as missing
+    rather than as off-screen -- which is the cost of a field nobody scrolls to.
+
+    A schema of its own rather than a slice of the big one, so the submenu form is
+    two rows and the settings form is eighteen. Both stay in step because each is
+    defined once.
+    """
+    return vol.Schema(
+        {
             # 证据图右侧是否再附一栏人物放大特写。默认关：打开会改变发给模型的
             # 图并改变缓存键，属于用户要显式选择的行为变更。
-            #
-            # 放在这个 schema 而不是 `_llm_schema()`：后者是初始流的服务商那一步，
-            # entry 建好之后再也到不了；设置表单是初始流最后一步与选项流共用的
-            # 那一个，用户之后只能从这里改。
             vol.Required(
                 CONF_PERSON_HIGHLIGHT, default=CONF_PERSON_HIGHLIGHT_DEFAULT
             ): bool,
@@ -626,14 +659,14 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
             return self.async_show_form(
                 step_id="options",
                 data_schema=self.add_suggested_values_to_schema(
-                    _options_schema(), user_input
+                    _setup_schema(), user_input
                 ),
                 errors=errors,
             )
         return self.async_show_form(
             step_id="options",
             data_schema=self.add_suggested_values_to_schema(
-                _options_schema(),
+                _setup_schema(),
                 self._data.get("llm") or {},
             ),
         )
@@ -826,8 +859,36 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
             step_id="settings",
             menu_options={
                 "settings_form": "修改参数 / Edit settings",
+                "close_up_form": "人物特写 / Person close-up",
                 "test_connection": "测试视觉模型连通性 / Test provider connection",
             },
+        )
+
+    async def async_step_close_up_form(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """The close-up's own settings, on their own short form.
+
+        These two fields were the last rows of the 20-field settings form, which
+        put them below the fold: the owner could not find the face-service field at
+        all, and reported it as missing rather than as off-screen. A submenu item is
+        one visible row instead of a field nobody scrolls to.
+
+        The save MERGES into the existing options rather than replacing them.
+        `async_create_entry(data=...)` replaces the whole options dict, so returning
+        just these two fields would silently wipe the other eighteen -- the LLM
+        settings, the zones, the retention windows. Merging is what makes a partial
+        form safe here.
+        """
+        if user_input is not None:
+            merged = dict(self.config_entry.options)
+            merged.update(user_input)
+            return self.async_create_entry(data=merged)
+        return self.async_show_form(
+            step_id="close_up_form",
+            data_schema=self.add_suggested_values_to_schema(
+                _close_up_schema(), self.config_entry.options
+            ),
         )
 
     async def async_step_provider(
