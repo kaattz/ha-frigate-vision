@@ -127,11 +127,23 @@ function makeCard(config) {
   };
 }
 
-/** A store entity carrying one notification, as the card reads it. */
+/**
+ * A store entity carrying one notification, as the card reads it.
+ *
+ * Also carries a `callWS` that stands in for Home Assistant's `auth/sign_path`,
+ * because the card re-signs before loading. It reports what it was asked to sign
+ * on `hass.signed`, so a test can assert the card asked for the bare path.
+ */
 function storeWith(item) {
+  const signed = [];
   return {
+    signed,
     states: {
       "sensor.notifications_store": { attributes: { items: item ? [item] : [] } },
+    },
+    callWS(message) {
+      signed.push(message.path);
+      return Promise.resolve({ path: message.path + "?authSig=RESIGNED" });
     },
   };
 }
@@ -139,22 +151,69 @@ function storeWith(item) {
 // --- tests ---------------------------------------------------------------
 
 let failures = 0;
+const queued = [];
+
+/**
+ * Register a test. Runs after every `check()` in the file has been declared, so a
+ * test may be async -- applying a source awaits a re-signing round trip now.
+ */
 function check(name, fn) {
-  try {
-    fn();
-    console.log("ok   " + name);
-  } catch (error) {
-    failures += 1;
-    console.log("FAIL " + name + "\n     " + error.message);
-  }
+  queued.push({ name, fn });
 }
 
-check("offsets are parsed from the pipe-separated string", () => {
+/** Let the card's pending async work settle before asserting on its result. */
+function flush() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function run() {
+  for (const { name, fn } of queued) {
+    try {
+      await fn();
+      console.log("ok   " + name);
+    } catch (error) {
+      failures += 1;
+      console.log("FAIL " + name + "\n     " + error.message);
+    }
+  }
+  console.log(failures ? `\n${failures} FAILED` : "\nALL PASSED");
+  process.exit(failures ? 1 : 0);
+}
+
+check("offsets are parsed from the pipe-separated string", async () => {
   const { card } = makeCard({ notification_id: "alert_1" });
   assert.deepStrictEqual(card._parseOffsets("1.5|9.2|17.8"), [1.5, 9.2, 17.8]);
 });
 
-check("a comma-separated value is NOT split (it never arrives intact)", () => {
+check("a signature-stripped path is what gets re-signed", async () => {
+  // HA's signing secret lives in memory, so every signed URL a stored
+  // notification holds stops working the moment HA restarts -- measured here as
+  // 401 for a URL whose own expiry was still a day away. The card re-signs, and
+  // it must ask for the bare path: the old `authSig` is not part of the path and
+  // including it would sign a different URL than the one it then loads.
+  const { card } = makeCard({ notification_id: "alert_1" });
+  assert.strictEqual(
+    card._pathWithoutSignature("/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=abc.def"),
+    "/api/frigate/vod/cam/start/1/end/2/index.m3u8"
+  );
+  assert.strictEqual(
+    card._pathWithoutSignature("/api/frigate_vision/media/e/a.jpg?authSig=x&height=360"),
+    "/api/frigate_vision/media/e/a.jpg?height=360"
+  );
+  // A URL with no signature is already a path; returning it unchanged keeps the
+  // re-sign idempotent.
+  assert.strictEqual(
+    card._pathWithoutSignature("/api/frigate/vod/cam/start/1/end/2/index.m3u8"),
+    "/api/frigate/vod/cam/start/1/end/2/index.m3u8"
+  );
+  // An absolute URL still yields the path HA signs.
+  assert.strictEqual(
+    card._pathWithoutSignature("http://ha.local:8123/api/x.jpg?authSig=z"),
+    "/api/x.jpg"
+  );
+});
+
+check("a comma-separated value is NOT split (it never arrives intact)", async () => {
   const { card } = makeCard({ notification_id: "alert_1" });
   // HA parses a comma-separated result as a tuple and the notification fails,
   // so a comma here means a value from some other source; parseFloat takes the
@@ -162,12 +221,12 @@ check("a comma-separated value is NOT split (it never arrives intact)", () => {
   assert.deepStrictEqual(card._parseOffsets("1.5,9.2,17.8"), [1.5]);
 });
 
-check("non-numeric entries are dropped, not turned into NaN", () => {
+check("non-numeric entries are dropped, not turned into NaN", async () => {
   const { card } = makeCard({ notification_id: "alert_1" });
   assert.deepStrictEqual(card._parseOffsets("1.5||oops|9.2"), [1.5, 9.2]);
 });
 
-check("a nine-offset notification builds nine cells", () => {
+check("a nine-offset notification builds nine cells", async () => {
   // The sheet grew from 2x3 to 3x3 so the extra probed frames reach the popup.
   // The grid is declared as `grid-auto-rows: 1fr` with one button per offset, so
   // it should follow the count rather than assume two rows -- asserted here
@@ -180,13 +239,14 @@ check("a nine-offset notification builds nine cells", () => {
     evidence_image_url: "/api/frigate_vision/media/e/nine.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7|52.3|61.8|70.2",
   });
+  await flush();
   assert.strictEqual(evidence.hidden, false, "the sheet must be shown");
   assert.strictEqual(cells.children.length, 9, "nine cells for nine offsets");
   assert.strictEqual(cells.children[0].dataset.cell, "1");
   assert.strictEqual(cells.children[8].dataset.cell, "9");
 });
 
-check("the overlay covers the frames and stops before the close-up", () => {
+check("the overlay covers the frames and stops before the close-up", async () => {
   // Reported from the UI: the numbers were on the wrong frames and the close-up
   // was numbered as though it were one of them. The sheet carries a fourth column
   // when the close-up is on, and the overlay was covering it.
@@ -202,6 +262,7 @@ check("the overlay covers the frames and stops before the close-up", () => {
     evidence_image_url: "/api/frigate_vision/media/e/nine.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7|52.3|61.8|70.2",
   });
+  await flush();
   card._sheet.naturalWidth = 1215;
   card._sheet.naturalHeight = 431;
   card._insetFromExtraColumn();
@@ -212,7 +273,7 @@ check("the overlay covers the frames and stops before the close-up", () => {
   );
 });
 
-check("a six-frame sheet with a close-up is two rows, not three", () => {
+check("a six-frame sheet with a close-up is two rows, not three", async () => {
   // The row count comes from the offsets, and real six-frame sheets are 1215x288
   // -- the grid is scaled to the target width before the close-up column is added.
   // Assuming three rows would make the overlay far too narrow.
@@ -224,6 +285,7 @@ check("a six-frame sheet with a close-up is two rows, not three", () => {
     evidence_image_url: "/api/frigate_vision/media/e/six.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7",
   });
+  await flush();
   card._sheet.naturalWidth = 1215;
   card._sheet.naturalHeight = 288;
   card._insetFromExtraColumn();
@@ -234,7 +296,7 @@ check("a six-frame sheet with a close-up is two rows, not three", () => {
   );
 });
 
-check("a grid-only sheet keeps the full width", () => {
+check("a grid-only sheet keeps the full width", async () => {
   // Both shapes have to stay correct: with no close-up the image is exactly the
   // frames, so the overlay covers all of it and no inset appears.
   for (const [offsets, width, height, label] of [
@@ -249,6 +311,7 @@ check("a grid-only sheet keeps the full width", () => {
       evidence_image_url: "/api/frigate_vision/media/e/nine.jpg?authSig=Y",
       evidence_offsets: offsets,
     });
+    await flush();
     card._sheet.naturalWidth = width;
     card._sheet.naturalHeight = height;
     card._insetFromExtraColumn();
@@ -260,7 +323,68 @@ check("a grid-only sheet keeps the full width", () => {
   }
 });
 
-check("a source with a sheet builds one button per offset", () => {
+check("the overlay is sized once the image loads, when it is not yet cached", async () => {
+  // The path the previous attempt got wrong. The card assigns `src` and sizes the
+  // overlay in the same tick, so the dimensions are not there yet -- and a test
+  // that sets `naturalWidth` by hand never notices. Here the dimensions arrive
+  // only when the load event fires, which is what a first-time (uncached) view
+  // does.
+  const { card, cells } = makeCard({ notification_id: "alert_nine" });
+  cells.style = {};
+  card._sheet.complete = false;
+  card._sheet.naturalWidth = 0;
+  card._sheet.naturalHeight = 0;
+  card.hass = storeWith({
+    id: "alert_nine",
+    hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
+    evidence_image_url: "/api/frigate_vision/media/e/nine.jpg?authSig=Y",
+    evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7|52.3|61.8|70.2",
+  });
+  await flush();
+  // The overlay cannot be sized yet, so it must at least not throw on the missing
+  // dimensions, and it must have registered a listener for when they arrive.
+  assert.strictEqual(card._sheet.listeners.load.length, 1, "must wait for load");
+  // Now the image arrives.
+  card._sheet.complete = true;
+  card._sheet.naturalWidth = 1215;
+  card._sheet.naturalHeight = 431;
+  card._sheet.dispatch("load");
+  const width = parseFloat(cells.style.width);
+  assert.ok(
+    Math.abs(width - 63.1) < 0.3,
+    "sizing must happen on load, got " + cells.style.width
+  );
+});
+
+check("the overlay is sized immediately when the image is already cached", async () => {
+  // The other half of the race: a cached image can be complete before the sizing
+  // runs, in which case a load listener would never fire and an earlier attempt
+  // silently did nothing.
+  const { card, cells } = makeCard({ notification_id: "alert_nine" });
+  cells.style = {};
+  card.hass = storeWith({
+    id: "alert_nine",
+    hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
+    evidence_image_url: "/api/frigate_vision/media/e/nine.jpg?authSig=Y",
+    evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7|52.3|61.8|70.2",
+  });
+  await flush();
+  card._sheet.complete = true;
+  card._sheet.naturalWidth = 1215;
+  card._sheet.naturalHeight = 431;
+  card._insetFromExtraColumn();
+  assert.ok(
+    Math.abs(parseFloat(cells.style.width) - 63.1) < 0.3,
+    "a cached image must be sized without waiting, got " + cells.style.width
+  );
+  assert.strictEqual(
+    card._sheet.listeners.load.length,
+    1,
+    "a cached image needs no extra listener, but a harmless one may be kept"
+  );
+});
+
+check("a source with a sheet builds one button per offset", async () => {
   const { card, cells, evidence } = makeCard({ notification_id: "alert_1" });
   card.hass = storeWith({
     id: "alert_1",
@@ -268,23 +392,25 @@ check("a source with a sheet builds one button per offset", () => {
     evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7",
   });
+  await flush();
   assert.strictEqual(evidence.hidden, false, "the sheet must be shown");
   assert.strictEqual(cells.children.length, 6, "six cells for six offsets");
   assert.strictEqual(cells.children[0].dataset.cell, "1");
   assert.strictEqual(cells.children[5].dataset.cell, "6");
 });
 
-check("a notification without the fields renders no sheet (old notifications)", () => {
+check("a notification without the fields renders no sheet (old notifications)", async () => {
   const { card, cells, evidence } = makeCard({ notification_id: "alert_old" });
   card.hass = storeWith({
     id: "alert_old",
     hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
   });
+  await flush();
   assert.strictEqual(evidence.hidden, true, "no sheet for an old notification");
   assert.strictEqual(cells.children.length, 0);
 });
 
-check("an image without offsets renders no sheet (half-present pair)", () => {
+check("an image without offsets renders no sheet (half-present pair)", async () => {
   const { card, evidence } = makeCard({ notification_id: "alert_1" });
   card.hass = storeWith({
     id: "alert_1",
@@ -292,10 +418,11 @@ check("an image without offsets renders no sheet (half-present pair)", () => {
     evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=Y",
     evidence_offsets: "",
   });
+  await flush();
   assert.strictEqual(evidence.hidden, true, "a grid that cannot seek is worse than none");
 });
 
-check("tapping a cell seeks the video to that offset and pauses", () => {
+check("tapping a cell seeks the video to that offset and pauses", async () => {
   const { card, video, cells } = makeCard({ notification_id: "alert_1" });
   video.readyState = 1; // metadata available
   video.duration = 66.3;
@@ -305,12 +432,13 @@ check("tapping a cell seeks the video to that offset and pauses", () => {
     evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7",
   });
+  await flush();
   cells.children[2].dispatch("click");
   assert.strictEqual(video.currentTime, 17.8, "third cell seeks to the third offset");
   assert.strictEqual(video.paused, true, "tapping a cell pauses for comparison");
 });
 
-check("a seek beyond the real duration is clamped", () => {
+check("a seek beyond the real duration is clamped", async () => {
   const { card, video, cells } = makeCard({ notification_id: "alert_1" });
   video.readyState = 1;
   // The offsets are clamped into the planned window server-side, but the
@@ -322,12 +450,13 @@ check("a seek beyond the real duration is clamped", () => {
     evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2|60",
   });
+  await flush();
   cells.children[2].dispatch("click");
   assert.ok(video.currentTime <= 10, "must not seek past the end");
   assert.ok(video.currentTime > 9.8, "must land near the end, not at zero");
 });
 
-check("a tap before metadata is applied once metadata arrives", () => {
+check("a tap before metadata is applied once metadata arrives", async () => {
   const { card, video, cells } = makeCard({ notification_id: "alert_1" });
   video.readyState = 0; // no metadata yet: currentTime would be discarded
   card.hass = storeWith({
@@ -336,6 +465,7 @@ check("a tap before metadata is applied once metadata arrives", () => {
     evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2|17.8",
   });
+  await flush();
   cells.children[1].dispatch("click");
   assert.strictEqual(video.currentTime, 0, "cannot seek without metadata");
   assert.strictEqual(card._pendingSeek, 9.2, "the target must be parked");
@@ -345,7 +475,7 @@ check("a tap before metadata is applied once metadata arrives", () => {
   assert.strictEqual(video.currentTime, 9.2, "the parked target must be applied");
 });
 
-check("a failed image hides the sheet instead of showing a broken icon", () => {
+check("a failed image hides the sheet instead of showing a broken icon", async () => {
   const { card, sheet, evidence } = makeCard({ notification_id: "alert_1" });
   card.hass = storeWith({
     id: "alert_1",
@@ -353,12 +483,13 @@ check("a failed image hides the sheet instead of showing a broken icon", () => {
     evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2",
   });
+  await flush();
   assert.strictEqual(evidence.hidden, false);
   sheet.dispatch("error");
   assert.strictEqual(evidence.hidden, true, "an expired sheet must not show a broken image");
 });
 
-check("dragging the scrubber highlights the nearest cell", () => {
+check("dragging the scrubber highlights the nearest cell", async () => {
   const { card, video, cells } = makeCard({ notification_id: "alert_1" });
   video.readyState = 1;
   video.duration = 66.3;
@@ -368,6 +499,7 @@ check("dragging the scrubber highlights the nearest cell", () => {
     evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2|17.8|26.4|35.1|44.7",
   });
+  await flush();
   video.currentTime = 18.0; // closest to 17.8, the third cell
   video.dispatch("timeupdate");
   assert.strictEqual(cells.children[2].getAttribute("aria-current"), "true");
@@ -378,7 +510,7 @@ check("dragging the scrubber highlights the nearest cell", () => {
   assert.strictEqual(cells.children[2].getAttribute("aria-current"), null);
 });
 
-check("a source with no playable url shows the empty state and no sheet", () => {
+check("a source with no playable url shows the empty state and no sheet", async () => {
   const { card, evidence, empty } = makeCard({ notification_id: "alert_1" });
   card.hass = storeWith({
     id: "alert_1",
@@ -386,6 +518,7 @@ check("a source with no playable url shows the empty state and no sheet", () => 
     evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=Y",
     evidence_offsets: "1.5|9.2",
   });
+  await flush();
   assert.strictEqual(empty.hidden, false, "the empty state must show");
   assert.strictEqual(evidence.hidden, true, "the sheet is only for comparison with a video");
 });
@@ -396,7 +529,7 @@ check("a source with no playable url shows the empty state and no sheet", () => 
 // through the store exactly like the id-configured form does. Testing only the
 // `notification_id` form would leave the production path uncovered.
 
-check("the entity path resolves an id through the store and shows the sheet", () => {
+check("the entity path resolves an id through the store and shows the sheet", async () => {
   const { card, evidence, cells } = makeCard({
     entity: "input_text.frigate_clip_notification_id",
   });
@@ -417,6 +550,7 @@ check("the entity path resolves an id through the store and shows the sheet", ()
       },
     },
   };
+  await flush();
   assert.strictEqual(evidence.hidden, false, "the sheet must be shown");
   assert.strictEqual(cells.children.length, 6, "six cells for six offsets");
   assert.ok(
@@ -425,7 +559,7 @@ check("the entity path resolves an id through the store and shows the sheet", ()
   );
 });
 
-check("the entity path still works when the helper is empty", () => {
+check("the entity path still works when the helper is empty", async () => {
   const { card, evidence } = makeCard({
     entity: "input_text.frigate_clip_notification_id",
   });
@@ -435,19 +569,101 @@ check("the entity path still works when the helper is empty", () => {
       "sensor.notifications_store": { attributes: { items: [] } },
     },
   };
+  await flush();
   assert.strictEqual(evidence.hidden, true, "no id means no sheet");
 });
 
-check("a bare URL in the entity still plays, with no sheet to look up", () => {
+check("a bare URL in the entity still plays, with no sheet to look up", async () => {
   const { card, evidence } = makeCard({ entity: "input_text.some_url" });
   card.hass = {
     states: {
       "input_text.some_url": { state: "/api/frigate/vod/cam/x.m3u8?authSig=Z" },
     },
   };
+  await flush();
   assert.strictEqual(evidence.hidden, true, "a bare URL has no notification behind it");
   assert.strictEqual(card._currentSource.indexOf("/api/frigate/vod/cam/x.m3u8"), 0);
 });
 
-console.log(failures ? `\n${failures} FAILED` : "\nALL PASSED");
-process.exit(failures ? 1 : 0);
+check("a stored notification is re-signed before it loads", async () => {
+  // The reported failure: "视频加载失败（链接可能已过期）" with the sheet missing too.
+  // Both URLs in a stored notification were signed with a secret that lived in the
+  // previous HA process, so a restart 401s all of them -- measured on this
+  // deployment, where the tokens' own expiry was still a day away. The card has to
+  // re-sign, or every notification older than the last restart is dead.
+  const { card, sheet } = makeCard({ notification_id: "alert_1" });
+  const hass = storeWith({
+    id: "alert_1",
+    hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=STALE",
+    evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=STALE",
+    evidence_offsets: "1.5|9.2",
+  });
+  // Capture what the player is handed. Asserting on the element instead would
+  // depend on which HLS path this environment happens to take, and the contract
+  // that matters is what reaches `_applySource`.
+  const original = card._applySource.bind(card);
+  let applied = null;
+  card._applySource = (source) => {
+    applied = source;
+    return original(source);
+  };
+  card.hass = hass;
+  await flush();
+  assert.deepStrictEqual(
+    hass.signed,
+    [
+      "/api/frigate/vod/cam/start/1/end/2/index.m3u8",
+      "/api/frigate_vision/media/e/a.jpg",
+    ],
+    "both URLs must be re-signed from their bare paths"
+  );
+  assert.ok(applied, "a source must be applied");
+  assert.ok(
+    applied.url.indexOf("authSig=RESIGNED") !== -1,
+    "the clip must load the freshly signed URL, got " + applied.url
+  );
+  assert.ok(
+    applied.evidence.image.indexOf("authSig=RESIGNED") !== -1,
+    "the sheet must load the freshly signed URL, got " + applied.evidence.image
+  );
+  assert.deepStrictEqual(
+    applied.evidence.offsets,
+    [1.5, 9.2],
+    "re-signing must not disturb the offsets"
+  );
+  // And the sheet really is rendered from that URL.
+  assert.ok(
+    String(sheet.src).indexOf("authSig=RESIGNED") !== -1,
+    "the rendered sheet must use the signed URL, got " + sheet.src
+  );
+});
+
+check("a failed re-sign falls back to the delivered URL", async () => {
+  // A popup that cannot sign (not signed in, or a socket that is down) should
+  // still try the URL it was given: a stale link sometimes still works, and an
+  // unsigned one never does.
+  const { card } = makeCard({ notification_id: "alert_1" });
+  const hass = storeWith({
+    id: "alert_1",
+    hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=STALE",
+    evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=STALE",
+    evidence_offsets: "1.5|9.2",
+  });
+  hass.callWS = () => Promise.reject(new Error("no auth"));
+  const original = card._applySource.bind(card);
+  let applied = null;
+  card._applySource = (source) => {
+    applied = source;
+    return original(source);
+  };
+  card.hass = hass;
+  await flush();
+  assert.ok(applied, "a source must still be applied");
+  assert.strictEqual(
+    applied.url,
+    "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=STALE",
+    "the original URL is the fallback, got " + applied.url
+  );
+});
+
+run();

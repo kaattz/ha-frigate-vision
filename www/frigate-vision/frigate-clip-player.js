@@ -68,6 +68,15 @@ const SHEET_COLUMNS = 3;
 // close-up's column width.
 const CELL_ASPECT = 640 / 360;
 
+// The query parameter HA's path signatures travel in, matching
+// `homeassistant.components.http.auth.SIGN_QUERY_PARAM`.
+const SIGNATURE_PARAM = "authSig";
+
+// How long a re-signed URL stays valid. The card re-signs every time it opens, so
+// this only has to outlast one viewing session; a day matches the integration's
+// own `CLIP_LINK_TTL` and keeps a popup left open working.
+const RESIGN_EXPIRY_SECONDS = 86400;
+
 class FrigateClipPlayer extends HTMLElement {
   constructor() {
     super();
@@ -89,6 +98,9 @@ class FrigateClipPlayer extends HTMLElement {
     // it no longer matches, so a superseded continuation can never construct
     // an Hls instance nor attach media to an element nobody owns.
     this._gen = 0;
+    // Bumped every time a source starts being re-signed. Signing is async, so a
+    // superseded round must not apply its result over a newer notification's.
+    this._resignToken = 0;
   }
 
   setConfig(config) {
@@ -125,10 +137,22 @@ class FrigateClipPlayer extends HTMLElement {
     this._hass = hass;
     const source = this._resolveSource();
     const signature = this._sourceSignature(source);
-    if (signature !== this._currentSource) {
-      this._currentSource = signature;
-      this._applySource(source);
-    }
+    if (signature === this._currentSource) return;
+    // Claimed before the await so a second `hass` set with the same source does
+    // not start a second signing round.
+    this._currentSource = signature;
+    // Every URL a stored notification carries was signed with a secret that died
+    // with the previous HA process, so it is re-signed before anything loads.
+    // `_resignSource` never rejects and falls back to the delivered URLs, so the
+    // catch here only covers a bug in it — the popup still opens either way.
+    const token = ++this._resignToken;
+    this._resignSource(source)
+      .catch(() => source)
+      .then((signed) => {
+        // A different notification arrived while signing; it owns the player now.
+        if (token !== this._resignToken) return;
+        this._applySource(signed);
+      });
   }
 
   /**
@@ -228,6 +252,88 @@ class FrigateClipPlayer extends HTMLElement {
       ? source.evidence.image + "|" + source.evidence.offsets.join(",")
       : "";
     return (source.url || "") + "\n" + evidence;
+  }
+
+  /**
+   * Strip the signature from a URL, leaving the path HA signs.
+   *
+   * HA's signing secret is created in memory on demand (`hass.data`), so a stored
+   * notification's URLs stop verifying the moment HA restarts -- measured on this
+   * deployment as HTTP 401 for a clip whose own expiry was still a day out. The
+   * card therefore re-signs before loading, and it has to ask for the bare path:
+   * the old signature is not part of the path, and re-signing the URL as it stands
+   * would produce a token for a different one.
+   *
+   * `authSig` is dropped and every other query parameter kept, because HA signs
+   * `claims["params"]` from the request's remaining query and compares the two.
+   */
+  _pathWithoutSignature(url) {
+    const text = String(url === null || url === undefined ? "" : url).trim();
+    if (!text) return "";
+    let path = text;
+    const schemeAt = path.indexOf("://");
+    if (schemeAt !== -1) {
+      const slashAt = path.indexOf("/", schemeAt + 3);
+      // A URL with an authority but no path signs nothing meaningful.
+      path = slashAt === -1 ? "" : path.slice(slashAt);
+    }
+    const [bare, query] = path.split("?");
+    if (!query) return bare;
+    const kept = query
+      .split("&")
+      .filter((pair) => pair && pair.split("=")[0] !== SIGNATURE_PARAM);
+    return kept.length ? bare + "?" + kept.join("&") : bare;
+  }
+
+  /**
+   * Ask Home Assistant to sign a path again, or null when it will not.
+   *
+   * A relative result is returned as-is: the clip is reachable both on the LAN and
+   * through the reverse tunnel, so keeping the browser's own origin makes one URL
+   * correct in both places.
+   */
+  async _signPath(path) {
+    const hass = this._hass;
+    if (!path || !hass || typeof hass.callWS !== "function") return null;
+    try {
+      const result = await hass.callWS({
+        type: "auth/sign_path",
+        path,
+        expires: RESIGN_EXPIRY_SECONDS,
+      });
+      const signed = result && result.path ? String(result.path) : "";
+      return signed || null;
+    } catch (err) {
+      // Not signed in, or the command is unavailable: the original URL is still
+      // worth trying, so this degrades rather than failing the popup.
+      return null;
+    }
+  }
+
+  /**
+   * Re-sign a source's URLs, falling back to what the notification carried.
+   *
+   * Re-signing is the only way a stored notification survives a restart. An
+   * unsigned manifest is worse than a stale one, so a failure keeps the original
+   * rather than dropping it -- and a source with no URLs at all is returned
+   * untouched, since there is nothing to sign.
+   *
+   * The manifest is all that needs signing: its segments and init section carry
+   * the same token and are accepted against the manifest's path, verified here by
+   * loading all three with one signature.
+   */
+  async _resignSource(source) {
+    if (!source) return source;
+    const url = await this._signPath(this._pathWithoutSignature(source.url));
+    const image = source.evidence
+      ? await this._signPath(this._pathWithoutSignature(source.evidence.image))
+      : null;
+    return {
+      url: url || source.url,
+      evidence: source.evidence
+        ? { image: image || source.evidence.image, offsets: source.evidence.offsets }
+        : null,
+    };
   }
 
   getCardSize() {
