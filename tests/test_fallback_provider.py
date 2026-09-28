@@ -15,12 +15,10 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.frigate_vision import vision
 from custom_components.frigate_vision.models import (
-    IMMEDIATE_FAILOVER_ERRORS,  # noqa: F401 - imported to fail loudly if the name disappears
     ActivityRecord,
     ActivitySource,
     ActivityStage,
     is_failover_eligible,
-    is_failover_immediate,
     is_provider_side_failure,
     retry_is_safe,
     the_provider_is_the_suspect,
@@ -95,31 +93,76 @@ class TestFailoverEligibility:
         assert not is_failover_eligible(code)
 
 
-class TestFailoverImmediacy:
-    """契约类失败不重试：同一提示词重试大概率得到同样的越界答案。"""
+class TestBlameIsNotFailover:
+    """两个问题，相反的偏置，必须由两个谓词回答。"""
 
     @pytest.mark.parametrize(
         "code",
         [
+            # 我们自己的错误：store / media / frigate 层
+            "terminal_activity",
+            "identity_conflict",
+            "entry_mismatch",
+            "side_effect_key_mismatch",
+            "history_capacity",
+            "queue_full",
+            "frame_decode_failed",
+            "artifact_missing",
+            "review_too_short",
+            "invalid_path_data",
+            "recording_gap",
+            "authentication_failed",
+            "request_timeout",
+            "frigate_unavailable",
+            "media_cleanup_failed",
+            "storage_corrupt",
+            "media_deadline_missing",
+            "face_service_unreachable",
+            # 分析路径上的本地错误
+            "evidence_incomplete",
+            "stage_conflict",
+            "vision_not_configured",
+            "analysis_outcome_unknown",
+            "label_malformed",
+            "too_many_labels",
+            "ambiguous_review_ownership",
+        ],
+    )
+    def test_our_own_faults_are_never_blamed_on_the_provider(self, code: str) -> None:
+        assert not the_provider_is_the_suspect(code)
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "provider_unavailable",
+            "provider_http_500",
+            "provider_http_502",
+            "provider_http_503",
+            "provider_http_504",
+            "provider_http_429",
+            "provider_http_418",
+            "provider_http_599",
+            "invalid_provider_response",
             "invalid_llm_response",
             "empty_provider_response",
             "reasoning_exhausted_max_tokens",
-            "invalid_provider_response",
         ],
     )
-    def test_contract_failures_skip_the_retry_budget(self, code: str) -> None:
-        assert is_failover_immediate(code)
+    def test_genuine_provider_faults_are_blamed(self, code: str) -> None:
+        assert the_provider_is_the_suspect(code)
 
-    @pytest.mark.parametrize(
-        "code",
-        [
-            "provider_http_503",
-            "provider_http_429",
-            "provider_unavailable",
-        ],
-    )
-    def test_transport_failures_use_the_retry_budget_first(self, code: str) -> None:
-        assert not is_failover_immediate(code)
+    def test_a_code_we_raise_may_still_be_worth_failing_over(self) -> None:
+        """`media_retry_exhausted` 不转移也不归咎；但两个谓词的偏置本来就不同。
+
+        这条钉住二者的关系：转移是「未知即尝试」，归咎是「未知即不是 provider」。
+        """
+        assert not is_failover_eligible("media_retry_exhausted")
+        assert not the_provider_is_the_suspect("media_retry_exhausted")
+        # A code can be failover-eligible yet not blamed (unknown provider code
+        # that we have never seen a status for is impossible; but a *known*
+        # provider status is both).
+        assert is_failover_eligible("provider_http_503")
+        assert the_provider_is_the_suspect("provider_http_503")
 
 
 class TestUnknownErrorsFailOver:
@@ -887,23 +930,41 @@ def _issues(hass: HomeAssistant) -> Any:
 
 
 class TestTheProviderAlertCannotDrift:
-    """报修与转移必须由同一个判断驱动 —— 否则新故障会静默丢活动。
+    """报修与转移由**两个**判断回答，各自的未知偏置相反。
 
     `record_error` 原本用 `is_provider_side_failure`（只认 5xx + 429）决定是否
     报修，而转移用 `is_failover_eligible`（只排除本地错误的**允许清单**）。两者
-    的差集就是「会转移、但两家都失败后一声不响」的那批错误码 —— 正是本项目已经
-    消灭过两次的静默丢失形态。
+    的差集就是「会转移、但两家都失败后一声不响」的那批错误码。
+
+    同一个谓词不能同时回答两个问题：转移要「未知即尝试」（不试就丢活动），
+    归咎要「未知即不是 provider」（`record_error` 的输入域是**任意**异常字符串，
+    把库存冲突或 Frigate 鉴权失败算到视觉模型头上会误导用户）。所以这里钉的是
+    两个谓词各自覆盖哪些码，以及那个相反偏置本身。
     """
 
-    #: 会转移、却不被旧的窄判断认作「供应商侧失败」的错误码。
+    #: 会转移、且确实来自供应商的错误码。
     DRIFTING_CODES = [
-        "provider_malformed_sse",
-        "a_brand_new_provider_error",
         "invalid_llm_response",
         "empty_provider_response",
         "reasoning_exhausted_max_tokens",
         "invalid_provider_response",
     ]
+
+    #: 从未见过的供应商错误码：值得转移（未知即尝试），但**不归咎**
+    #: （未知即不是 provider）。这两条把两个谓词相反的偏置钉在一起。
+    UNSEEN_PROVIDER_CODES = [
+        "provider_malformed_sse",
+        "a_brand_new_provider_error",
+    ]
+
+    @pytest.mark.parametrize("code", UNSEEN_PROVIDER_CODES)
+    def test_an_unseen_provider_code_is_worth_trying_but_not_blamed(
+        self, code: str
+    ) -> None:
+        assert is_failover_eligible(code), "未知故障必须值得换一家再试"
+        assert not the_provider_is_the_suspect(code), (
+            "但归咎是闭集：我们没见过它，就不能断定是 provider 的错"
+        )
 
     @pytest.mark.parametrize("code", DRIFTING_CODES)
     def test_a_drifting_code_is_the_providers_fault(self, code: str) -> None:

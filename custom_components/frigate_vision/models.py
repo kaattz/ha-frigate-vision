@@ -764,12 +764,11 @@ def is_provider_side_failure(error_code: str) -> bool:
 
     Narrower than `the_provider_is_the_suspect` on purpose, and no longer the
     predicate behind the provider repair: that job moved to
-    `the_provider_is_the_suspect`, which is derived from the local-error allow-list
-    so it cannot drift out of step with the failover loop. What remains here is the
-    strictly narrower question "did the provider definitely not do the work?" --
-    the one a replay decision turns on, since a contract failure
-    (`invalid_llm_response`) is the provider's fault but says nothing about whether
-    it was billed.
+    `the_provider_is_the_suspect`, which is a closed list of codes the provider
+    demonstrably produced. What remains here is the strictly narrower question
+    "did the provider definitely not do the work?" -- the one a replay decision
+    turns on, since a contract failure (`invalid_llm_response`) is the provider's
+    fault but says nothing about whether it was billed.
 
     Currently has no in-tree caller: `retry_is_safe` spells the same 5xx/429 rule
     out inline rather than delegating here. Kept as the named definition of that
@@ -785,21 +784,6 @@ def is_automatically_retryable(error_code: str) -> bool:
     return status is not None and status in AUTOMATIC_RETRY_STATUSES
 
 
-# 供应商答了、但答案不合契约。换个模型可能答得对，所以值得转移；但**不值得
-# 对同一组重试**：同一提示词、同一个模型，重试大概率得到同样的越界答案，
-# 重试 4 次等于白等 26 秒退避。
-#
-# `invalid_provider_response` 也在这里：provider 返回了非 JSON 或结构不对的
-# 响应体，对同一端点重试同样是碰运气。
-IMMEDIATE_FAILOVER_ERRORS = frozenset(
-    {
-        "invalid_llm_response",
-        "empty_provider_response",
-        "reasoning_exhausted_max_tokens",
-        "invalid_provider_response",
-    }
-)
-
 # The local errors, enumerated exhaustively. These are produced by our own
 # validation -- the state machine, the evidence check, the image decode, the
 # label parser -- so unlike provider failures they are a closed set we can list.
@@ -814,16 +798,13 @@ IMMEDIATE_FAILOVER_ERRORS = frozenset(
 # would risk paying twice for one activity. That uncertainty is exactly what
 # makes it the one state this project never replays automatically.
 #
-# The set is also the denial list for `the_provider_is_the_suspect`, so it has to
-# cover every local code that can reach `IntegrationRuntime.record_error` -- not
-# just the ones an analysis can raise. The queue worker funnels *any* handler
-# exception into `record_error(str(exc))`, which is how the correlation codes
-# below arrive. They were absent while the only consumer was the failover loop
-# (they never reach it, because they are raised before any provider call), but
-# they are local by the same test -- our code, same wall for a second provider --
-# and leaving them out would make the shared provider alert fire for a review
-# ownership ambiguity with no provider involved. See
-# `the_provider_is_the_suspect`.
+# The set covers every local code that can reach
+# `IntegrationRuntime.record_error` -- not just the ones an analysis can raise.
+# The queue worker funnels *any* handler exception into `record_error(str(exc))`,
+# which is how the correlation codes below arrive. They never reach the failover
+# loop (they are raised before any provider call), but they are local by the same
+# test -- our code, same wall for a second provider -- and listing them keeps that
+# judgement explicit. See `is_failover_eligible`, the only consumer.
 _LOCAL_ONLY_ERRORS = frozenset(
     {
         # State machine and evidence checks, before any request is built.
@@ -882,31 +863,42 @@ def is_failover_eligible(error_code: str) -> bool:
     return error_code not in _LOCAL_ONLY_ERRORS
 
 
-def is_failover_immediate(error_code: str) -> bool:
-    """Whether to switch providers without spending the retry budget first."""
-    return error_code in IMMEDIATE_FAILOVER_ERRORS
+# Codes that genuinely originate at the provider or on the wire. A positive list,
+# unlike `is_failover_eligible`: the two answer different questions and need
+# opposite biases.
+#
+#   * failover asks "is another provider worth trying?" -- unknown should mean
+#     yes, because not trying loses the activity;
+#   * blame asks "whose fault is this?" -- unknown must mean NOT the provider,
+#     because `record_error`'s domain is any exception string in the codebase,
+#     and blaming the vision provider for a store conflict or a Frigate auth
+#     failure sends the user to the wrong subsystem.
+#
+# So this list is deliberately closed. Adding a code here is a claim that the
+# provider is at fault; leaving one out can only under-alert, never misattribute.
+_PROVIDER_SUSPECT_ERRORS = frozenset(
+    {
+        "provider_unavailable",
+        "invalid_provider_response",
+        "invalid_llm_response",
+        "empty_provider_response",
+        "reasoning_exhausted_max_tokens",
+    }
+)
 
 
 def the_provider_is_the_suspect(error_code: str) -> bool:
-    """Whether the provider is the thing that failed, rather than our own code.
+    """Whether the failure came from the provider or the network, not from us.
 
-    One definition used for two decisions that must never disagree: whether to try
-    the other provider, and whether to raise the shared provider alert. Deriving
-    both from a single predicate is what stops a newly-observed provider failure
-    from failing over (good) while raising no alert at all (silent loss).
-
-    Deliberately the complement of the local set rather than a second list: any
-    code we do not raise ourselves came from the provider or the network.
-
-    Only true of a code the analysis path can actually produce. The local set is
-    the shared definition of "our own code", and it is deliberately wider than
-    the analysis path -- the correlation engine's refusals are in it too, because
-    they reach `record_error` through the worker's catch-all and are ours by the
-    same test. A code from neither side (a mistyped string, a future caller)
-    still counts as the provider's: an unknown fault must be loud, not silent,
-    which is the whole reason this predicate is an allow-list.
+    Deliberately narrower than `is_failover_eligible`, and the two must not be
+    conflated: that one is an allow-list (try anywhere that is not provably
+    local), this one is a closed list (only blame the provider for failures it
+    demonstrably produced). Any `provider_http_<status>` counts.
     """
-    return is_failover_eligible(error_code)
+    return (
+        error_code in _PROVIDER_SUSPECT_ERRORS
+        or provider_status(error_code) is not None
+    )
 
 
 def retry_is_safe(error_code: str) -> bool:

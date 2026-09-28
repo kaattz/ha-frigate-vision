@@ -577,6 +577,79 @@ async def test_the_runtime_loop_does_not_retry_a_spent_provider_failure(
     ) in registry.issues, "a lost activity must raise a repair, not pass silently"
 
 
+async def test_a_store_conflict_does_not_raise_the_provider_alert(
+    hass: HomeAssistant,
+) -> None:
+    """库存冲突不是视觉 provider 的问题，绝不能报 provider_error。
+
+    `record_error` 的输入域是 worker 兜底路径喂进来的**任意**异常字符串
+    （`runtime.py:250`），远宽于分析路径。一个 `StoreConflictError` 走到这里
+    时，provider 根本没被调用过 —— 给用户报「视觉模型在报错」会把他送去查
+    LLM，而真正坏掉的是库存。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+
+    async def handler(message: object) -> None:
+        return None
+
+    runtime = IntegrationRuntime(
+        hass=hass,
+        store=store,
+        queue=EntryRuntime(queue_size=1, handler=handler),
+        entry_id="entry_1",
+    )
+
+    runtime.record_error("terminal_activity")
+
+    registry = ir.async_get(hass)
+    assert (
+        "frigate_vision",
+        "entry_1_provider_error",
+    ) not in registry.issues, "库存冲突被误报成了视觉 provider 的故障"
+    assert runtime.last_error == "terminal_activity"
+
+
+async def test_a_frigate_failure_keeps_its_own_card_and_is_not_erased(
+    hass: HomeAssistant,
+) -> None:
+    """clear_error(PROVIDER_ERROR) 不能抹掉 live 的 Frigate 故障。
+
+    `frigate_unavailable` 有自己的修复项，所以 `record_error` 让它走「自己的
+    卡片」那条分支并提前返回 —— 它**不**是 provider 侧的失败。而
+    `clear_error(PROVIDER_ERROR)` 会顺带清 `last_error`，前提是那个码是
+    provider 的错。旧实现用「非本地错误」的补集判定，Frigate 掉线恰好落在
+    补集里，于是下一次分析成功就把一场仍在持续的 Frigate 故障从
+    `sensor.<name>_last_error` 上抹掉了，而它的修复卡片还挂着。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+
+    async def handler(message: object) -> None:
+        return None
+
+    runtime = IntegrationRuntime(
+        hass=hass,
+        store=store,
+        queue=EntryRuntime(queue_size=1, handler=handler),
+        entry_id="entry_1",
+    )
+    runtime.record_error("frigate_unavailable")
+    assert runtime.last_error == "frigate_unavailable"
+    registry = ir.async_get(hass)
+    assert ("frigate_vision", "entry_1_frigate_unavailable") in registry.issues
+
+    runtime.clear_error("provider_error")
+
+    assert runtime.last_error == "frigate_unavailable", (
+        "一场仍在持续的 Frigate 故障被一次成功的分析抹掉了"
+    )
+    assert (
+        "frigate_vision",
+        "entry_1_frigate_unavailable",
+    ) in registry.issues, "Frigate 的修复卡片不该被 provider_error 收走"
+
+
 async def test_runtime_loads_with_review_only_configuration(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:

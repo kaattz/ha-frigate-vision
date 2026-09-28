@@ -471,6 +471,14 @@ class VisionClient:
         # diagnostic (it tells the user which of their two providers is the one
         # actually working), not part of the persisted record, and the persisted
         # schema is a separate, more expensive thing to change.
+        #
+        # Never pruned, and that is deliberate rather than overlooked: the store's
+        # retention does not reach this dict, so it holds one small entry per
+        # activity analysed during this client's lifetime. Measured at this
+        # deployment's rate that is well under a megabyte per month, and it resets
+        # on every HA restart or entry reload -- a pruning sweep would cost more
+        # code than the memory it reclaims. Revisit if instances ever analyse
+        # hundreds of activities a day for months without restarting.
         self._last_provider: dict[str, str] = {}
 
     def provider_for(self, activity_id: str) -> str | None:
@@ -561,6 +569,12 @@ class VisionClient:
                 )
             except VisionError as exc:
                 code = str(exc)
+                # Contract failures reach the fallback without spending the retry
+                # budget, and that is structural rather than a decision taken
+                # here: `validate_response` runs after `async_request_with_retry`
+                # has already returned, so a wrong answer is never retried -- only
+                # 502/503/504 are. If validation ever moves inside the retry loop,
+                # a contract failure would suddenly wait 26s before failing over.
                 if not is_failover_eligible(code) or is_last:
                     if last_failure is not None:
                         _LOGGER.warning(

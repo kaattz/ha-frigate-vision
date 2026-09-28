@@ -658,25 +658,27 @@ class IntegrationRuntime:
         # remedy is a human decision (wait for the window, or change plan) rather
         # than something the integration can wait out.
         #
-        # The specific card wins when there is one. This ordering is load-bearing
-        # now that the test below is `the_provider_is_the_suspect`: that predicate
-        # is an allow-list, so it is also true of failures that already have their
-        # own translated repair -- `frigate_unavailable`, `media_cleanup_failed`,
-        # `provider_unavailable`, `storage_corrupt`, `delivery_outcome_unknown`.
-        # Letting the shared alert take them would make those cards unreachable
-        # dead weight *and* tell the user to go and look at their vision provider
-        # when Frigate is the thing that is down. `provider_error` is excluded
-        # here, so it falls through to the shared alert rather than aliasing
-        # itself.
+        # The specific card wins when there is one. The blame predicate below is
+        # a closed list, but this ordering is still load-bearing: several codes
+        # with their own translated repair are provider-side by any reading
+        # (`provider_unavailable` is the clear one), and letting the shared alert
+        # take them would make those cards unreachable dead weight *and* tell the
+        # user to go and look at their vision provider when the card already says
+        # what is wrong. `provider_error` is excluded here, so it falls through to
+        # the shared alert rather than aliasing itself.
         if code in ISSUES and code != PROVIDER_ERROR:
             if self.entry_id:
                 async_set_issue(self.hass, self.entry_id, code)
             return
-        # Driven by `the_provider_is_the_suspect`, the same predicate the failover
-        # loop uses, so the two cannot drift. Under the previous narrow predicate
-        # (5xx + 429 only) a code could fail over -- treating it as the provider's
-        # fault -- and then be recorded with no alert at all once both providers
-        # had failed: the silent-loss shape this whole area exists to prevent.
+        # Driven by `the_provider_is_the_suspect`, a deliberately closed list of
+        # codes the provider demonstrably produced. The failover loop uses
+        # `is_failover_eligible` instead, and the two must NOT be conflated: that
+        # one is an allow-list (try anywhere that is not provably local), this one
+        # is the blame question, whose unknown has to mean "not the provider"
+        # because this method's input domain is *any* exception string in the
+        # codebase. Deriving blame from the failover allow-list is what made a
+        # `StoreConflictError` and a Frigate auth failure report "Vision provider
+        # is answering with errors".
         if the_provider_is_the_suspect(code):
             _LOGGER.warning(
                 "Vision provider is answering with errors (%s); activities are "
@@ -697,8 +699,17 @@ class IntegrationRuntime:
         # that made the original failure invisible.
         #
         # The same predicate as `record_error`, for the same reason raising and
-        # clearing have to agree: with a narrower test here, a drifting code would
-        # raise the alert and then never clear it, leaving a permanent repair.
+        # clearing have to agree. The two branches here mirror the two there:
+        #
+        #   * a code with its own card is cleared by `clear_error(that_code)`,
+        #     through the `last_error == code` test at the end;
+        #   * a provider-side code is retired by `clear_error(PROVIDER_ERROR)`;
+        #   * a code with its own card must NOT be retired by
+        #     `clear_error(PROVIDER_ERROR)`. `frigate_unavailable`,
+        #     `media_cleanup_failed` and `storage_corrupt` are all in `ISSUES`
+        #     *and* were blamed on the provider under the old complement-based
+        #     predicate, so a successful analysis erased a live Frigate outage
+        #     from the sensor while its repair card stayed up.
         if code == PROVIDER_ERROR and self.last_error is not None:
             if the_provider_is_the_suspect(self.last_error):
                 self.last_error = None
