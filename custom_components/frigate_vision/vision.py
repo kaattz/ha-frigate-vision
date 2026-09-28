@@ -45,6 +45,11 @@ from PIL import Image, UnidentifiedImageError
 from .const import (
     CONF_FACE_SERVICE_URL,
     CONF_FACE_SERVICE_URL_DEFAULT,
+    CONF_FALLBACK_LLM_API_KEY,
+    CONF_FALLBACK_LLM_BASE_URL,
+    CONF_FALLBACK_LLM_MODEL,
+    CONF_FALLBACK_LLM_REASONING_EFFORT,
+    CONF_FALLBACK_LLM_THINKING,
     CONF_PERSON_HIGHLIGHT,
     CONF_PERSON_HIGHLIGHT_DEFAULT,
     CONF_PROMPT_OVERRIDE,
@@ -296,15 +301,24 @@ def extract_json_object(raw: Any) -> Any:
     return None
 
 
-def vision_config_from(
-    data: Mapping[str, Any], options: Mapping[str, Any]
-) -> VisionConfig:
-    """Build a VisionConfig from the entry's data and options.
+def _shared_prompt_settings(options: Mapping[str, Any]) -> dict[str, Any]:
+    """The settings that describe *what is asked*, not *who answers*.
 
-    Options are read first and fall back to data, so provider settings can be
-    changed from the Options page at any time while a value stored during the
-    initial flow keeps working.
+    Shared between both providers on purpose: switching provider must not change
+    the question. This is also what makes it semantic for the analysis cache key
+    to exclude the provider -- the prompt really is the same.
     """
+    return {
+        "max_tokens": int(options.get("max_tokens", 4000)),
+        "target_width": int(options.get("target_width", 768)),
+        "language": str(options.get("output_language", "zh-CN")),
+    }
+
+
+def _prompt_fields(
+    data: Mapping[str, Any], options: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The deployment's own prompt customisation, shared by both providers."""
 
     def pick(key: str, default: str = "") -> str:
         value = options.get(key)
@@ -337,27 +351,83 @@ def vision_config_from(
                 return False
         return default
 
+    return {
+        "scene_description": pick(CONF_SCENE_DESCRIPTION)[
+            :MAX_SCENE_DESCRIPTION_LENGTH
+        ],
+        "scene_labels": pick(CONF_SCENE_LABELS, ""),
+        "prompt_override": pick(CONF_PROMPT_OVERRIDE, "")[
+            :MAX_PROMPT_OVERRIDE_LENGTH
+        ],
+        "person_highlight": pick_flag(
+            CONF_PERSON_HIGHLIGHT, CONF_PERSON_HIGHLIGHT_DEFAULT
+        ),
+        "face_service_url": pick(CONF_FACE_SERVICE_URL, CONF_FACE_SERVICE_URL_DEFAULT),
+    }
+
+
+def vision_config_from(
+    data: Mapping[str, Any], options: Mapping[str, Any]
+) -> VisionConfig:
+    """Build a VisionConfig from the entry's data and options.
+
+    Options are read first and fall back to data, so provider settings can be
+    changed from the Options page at any time while a value stored during the
+    initial flow keeps working.
+    """
+
+    def pick(key: str, default: str = "") -> str:
+        value = options.get(key)
+        if value in (None, ""):
+            value = data.get(key)
+        return str(value) if value not in (None, "") else default
+
     return VisionConfig(
         base_url=pick("llm_base_url"),
         api_key=pick("llm_api_key"),
         model=pick("llm_model"),
         thinking=pick("llm_thinking", "default"),
         reasoning_effort=pick("llm_reasoning_effort", "default"),
-        max_tokens=int(options.get("max_tokens", 4000)),
-        target_width=int(options.get("target_width", 768)),
-        language=str(options.get("output_language", "zh-CN")),
-        scene_description=pick(CONF_SCENE_DESCRIPTION)[
-            :MAX_SCENE_DESCRIPTION_LENGTH
-        ],
-        scene_labels=pick(CONF_SCENE_LABELS, ""),
-        prompt_override=pick(CONF_PROMPT_OVERRIDE, "")[
-            :MAX_PROMPT_OVERRIDE_LENGTH
-        ],
-        person_highlight=pick_flag(
-            CONF_PERSON_HIGHLIGHT, CONF_PERSON_HIGHLIGHT_DEFAULT
-        ),
-        face_service_url=pick(CONF_FACE_SERVICE_URL, CONF_FACE_SERVICE_URL_DEFAULT),
+        **_shared_prompt_settings(options),
+        **_prompt_fields(data, options),
     )
+
+
+def fallback_config_from(
+    data: Mapping[str, Any], options: Mapping[str, Any]
+) -> VisionConfig | None:
+    """The second provider, or None when it is not fully configured.
+
+    Returns None rather than a partially-filled config: a half-configured backup
+    would be tried on every failure and fail for a configuration reason, hiding
+    the real failure behind a second one. The caller treats None as "single
+    provider", which is exactly today's behaviour.
+    """
+
+    def pick(key: str) -> str:
+        value = options.get(key)
+        if value in (None, ""):
+            value = data.get(key)
+        return str(value) if value not in (None, "") else ""
+
+    base_url = pick(CONF_FALLBACK_LLM_BASE_URL)
+    api_key = pick(CONF_FALLBACK_LLM_API_KEY)
+    model = pick(CONF_FALLBACK_LLM_MODEL)
+    if not (base_url and api_key and model):
+        return None
+    return VisionConfig(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        thinking=pick(CONF_FALLBACK_LLM_THINKING) or "default",
+        reasoning_effort=pick(CONF_FALLBACK_LLM_REASONING_EFFORT) or "default",
+        **_shared_prompt_settings(options),
+        **_prompt_fields(data, options),
+    )
+
+
+def fallback_is_configured(data: Mapping[str, Any], options: Mapping[str, Any]) -> bool:
+    return fallback_config_from(data, options) is not None
 
 
 def vision_is_configured(data: Mapping[str, Any], options: Mapping[str, Any]) -> bool:

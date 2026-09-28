@@ -26,6 +26,13 @@ CONF_LLM_API_KEY = "llm_api_key"
 CONF_LLM_MODEL = "llm_model"
 CONF_LLM_THINKING = "llm_thinking"
 CONF_LLM_REASONING_EFFORT = "llm_reasoning_effort"
+# 第二组供应商。只重复「谁来回话」的字段；提示词、图片宽度、语言等共享，因为
+# 换供应商不该改变问题本身。
+CONF_FALLBACK_LLM_BASE_URL = "fallback_llm_base_url"
+CONF_FALLBACK_LLM_API_KEY = "fallback_llm_api_key"
+CONF_FALLBACK_LLM_MODEL = "fallback_llm_model"
+CONF_FALLBACK_LLM_THINKING = "fallback_llm_thinking"
+CONF_FALLBACK_LLM_REASONING_EFFORT = "fallback_llm_reasoning_effort"
 CONF_LLM_PROVIDER = "llm_provider"
 CONF_LLM_BASE_URL_DEFAULT = "https://api.deepseek.com/v1"
 CONF_LLM_PROVIDER_DEFAULT = "deepseek"
