@@ -775,6 +775,61 @@ def is_automatically_retryable(error_code: str) -> bool:
     return status is not None and status in AUTOMATIC_RETRY_STATUSES
 
 
+# 供应商答了、但答案不合契约。换个模型可能答得对，所以值得转移；但**不值得
+# 对同一组重试**：同一提示词、同一个模型，重试大概率得到同样的越界答案，
+# 重试 4 次等于白等 26 秒退避。
+#
+# `invalid_provider_response` 也在这里：provider 返回了非 JSON 或结构不对的
+# 响应体，对同一端点重试同样是碰运气。
+IMMEDIATE_FAILOVER_ERRORS = frozenset(
+    {
+        "invalid_llm_response",
+        "empty_provider_response",
+        "reasoning_exhausted_max_tokens",
+        "invalid_provider_response",
+    }
+)
+
+# 本地错误：换一组供应商会撞同一面墙（同一张图、同一套标签、同一个状态机），
+# 转移纯浪费一次计费调用。`analysis_outcome_unknown` 也在此列，理由不同：
+# 请求可能已到达第一组并被计费，转到第二组等于对同一活动发起第二次可能计费的
+# 调用，而它恰恰是贯穿全项目最不该自动重放的那个状态。
+_NEVER_FAILOVER_ERRORS = frozenset(
+    {
+        "evidence_incomplete",
+        "stage_conflict",
+        "unsupported_evidence_mode",
+        "analysis_already_started",
+        "vision_not_configured",
+        "activity_missing",
+        "analysis_outcome_unknown",
+    }
+)
+
+
+def is_failover_eligible(error_code: str) -> bool:
+    """Whether another provider could plausibly answer where this one did not.
+
+    Deliberately allow-listed rather than deny-listed: the local errors are the
+    closed set (they are produced by our own validation, so we can enumerate
+    them), while provider-side failures are open -- a gateway can invent a status
+    we have never seen. Treating an unknown code as "the local code's fault"
+    would silently stop failing over the first time a new status appears.
+    """
+    if error_code in _NEVER_FAILOVER_ERRORS:
+        return False
+    return (
+        is_provider_side_failure(error_code)
+        or error_code in IMMEDIATE_FAILOVER_ERRORS
+        or error_code == "provider_unavailable"
+    )
+
+
+def is_failover_immediate(error_code: str) -> bool:
+    """Whether to switch providers without spending the retry budget first."""
+    return error_code in IMMEDIATE_FAILOVER_ERRORS
+
+
 def retry_is_safe(error_code: str) -> bool:
     return (
         error_code
