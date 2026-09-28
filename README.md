@@ -20,7 +20,10 @@ Home Assistant 自定义集成（HACS）：把 Frigate 检测到的人物活动�
     │ 严格幂等 + 重启恢复                          │
     │ 帧选择与联系图合成（6 格，必要时 9 格）        │
     │ 人物特写栏（可选）                           │
-    │ 兼容 OpenAI 协议的视觉模型调用                │
+    ├────────────────────────────────────────────┤
+    │ 视觉调用（兼容 OpenAI 协议）                  │
+    │  ├─ 第一组 Provider                        │
+    │  └─ 第二组 Provider（可选，第一组失败才用）    │
     ├────────────────────────────────────────────┤
     │ 场景层（scenes.py，内置一个场景）             │
     │  └─ review_six：可回答的分类 + 提示词         │
@@ -35,6 +38,7 @@ Home Assistant 自定义集成（HACS）：把 Frigate 检测到的人物活动�
 - **活动边界来自 Frigate Review，不来自猜测。** 每条人物 Review 就是一次活动；以 detection ID 关联同一活动的多次上报，`min_review_seconds` 与 zone 配置决定什么值得分析。
 - **证据是确定性抽帧。** 「首帧 + 3 张高变化帧 + 末帧 + 后置现场帧」共 6 格，当画面中没有足够的变化候选时再补 3 格探测帧、扩为 3×3。优先采用 Frigate `path_data` 做路径运动选帧，缺失时回退像素差分。
 - **严格幂等。** 媒体生成、模型调用、通知交付都先持久化 `started` 阶段再执行；结果不确定的失败（`analysis_outcome_unknown`、`delivery_outcome_unknown`）**禁止自动重试**，宁可人工介入也不重复打扰或重复计费。
+- **供应商可故障转移（可选）。** 配了第二组 provider 时，第一组拿不到答案不会丢掉这条活动：同一次幂等声明内换第二组重试，共用同一张联系图。见[第二组 Provider](#第二组-provider故障转移可选)。
 
 ## 两个层次：核心与场景
 
@@ -90,7 +94,7 @@ Home Assistant 自定义集成（HACS）：把 Frigate 检测到的人物活动�
 
 | 服务 | 用途 |
 |---|---|
-| `frigate_vision.get_activity` | 返回脱敏后的活动摘要（带响应数据） |
+| `frigate_vision.get_activity` | 返回脱敏后的活动摘要（带响应数据，含 `provider` 字段标明本条由哪组回答） |
 | `frigate_vision.process_review` | 手动把某条未处理的 person Review 入队 |
 | `frigate_vision.retry_failed` | 对**可证明安全**的失败建立一次显式重试 |
 | `frigate_vision.ack_delivery` | 通知蓝图处理成功后回执，活动转为 `completed` |
@@ -135,6 +139,25 @@ Home Assistant 自定义集成（HACS）：把 Frigate 检测到的人物活动�
 - 推理档位 `default` / `low` / `high` / `max`；推理开关 `default` / `disabled`。
 - 保存前可点「测试连接」实测一次往返（纯文本，不发送图片）。
 - **`thinking` 字段并非所有端点都接受。** Google 的 OpenAI 兼容端点会以 HTTP 400 拒绝该字段（`Unknown name "thinking"`），因此集成对已知会拒绝的 provider 自动省略此字段——此时推理保持 provider 默认，代价更高但分析能正常完成。`reasoning_effort` 不受此限制。
+
+### 第二组 Provider（故障转移，可选）
+
+同一页最下方有五个「备用」字段：接口地址、API Key、模型名称、推理模式、推理强度。用途是**第一组拿不到答案时不要丢掉这条活动**——实测本部署曾因第一组返回 `503 model service info not found` 而整条活动被记为失败、静默丢弃。
+
+| 规则 | 说明 |
+|---|---|
+| 生效条件 | 地址 / Key / 模型**三项齐全**才启用。只填其中一两个会被表单拒绝（`fallback_incomplete`）；一项都不填＝不启用，这是默认状态。 |
+| 只改下拉框不算配置 | 推理模式与推理强度有默认值，前端每次保存都会回传它们，所以「只动了下拉框」不是半配置。 |
+| 共享的字段 | 提示词相关的设置（场景描述、标签、判断规则、图片宽度、输出语言等）两组**共用一份**——换供应商不该改变问题本身。每组独立的只有"谁来回话"：地址、Key、模型、推理两项。 |
+| 何时转移 | 第一组**重试耗尽后**仍失败才换组；两组各自跑满 4 次（退避 2s/6s/18s），最坏约 52 秒。 |
+| 什么会转移 | 服务端故障（5xx）、配额用尽（429）、连不上，以及**答了但不合契约**（分类越界、空回复、推理撑爆 token）。 |
+| 什么不会转移 | 本地错误（证据缺失、状态冲突、标签格式错、图片损坏、未配置客户端）——第二组会撞同一面墙，转移纯属浪费。`analysis_outcome_unknown` 也不转移：请求可能已到达第一组并被计费。 |
+| 契约类不重试 | 「答了但不合契约」直接换组，不对同一组重试 4 次：同一提示词、同一模型，重试大概率得到同样的越界答案。 |
+| 每条活动独立 | 不粘住备用：下一条活动仍从第一组开始，抖动恢复后自动回主。 |
+| 缓存键不含 provider | 同一条活动不会因为换组而重复计费。代价：两组模型不同时，不同活动的描述风格可能不完全一致。 |
+| 告警 | **只有两组都失败**才报 Repair。救回来时不报——避免"通知正常但设置里堆着错误告警"的矛盾；日志里有 WARNING 记录两组各自的原因。两组都失败时落库的是**最后一组**的错误码，完整追溯在两组的日志里。 |
+
+排查时想知道"这条到底是哪组答的"，用 `frigate_vision.get_activity` 的 `provider` 字段（`primary` / `fallback`，未分析为 `null`）。
 
 **行为选项**
 
@@ -191,11 +214,16 @@ https://github.com/kaattz/ha-frigate-vision/blob/main/blueprints/automation/frig
 | `provider_http_5xx` | 视觉服务端故障。502/503/504 会自动重试（共 4 次尝试，退避 2s/6s/18s），因为这三者都表示请求未被处理；500 不自动重试（无法确定请求是否已执行）。耗尽后可用 `retry_failed` 手动补跑。 |
 | `provider_http_429` | 配额用尽。**刻意不自动重试**：窗口通常是按天计的，几十秒的退避熬不过去，重试只会烧掉下一个窗口的额度。等配额重置后手动 `retry_failed`，或改用付费方案 / 换 provider。 |
 | `provider_unavailable` | 完全连不上 provider。可用 `retry_failed` 补跑。 |
-| `media_retry_exhausted` | 可安全使用 `retry_failed` |
+| `invalid_llm_response` | 模型答了，但分类越界或 JSON 结构不合契约。配了第二组会直接转过去（不重试）。 |
+| `empty_provider_response` | 模型返回空内容。配了第二组会转过去。 |
+| `reasoning_exhausted_max_tokens` | 推理把 token 预算耗尽，没留下正文。提高「最大 Token」或降低推理档位；配了第二组会转过去。 |
+| `media_retry_exhausted` | 取帧/录像重试耗尽（Frigate 侧问题，**不是** provider 问题，因此不会转移）。可安全使用 `retry_failed` |
 | `ambiguous_review_ownership` | Review 归属不唯一，检查 detection ID 与 zone 布局 |
 | `invalid_path_data` | Frigate 路径数据非法，永久失败，不回退像素差分 |
 
-provider 类故障（5xx / 429）会在「设置 → 修复」中报一条 `provider_error`，并在日志留下一条 WARNING；下一次分析成功时自动清除。具体状态码仍在 `sensor.<name>_last_error` 上。
+provider 类故障会在「设置 → 修复」中报一条 `provider_error`，并在日志留下一条 WARNING；下一次分析成功时自动清除。具体状态码仍在 `sensor.<name>_last_error` 上。
+
+**判定「是 provider 的问题」用的是同一个谓词驱动转移与告警**，两者不会漂移。已带了专属修复卡片的错误码（`frigate_unavailable`、`media_cleanup_failed` 等）优先显示自己的卡片，不会被归到 `provider_error`——否则 Frigate 掉线时反而会提示你去检查视觉 provider。
 
 ## 已知问题
 
