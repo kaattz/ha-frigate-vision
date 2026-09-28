@@ -43,6 +43,15 @@ async def async_register_services(hass: HomeAssistant) -> None:
             "description": record.description,
             "confidence": record.confidence,
             "error_code": record.error_code,
+            # Which provider answered, when the entry has one configured. `None`
+            # before the activity is analysed -- deliberately not defaulted to
+            # "primary", because a guess here would be indistinguishable from a
+            # measurement and this field exists precisely to be trusted.
+            "provider": (
+                runtime.vision.provider_for(record.activity_id)
+                if runtime.vision is not None
+                else None
+            ),
             "evidence_url": (
                 None
                 if record.evidence_expired_at is not None
