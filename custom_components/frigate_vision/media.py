@@ -26,7 +26,12 @@ from .const import (
 from .correlation import ZoneRoles
 from .frigate import FrigateApiError, event_box
 from .media_source import DATA_MEDIA_REGISTRY
-from .models import ActivityRecord, ActivitySource, ActivityStage, media_key
+from .models import (
+    ActivityRecord,
+    ActivitySource,
+    ActivityStage,
+    media_key,
+)
 from .pathing import (
     InvalidPathData,
     MotionPath,
@@ -1019,12 +1024,19 @@ class MediaManager:
         if record.stage is ActivityStage.EVIDENCE_READY:
             if record.evidence_path is None:
                 raise MediaError("artifact_missing")
-            expected = self._canonical_path(record)
-            if Path(record.evidence_path) != expected:
+            accepted = self._accepted_paths(record)
+            actual = await self._hass.async_add_executor_job(
+                Path(record.evidence_path).resolve
+            )
+            if actual not in accepted:
                 raise MediaError("invalid_output_path")
+            # See `async_restore_registry`: a replay points at its root's sheet,
+            # and that sheet's metadata carries the root's id -- so the id the
+            # artifact must match is the one in its own filename.
+            expected = actual
             metadata = expected.with_suffix(".json")
             recovered = await self._hass.async_add_executor_job(
-                _read_existing, expected, metadata, record.activity_id
+                _read_existing, expected, metadata, expected.stem
             )
             if recovered is None or recovered[:2] != (
                 record.evidence_mode,
@@ -1724,19 +1736,62 @@ class MediaManager:
             raise MediaError("invalid_output_path")
         return final
 
+    def _accepted_paths(self, record: ActivityRecord) -> tuple[Path, ...]:
+        """Every artifact path this record may legitimately point at.
+
+        Normally exactly one: the file named after the record itself.
+
+        A replay is the exception, and deliberately so. `async_create_retry`
+        keeps the root activity's sheet when it has not expired -- a replay reuses
+        the evidence that was already built rather than paying to rebuild it --
+        while giving the new record its own `_attempt_N` id. The two facts
+        together mean a legitimate replay points at a file named after its ROOT,
+        so validating it against its own id alone refuses a record the store
+        itself created:
+
+            measured 2026-09-28, `retry_failed` on a 502 activity produced
+            `..._attempt_1` holding the root's `.jpg`; the next
+            `async_setup_entry` raised `invalid_output_path` from
+            `async_restore_registry` and the whole entry went to `setup_error`,
+            every entity unavailable until the store was repaired by hand.
+
+        The root is derived by the same separator `attempt_activity_id` joins
+        with, so the two cannot drift. Anything else -- a path named after an
+        unrelated activity, a file outside the entry's directory -- is still
+        refused: the check exists to keep a persisted record from pointing the
+        reader at a file it does not own, and that purpose is kept, not widened.
+        """
+        own = self._canonical_path(record)
+        root_id = _root_activity_id(record.activity_id)
+        if root_id is None:
+            return (own,)
+        root = (self._root / record.entry_id / f"{root_id}.jpg").resolve()
+        if root.parent != (self._root / record.entry_id).resolve():
+            return (own,)
+        return (own, root)
+
     async def async_restore_registry(self) -> None:
         """Rebuild the in-memory registry from validated persisted artifacts."""
         for record in self._store.all():
             if record.evidence_path is None or record.evidence_expired_at is not None:
                 continue
-            expected = self._canonical_path(record)
-            if Path(record.evidence_path) != expected:
+            accepted = self._accepted_paths(record)
+            actual = await self._hass.async_add_executor_job(
+                Path(record.evidence_path).resolve
+            )
+            if actual not in accepted:
                 raise MediaError("invalid_output_path")
+            # `actual.stem`, not `record.activity_id`: a replay's sheet belongs to
+            # its root, and the artifact's own metadata records that root's id.
+            # The pair is self-consistent -- a file named after X carries X's
+            # metadata -- which is the invariant worth holding, and it is
+            # identical to the old behaviour for every non-replay record.
+            expected = actual
             recovered = await self._hass.async_add_executor_job(
                 _read_existing,
                 expected,
                 expected.with_suffix(".json"),
-                record.activity_id,
+                expected.stem,
             )
             if recovered is None or recovered[:2] != (
                 record.evidence_mode,
@@ -1806,6 +1861,20 @@ class MediaManager:
             await self._hass.async_add_executor_job(_delete_artifact, path, self._root)
             removed.append(record.activity_id)
         return tuple(removed)
+
+
+def _root_activity_id(activity_id: str) -> str | None:
+    """The activity a replay was derived from, or None when it is not a replay.
+
+    The separator is spelled the same way `attempt_activity_id` joins it; that
+    helper is the only producer of these ids, so the two spellings are a pair and
+    are kept adjacent in spirit even though they live in different modules.
+    """
+    marker = "_attempt_"
+    if marker not in activity_id:
+        return None
+    root = activity_id.split(marker, 1)[0]
+    return root if root and root != activity_id else None
 
 
 def _read_existing(

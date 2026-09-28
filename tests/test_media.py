@@ -27,6 +27,7 @@ from custom_components.frigate_vision.media import (
     select_review_change_frames,
     validate_unique_frames,
 )
+from custom_components.frigate_vision.media_source import DATA_MEDIA_REGISTRY
 from custom_components.frigate_vision.models import (
     ActivityRecord,
     ActivitySource,
@@ -3330,3 +3331,183 @@ async def test_a_review_activity_without_a_box_degrades_instead_of_failing(
     assert completed.stage is ActivityStage.EVIDENCE_READY, "没有 box 不该让分析失败"
     with Image.open(completed.evidence_path) as sheet:
         assert sheet.size[0] == 1920, "没有 box 时应退回普通拼图"
+
+
+# --------------------------------------------------------------------------- #
+# A replayed activity shares its root activity's evidence sheet.
+#
+# Measured on the deployment, 2026-09-28: `retry_failed` produced a record whose
+# `evidence_path` pointed at the ROOT activity's JPEG while its own `activity_id`
+# carried the `_attempt_1` suffix. The next `async_setup_entry` walked that record
+# in `async_restore_registry`, found the filename did not equal its `activity_id`,
+# raised `invalid_output_path`, and the whole config entry went to `setup_error`
+# -- every entity unavailable until the store was repaired by hand.
+#
+# The sharing itself is deliberate, not a bug: a replay reuses the sheet that was
+# already built, which is why `async_create_retry` keeps `EVIDENCE_READY` when the
+# evidence has not expired (pinned by
+# `test_a_lost_503_activity_with_evidence_is_replayed_with_its_sheet`). What was
+# missing is that the two path validators did not know about it.
+# --------------------------------------------------------------------------- #
+
+
+def _write_sheet(path: Path, activity_id: str, samples: tuple[float, ...]) -> None:
+    """One artifact pair exactly as `media.py` writes it, under a chosen id.
+
+    The metadata carries the ROOT activity's id on purpose, mirroring what the
+    deployment's own replayed record pointed at.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_jpeg(128))
+    path.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "activity_id": activity_id,
+                "plan_version": 4,
+                "mode": "review_six",
+                "selection_source": "path_motion",
+                "sample_times": list(samples),
+            }
+        ),
+        "utf-8",
+    )
+
+
+async def test_a_replayed_activity_restores_from_its_root_sheet(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """The restart path must accept a replay that shares its root's sheet.
+
+    This is the production failure, reduced: rebuild the store the way
+    `retry_failed` leaves it, then run exactly what `async_setup_entry` runs.
+    """
+    samples = (1.0, 2.0, 3.0)
+    sheet = tmp_path / "entry_1" / "review_root.jpg"
+    _write_sheet(sheet, "review_root", samples)
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="review_root",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.FAILED,
+            created_at=1,
+            updated_at=2,
+            camera="front",
+            error_code="provider_http_502",
+            evidence_mode="review_six",
+            evidence_revision=1,
+            evidence_path=str(sheet),
+            evidence_media_url="media-source://frigate_vision/entry_1/review_root",
+            sample_times=samples,
+        )
+    )
+    retry = await store.async_create_retry("review_root", now=3)
+    assert retry.stage is ActivityStage.EVIDENCE_READY
+
+    manager = MediaManager(
+        hass,
+        store,
+        object(),
+        tmp_path,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+
+    await manager.async_restore_registry()
+
+    registry = hass.data[DATA_MEDIA_REGISTRY]
+    assert registry["entry_1/review_root"] == sheet
+    assert registry["entry_1/review_root_attempt_1"] == sheet, (
+        "the replay must be registered against the sheet it actually reuses"
+    )
+
+
+async def test_a_replayed_activity_continues_analysis_from_its_root_sheet(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """The same acceptance on the other path: `async_build` on EVIDENCE_READY.
+
+    `async_build` repeats the identical check, so a fix applied only to
+    `async_restore_registry` would leave the replay unable to be analysed.
+    """
+    samples = (1.0, 2.0, 3.0)
+    sheet = tmp_path / "entry_1" / "review_root.jpg"
+    _write_sheet(sheet, "review_root", samples)
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="review_root",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.FAILED,
+            created_at=1,
+            updated_at=2,
+            camera="front",
+            error_code="provider_http_502",
+            evidence_mode="review_six",
+            evidence_revision=1,
+            evidence_path=str(sheet),
+            evidence_media_url="media-source://frigate_vision/entry_1/review_root",
+            sample_times=samples,
+        )
+    )
+    retry = await store.async_create_retry("review_root", now=3)
+
+    manager = MediaManager(
+        hass,
+        store,
+        object(),
+        tmp_path,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+
+    built = await manager.async_build(retry.activity_id)
+
+    assert built.stage is ActivityStage.EVIDENCE_READY
+    assert built.evidence_path == str(sheet), "replay keeps the sheet it reused"
+
+
+async def test_a_replay_still_refuses_a_sheet_belonging_to_neither_id(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """The acceptance must stay narrow: an unrelated file is still refused.
+
+    Without this, "accept the root's sheet" could be implemented as "accept any
+    path", which is the sandbox escape the canonical check exists to prevent.
+    """
+    samples = (1.0, 2.0, 3.0)
+    stranger = tmp_path / "entry_1" / "someone_elses.jpg"
+    _write_sheet(stranger, "someone_else", samples)
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="review_root",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.EVIDENCE_READY,
+            created_at=1,
+            updated_at=2,
+            camera="front",
+            evidence_mode="review_six",
+            evidence_revision=1,
+            evidence_path=str(stranger),
+            evidence_media_url="media-source://frigate_vision/entry_1/review_root",
+            sample_times=samples,
+        )
+    )
+    manager = MediaManager(
+        hass,
+        store,
+        object(),
+        tmp_path,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+
+    with pytest.raises(MediaError, match="invalid_output_path"):
+        await manager.async_restore_registry()
