@@ -754,17 +754,27 @@ def is_server_error(error_code: str) -> bool:
 
 
 def is_provider_side_failure(error_code: str) -> bool:
-    """Whether the provider itself failed, so the request was never processed.
+    """Whether the provider itself refused, so the request was never processed.
 
     Covers 5xx and 429. Both are the provider refusing to do the work for a reason
     that has nothing to do with the request: an internal fault, an overloaded
-    gateway, or an exhausted quota. Nothing is billed in any of them, so a replay
+    gateway, or an exhausted quota. Nothing is billed in any of them, so a *replay*
     cannot duplicate a side effect -- which is what makes them safe to offer to a
     human, and what distinguishes them from `analysis_outcome_unknown`.
 
-    This is the predicate behind the "the provider is failing and activities are
-    being lost" repair, so it must be at least as wide as anything that can
-    silently discard an activity.
+    Narrower than `the_provider_is_the_suspect` on purpose, and no longer the
+    predicate behind the provider repair: that job moved to
+    `the_provider_is_the_suspect`, which is derived from the local-error allow-list
+    so it cannot drift out of step with the failover loop. What remains here is the
+    strictly narrower question "did the provider definitely not do the work?" --
+    the one a replay decision turns on, since a contract failure
+    (`invalid_llm_response`) is the provider's fault but says nothing about whether
+    it was billed.
+
+    Currently has no in-tree caller: `retry_is_safe` spells the same 5xx/429 rule
+    out inline rather than delegating here. Kept as the named definition of that
+    distinction and pinned by tests, because the failover feature makes it easy to
+    reach for the wider predicate in a place that needs this one.
     """
     return is_server_error(error_code) or provider_status(error_code) == QUOTA_STATUS
 
@@ -803,6 +813,17 @@ IMMEDIATE_FAILOVER_ERRORS = frozenset(
 # already have reached the first provider and been billed, so trying the second
 # would risk paying twice for one activity. That uncertainty is exactly what
 # makes it the one state this project never replays automatically.
+#
+# The set is also the denial list for `the_provider_is_the_suspect`, so it has to
+# cover every local code that can reach `IntegrationRuntime.record_error` -- not
+# just the ones an analysis can raise. The queue worker funnels *any* handler
+# exception into `record_error(str(exc))`, which is how the correlation codes
+# below arrive. They were absent while the only consumer was the failover loop
+# (they never reach it, because they are raised before any provider call), but
+# they are local by the same test -- our code, same wall for a second provider --
+# and leaving them out would make the shared provider alert fire for a review
+# ownership ambiguity with no provider involved. See
+# `the_provider_is_the_suspect`.
 _LOCAL_ONLY_ERRORS = frozenset(
     {
         # State machine and evidence checks, before any request is built.
@@ -817,6 +838,10 @@ _LOCAL_ONLY_ERRORS = frozenset(
         "vision_not_configured",
         # Decoding the evidence sheet: both providers are handed the same file.
         "invalid_evidence_image",
+        # Building the evidence sheet failed on our side, on Frigate's side, or
+        # on the recorder's -- never on the provider's, which has not been called
+        # yet. A second vision provider cannot record a missing clip.
+        "media_retry_exhausted",
         # Parsing the deployment's labels: `scene_labels` is shared, so the
         # second provider would fail on the same malformed line.
         "label_malformed",
@@ -828,6 +853,16 @@ _LOCAL_ONLY_ERRORS = frozenset(
         "too_many_labels",
         # Uncertain outcome: possibly already billed.
         "analysis_outcome_unknown",
+        # The correlation engine's own refusals, raised while attaching Frigate
+        # evidence to an activity -- strictly before any provider call. Reached
+        # by `record_error` through the worker's catch-all.
+        "ambiguous_review_ownership",
+        "ambiguous_event_ownership",
+        "ingress_identity_mismatch",
+        "event_id_missing",
+        "event_owner_missing",
+        "review_id_missing",
+        "unsupported_ingress_kind",
     }
 )
 
@@ -850,6 +885,28 @@ def is_failover_eligible(error_code: str) -> bool:
 def is_failover_immediate(error_code: str) -> bool:
     """Whether to switch providers without spending the retry budget first."""
     return error_code in IMMEDIATE_FAILOVER_ERRORS
+
+
+def the_provider_is_the_suspect(error_code: str) -> bool:
+    """Whether the provider is the thing that failed, rather than our own code.
+
+    One definition used for two decisions that must never disagree: whether to try
+    the other provider, and whether to raise the shared provider alert. Deriving
+    both from a single predicate is what stops a newly-observed provider failure
+    from failing over (good) while raising no alert at all (silent loss).
+
+    Deliberately the complement of the local set rather than a second list: any
+    code we do not raise ourselves came from the provider or the network.
+
+    Only true of a code the analysis path can actually produce. The local set is
+    the shared definition of "our own code", and it is deliberately wider than
+    the analysis path -- the correlation engine's refusals are in it too, because
+    they reach `record_error` through the worker's catch-all and are ours by the
+    same test. A code from neither side (a mistyped string, a future caller)
+    still counts as the provider's: an unknown fault must be loud, not silent,
+    which is the whole reason this predicate is an allow-list.
+    """
+    return is_failover_eligible(error_code)
 
 
 def retry_is_safe(error_code: str) -> bool:

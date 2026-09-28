@@ -30,7 +30,7 @@ from .models import (
     ActivityRecord,
     ActivityStage,
     IngressMessage,
-    is_provider_side_failure,
+    the_provider_is_the_suspect,
 )
 from .repairs import (
     ISSUES,
@@ -42,6 +42,7 @@ from .store import ActivityStore
 from .vision import (
     VisionClient,
     VisionError,
+    fallback_config_from,
     vision_config_from,
     vision_is_configured,
 )
@@ -275,7 +276,13 @@ class IntegrationRuntime:
         # `entry.data` alone left a UI-configured entry with no client.
         if vision_is_configured(entry.data, entry.options):
             runtime.vision = VisionClient(
-                hass, store, vision_config_from(entry.data, dict(entry.options))
+                hass,
+                store,
+                vision_config_from(entry.data, dict(entry.options)),
+                # None when the second provider is not fully configured, which
+                # is exactly the single-provider behaviour every existing
+                # deployment already has.
+                fallback_config_from(entry.data, dict(entry.options)),
             )
         runtime.unsubscribe_callbacks = []
         for recovered_record in recovered:
@@ -637,10 +644,9 @@ class IntegrationRuntime:
 
     def record_error(self, code: str) -> None:
         self.last_error = code
-        # A provider-side failure is reported under one shared repair rather than
-        # under its own status: the user's action does not depend on which code it
-        # was, and a per-status issue would need a translation for every status a
-        # provider can invent.
+        # `provider_error` is the shared alert for every provider-side failure.
+        # The user's action does not depend on which code it was, and a per-status
+        # issue would need a translation for every status a provider can invent.
         #
         # Without this the failure was invisible. `last_error` is memory-only and
         # the sensor was already holding the same value from an earlier failure,
@@ -651,7 +657,27 @@ class IntegrationRuntime:
         # completely, and is arguably *more* important to surface, because the
         # remedy is a human decision (wait for the window, or change plan) rather
         # than something the integration can wait out.
-        if is_provider_side_failure(code):
+        #
+        # The specific card wins when there is one. This ordering is load-bearing
+        # now that the test below is `the_provider_is_the_suspect`: that predicate
+        # is an allow-list, so it is also true of failures that already have their
+        # own translated repair -- `frigate_unavailable`, `media_cleanup_failed`,
+        # `provider_unavailable`, `storage_corrupt`, `delivery_outcome_unknown`.
+        # Letting the shared alert take them would make those cards unreachable
+        # dead weight *and* tell the user to go and look at their vision provider
+        # when Frigate is the thing that is down. `provider_error` is excluded
+        # here, so it falls through to the shared alert rather than aliasing
+        # itself.
+        if code in ISSUES and code != PROVIDER_ERROR:
+            if self.entry_id:
+                async_set_issue(self.hass, self.entry_id, code)
+            return
+        # Driven by `the_provider_is_the_suspect`, the same predicate the failover
+        # loop uses, so the two cannot drift. Under the previous narrow predicate
+        # (5xx + 429 only) a code could fail over -- treating it as the provider's
+        # fault -- and then be recorded with no alert at all once both providers
+        # had failed: the silent-loss shape this whole area exists to prevent.
+        if the_provider_is_the_suspect(code):
             _LOGGER.warning(
                 "Vision provider is answering with errors (%s); activities are "
                 "not being analysed",
@@ -659,9 +685,6 @@ class IntegrationRuntime:
             )
             if self.entry_id:
                 async_set_issue(self.hass, self.entry_id, PROVIDER_ERROR)
-            return
-        if code in ISSUES and self.entry_id:
-            async_set_issue(self.hass, self.entry_id, code)
 
     def clear_error(self, code: str) -> None:
         if code in ISSUES and self.entry_id:
@@ -672,8 +695,12 @@ class IntegrationRuntime:
         # recorded provider failure too, or the `Last error` sensor would keep
         # reporting an outage that is over -- which is the same stuck-value problem
         # that made the original failure invisible.
+        #
+        # The same predicate as `record_error`, for the same reason raising and
+        # clearing have to agree: with a narrower test here, a drifting code would
+        # raise the alert and then never clear it, leaving a permanent repair.
         if code == PROVIDER_ERROR and self.last_error is not None:
-            if is_provider_side_failure(self.last_error):
+            if the_provider_is_the_suspect(self.last_error):
                 self.last_error = None
         if self.last_error == code:
             self.last_error = None

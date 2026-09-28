@@ -66,6 +66,7 @@ from .models import (
     ActivityRecord,
     ActivityStage,
     analysis_key,
+    is_failover_eligible,
     provider_status,
 )
 from .scenes import (
@@ -453,11 +454,28 @@ class VisionClient:
     """
 
     def __init__(
-        self, hass: HomeAssistant, store: ActivityStore, config: VisionConfig
+        self,
+        hass: HomeAssistant,
+        store: ActivityStore,
+        config: VisionConfig,
+        fallback: VisionConfig | None = None,
     ) -> None:
         self._hass = hass
         self._store = store
         self._config = config
+        # The second provider, or None for a single-provider deployment. None is
+        # the default so every existing construction keeps today's behaviour
+        # exactly, including the error codes it records.
+        self._fallback = fallback
+        # Which provider answered, per activity. In-memory on purpose: it is
+        # diagnostic (it tells the user which of their two providers is the one
+        # actually working), not part of the persisted record, and the persisted
+        # schema is a separate, more expensive thing to change.
+        self._last_provider: dict[str, str] = {}
+
+    def provider_for(self, activity_id: str) -> str | None:
+        """Which provider answered, or None if the activity has not been analysed."""
+        return self._last_provider.get(activity_id)
 
     async def async_analyze(self, activity_id: str) -> ActivityRecord:
         record = self._store.get(activity_id)
@@ -516,50 +534,89 @@ class VisionClient:
             raise VisionError("analysis_already_started")
 
         session = async_get_clientsession(self._hass)
-        try:
-            (
-                classification,
-                description,
-                confidence,
-                prompt_version,
-            ) = await async_analyze(
-                session,
-                self._config,
-                evidence_path=record.evidence_path,
-                evidence_mode=record.evidence_mode,
-                allowed=allowed,
-            )
-        except VisionError as exc:
-            await self._store.async_transition(
+        # The claim above happens once, for both providers. A second claim -- or
+        # a claim taken inside this loop -- would collide with the key just
+        # written and be refused as `analysis_already_started`, which would kill
+        # the failover silently rather than loudly. One activity, one claim,
+        # however many providers it takes to answer.
+        providers: list[tuple[str, VisionConfig]] = [("primary", self._config)]
+        if self._fallback is not None:
+            providers.append(("fallback", self._fallback))
+
+        last_failure: tuple[str, str] | None = None
+        for index, (name, provider) in enumerate(providers):
+            is_last = index == len(providers) - 1
+            try:
+                (
+                    classification,
+                    description,
+                    confidence,
+                    prompt_version,
+                ) = await async_analyze(
+                    session,
+                    provider,
+                    evidence_path=record.evidence_path,
+                    evidence_mode=record.evidence_mode,
+                    allowed=allowed,
+                )
+            except VisionError as exc:
+                code = str(exc)
+                if not is_failover_eligible(code) or is_last:
+                    if last_failure is not None:
+                        _LOGGER.warning(
+                            "Both providers failed (%s, then %s); "
+                            "the activity is lost",
+                            last_failure[1],
+                            code,
+                        )
+                    await self._store.async_transition(
+                        activity_id,
+                        ActivityStage.ANALYSIS_STARTED,
+                        ActivityStage.FAILED,
+                        updated_at=time.time(),
+                        error_code=code,
+                    )
+                    raise
+                last_failure = (name, code)
+                _LOGGER.warning(
+                    "The %s provider failed (%s); trying the fallback",
+                    name,
+                    code,
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001
+                # Unexpected: the outcome is unknown, so the request may already
+                # have been billed. Never fail over here -- that would risk
+                # paying twice for one activity.
+                await self._store.async_transition(
+                    activity_id,
+                    ActivityStage.ANALYSIS_STARTED,
+                    ActivityStage.FAILED,
+                    updated_at=time.time(),
+                    error_code="analysis_outcome_unknown",
+                )
+                raise VisionError("analysis_outcome_unknown") from exc
+
+            if name == "fallback":
+                _LOGGER.warning(
+                    "The primary provider failed (%s); the fallback provider "
+                    "answered this activity",
+                    last_failure[1] if last_failure else "unknown",
+                )
+            self._last_provider[activity_id] = name
+            return await self._store.async_complete_analysis(
                 activity_id,
-                ActivityStage.ANALYSIS_STARTED,
-                ActivityStage.FAILED,
+                # The scene is part of the claimed key, so it must be passed back
+                # rather than left to be re-derived from an ambiguous version
+                # string.
+                scene_mode=record.evidence_mode,
+                prompt_version=prompt_version,
+                classification=classification,
+                description=description,
+                confidence=confidence,
                 updated_at=time.time(),
-                error_code=str(exc),
             )
-            raise
-        except Exception as exc:  # noqa: BLE001
-            # The request may or may not have reached the provider, so the
-            # outcome is unknown rather than failed.
-            await self._store.async_transition(
-                activity_id,
-                ActivityStage.ANALYSIS_STARTED,
-                ActivityStage.FAILED,
-                updated_at=time.time(),
-                error_code="analysis_outcome_unknown",
-            )
-            raise VisionError("analysis_outcome_unknown") from exc
-        return await self._store.async_complete_analysis(
-            activity_id,
-            # The scene is part of the claimed key, so it must be passed back
-            # rather than left to be re-derived from an ambiguous version string.
-            scene_mode=record.evidence_mode,
-            prompt_version=prompt_version,
-            classification=classification,
-            description=description,
-            confidence=confidence,
-            updated_at=time.time(),
-        )
+        raise AssertionError("unreachable")
 
 
 def validate_response(body: Any, allowed: set[str]) -> tuple[str, str, int]:
