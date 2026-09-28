@@ -11,7 +11,13 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.frigate_vision import config_flow
 from custom_components.frigate_vision.const import (
+    CONF_FALLBACK_LLM_API_KEY,
+    CONF_FALLBACK_LLM_BASE_URL,
+    CONF_FALLBACK_LLM_MODEL,
+    CONF_FALLBACK_LLM_REASONING_EFFORT,
+    CONF_FALLBACK_LLM_THINKING,
     CONF_LLM_BASE_URL,
+    CONF_LLM_BASE_URL_DEFAULT,
     CONF_LLM_PROVIDER,
     PROVIDER_PRESETS,
 )
@@ -1299,4 +1305,392 @@ def test_the_label_errors_are_translated_where_each_flow_reads_them() -> None:
         translated = set(payload["config"].get("error", {}))
         missing = sorted(codes - translated)
         assert not missing, f"{name} 的初始流缺少错误码译文：{missing}"
+
+
+# ---------------------------------------------------------------------------
+# The second provider (fallback): five plain fields on the settings form.
+#
+# Deliberately no preset menu: the primary provider has one because its URL is
+# the part that cannot be guessed, but the fallback is usually "another known
+# endpoint" and a menu of its own would double that machinery for little gain.
+# ---------------------------------------------------------------------------
+
+_FALLBACK_FIELDS = (
+    CONF_FALLBACK_LLM_BASE_URL,
+    CONF_FALLBACK_LLM_API_KEY,
+    CONF_FALLBACK_LLM_MODEL,
+    CONF_FALLBACK_LLM_THINKING,
+    CONF_FALLBACK_LLM_REASONING_EFFORT,
+)
+
+# The three fields that are required *together*. `thinking` and
+# `reasoning_effort` are deliberately absent: they have defaults, so they are
+# never evidence that the user meant to configure a provider.
+_FALLBACK_REQUIRED = (
+    CONF_FALLBACK_LLM_BASE_URL,
+    CONF_FALLBACK_LLM_API_KEY,
+    CONF_FALLBACK_LLM_MODEL,
+)
+
+
+async def _open_the_settings_form(hass: HomeAssistant, entry) -> str:
+    """Drive the options flow to the settings form, the way the frontend does.
+
+    Returns the flow_id. The fallback fields live on this form, so every test
+    below starts here rather than calling the step function directly -- what is
+    being tested is what the user can actually reach.
+    """
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings_form"}
+    )
+    assert result["step_id"] == "settings_form"
+    return result["flow_id"]
+
+
+async def test_fallback_fields_are_reachable_from_the_settings_menu(
+    hass: HomeAssistant,
+) -> None:
+    """第二组的五个字段在「配置参数」页，与主组分开。"""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"llm_base_url": "https://api.deepseek.com/v1"},
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert set(result["menu_options"]) == {"settings", "provider"}, (
+        "第二组不该新增顶层菜单项：它只有输入框，没有预设菜单"
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings"}
+    )
+    assert set(result["menu_options"]) == {
+        "settings_form",
+        "close_up_form",
+        "test_connection",
+    }, "预设菜单是主组专有的，第二组不加菜单"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings_form"}
+    )
+
+    fields = {getattr(m, "schema", None) for m in result["data_schema"].schema}
+    missing = sorted(set(_FALLBACK_FIELDS) - fields)
+    assert not missing, f"配置参数表单上没有第二组的字段：{missing}"
+    # 五个都在，且只有这五个：多出来的 fallback_llm_provider 之类正是被否掉的预设菜单。
+    assert {f for f in fields if f and str(f).startswith("fallback_")} == set(
+        _FALLBACK_FIELDS
+    ), "第二组只有这五个字段，没有预设菜单"
+
+    schema = result["data_schema"]
+    # 地址默认值必须是空串，不能是主组的默认地址——否则第二组会「默认开启」，
+    # 而它默认必须是关的（见 vision.fallback_config_from：三项齐全才算配置）。
+    url_default = _field(schema, CONF_FALLBACK_LLM_BASE_URL)[0].default
+    url_default = url_default() if callable(url_default) else url_default
+    assert url_default == "", f"第二组地址默认值应为空串，实际：{url_default!r}"
+    assert url_default != CONF_LLM_BASE_URL_DEFAULT
+
+    for name, expected in (
+        (CONF_FALLBACK_LLM_THINKING, "default"),
+        (CONF_FALLBACK_LLM_REASONING_EFFORT, "default"),
+    ):
+        marker, dropdown = _field(schema, name)
+        default = marker.default
+        default = default() if callable(default) else default
+        assert default == expected, f"{name} 默认值应为 {expected}，实际 {default!r}"
+        assert type(dropdown).__name__ == "SelectSelector", f"{name} 应是下拉框"
+
+    # 密钥必须是密码框：它会像主组密钥一样显示在表单上。
+    _, key_selector = _field(schema, CONF_FALLBACK_LLM_API_KEY)
+    assert key_selector.config["type"] == "password", "第二组密钥必须是密码框"
+
+    texts = [
+        _field(schema, CONF_FALLBACK_LLM_BASE_URL)[1],
+        _field(schema, CONF_FALLBACK_LLM_MODEL)[1],
+    ]
+    for selector_ in texts:
+        assert type(selector_).__name__ == "TextSelector", (
+            "地址与模型名是自由文本：本地路由器或反向代理都要能填"
+        )
+
+
+@pytest.mark.parametrize(
+    "provided",
+    [
+        (CONF_FALLBACK_LLM_BASE_URL,),
+        (CONF_FALLBACK_LLM_API_KEY,),
+        (CONF_FALLBACK_LLM_MODEL,),
+        (CONF_FALLBACK_LLM_BASE_URL, CONF_FALLBACK_LLM_API_KEY),
+        (CONF_FALLBACK_LLM_BASE_URL, CONF_FALLBACK_LLM_MODEL),
+        (CONF_FALLBACK_LLM_API_KEY, CONF_FALLBACK_LLM_MODEL),
+    ],
+    ids=lambda keys: "+".join(k.removeprefix("fallback_llm_") for k in keys),
+)
+async def test_a_half_configured_fallback_is_rejected(
+    hass: HomeAssistant, provided: tuple[str, ...]
+) -> None:
+    """只填 URL 不给 Key -> 表单报错，而不是存下一个永远失败的半配置。"""
+    values = {
+        CONF_FALLBACK_LLM_BASE_URL: "https://backup.example.com/v1",
+        CONF_FALLBACK_LLM_API_KEY: "backup-key",
+        CONF_FALLBACK_LLM_MODEL: "backup-model",
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"llm_base_url": "https://api.deepseek.com/v1", "max_tokens": 1234},
+    )
+    entry.add_to_hass(hass)
+    flow_id = await _open_the_settings_form(hass, entry)
+
+    result = await hass.config_entries.options.async_configure(
+        flow_id,
+        {**_OPTIONS_PAYLOAD, **{key: values[key] for key in provided}},
+    )
+
+    assert result["type"] is FlowResultType.FORM, (
+        "三项必填只给了一部分时必须重新显示表单，而不是创建 entry"
+    )
+    assert result["step_id"] == "settings_form"
+    assert result.get("errors", {}).get("base") == "fallback_incomplete", (
+        f"只填了 {provided} 就保存，会存下一个永远失败的半配置"
+    )
+    # 关键：半配置不能被写进 entry。前面「重新显示表单」还不够——静默存下
+    # 才是这个缺陷的形态。
+    assert entry.options.get("max_tokens") == 1234, "表单报错时不该改动已存的选项"
+    for key in values:
+        assert key not in entry.options, f"半配置 {key} 被存进了 entry"
+
+
+@pytest.mark.parametrize(
+    "touched",
+    [
+        {},
+        # What the real frontend submits when the user leaves the fallback
+        # alone: the dropdowns come back at their defaults, and the text fields
+        # are empty strings. This is the default single-provider state.
+        {
+            CONF_FALLBACK_LLM_BASE_URL: "",
+            CONF_FALLBACK_LLM_API_KEY: "",
+            CONF_FALLBACK_LLM_MODEL: "",
+            CONF_FALLBACK_LLM_THINKING: "default",
+            CONF_FALLBACK_LLM_REASONING_EFFORT: "default",
+        },
+    ],
+    ids=["no-fallback-keys", "the-fields-at-their-defaults"],
+)
+async def test_an_empty_fallback_is_accepted(
+    hass: HomeAssistant, touched: dict[str, str]
+) -> None:
+    """一个都不填 = 不启用第二组，这是默认状态。"""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"llm_base_url": "https://api.deepseek.com/v1"},
+    )
+    entry.add_to_hass(hass)
+    flow_id = await _open_the_settings_form(hass, entry)
+
+    result = await hass.config_entries.options.async_configure(
+        flow_id, {**_OPTIONS_PAYLOAD, **touched}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY, (
+        f"空配置必须能保存，实际错误：{result.get('errors')}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("thinking", "effort"),
+    [("disabled", "high"), ("default", "default")],
+)
+async def test_touching_only_a_dropdown_does_not_require_a_provider(
+    hass: HomeAssistant, thinking: str, effort: str
+) -> None:
+    """只动了第二组的两个下拉框，不等于「在配置第二组」。
+
+    两个下拉框有默认值（default），所以它们永远「有值」。若把「任何第二组字段有值」
+    当成半配置，那么用户随手把推理模式调成「关闭」就会被迫去填一个他并不想要的
+    备用服务商——而那才是默认状态下的正常提交。
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"llm_base_url": "https://api.deepseek.com/v1"},
+    )
+    entry.add_to_hass(hass)
+    flow_id = await _open_the_settings_form(hass, entry)
+
+    result = await hass.config_entries.options.async_configure(
+        flow_id,
+        {
+            **_OPTIONS_PAYLOAD,
+            CONF_FALLBACK_LLM_THINKING: thinking,
+            CONF_FALLBACK_LLM_REASONING_EFFORT: effort,
+        },
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY, (
+        f"下拉框有默认值，不该被当成半配置，实际错误：{result.get('errors')}"
+    )
+    assert result["data"][CONF_FALLBACK_LLM_THINKING] == thinking
+    assert result["data"][CONF_FALLBACK_LLM_REASONING_EFFORT] == effort
+
+
+async def test_a_complete_fallback_is_saved(hass: HomeAssistant) -> None:
+    """三个必填项齐全时正常保存。"""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"llm_base_url": "https://api.deepseek.com/v1"},
+    )
+    entry.add_to_hass(hass)
+    flow_id = await _open_the_settings_form(hass, entry)
+
+    submitted = {
+        **_OPTIONS_PAYLOAD,
+        CONF_FALLBACK_LLM_BASE_URL: "https://backup.example.com/v1",
+        CONF_FALLBACK_LLM_API_KEY: "backup-key",
+        CONF_FALLBACK_LLM_MODEL: "backup-model",
+        CONF_FALLBACK_LLM_THINKING: "disabled",
+        CONF_FALLBACK_LLM_REASONING_EFFORT: "low",
+    }
+    result = await hass.config_entries.options.async_configure(flow_id, submitted)
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY, (
+        f"三项齐全必须能保存，实际错误：{result.get('errors')}"
+    )
+    for key in _FALLBACK_FIELDS:
+        assert result["data"][key] == submitted[key], f"{key} 没有被存下"
+
+    # 存下的东西必须真的能被解析成第二组服务商——否则表单收了一份永远用不上的
+    # 配置，而「保存成功」会让用户以为已经生效。
+    from custom_components.frigate_vision.vision import fallback_config_from
+
+    config = fallback_config_from({}, dict(result["data"]))
+    assert config is not None, "三项齐全却没有被解析成第二组服务商"
+    assert config.base_url == "https://backup.example.com/v1"
+    assert config.model == "backup-model"
+    assert config.thinking == "disabled"
+    assert config.reasoning_effort == "low"
+
+
+async def test_the_initial_flow_rejects_a_half_configured_fallback_too(
+    hass: HomeAssistant,
+) -> None:
+    """初始流渲染同一个 `_options_schema()`，也要挡下半配置。
+
+    两个流各写一份校验就会有一个先漂移，而漂移的那一份会把半配置存进 entry——
+    之后每次失败转移都因为配置原因失败，把真正的故障藏在第二个故障后面。
+    """
+    flow_id = await _drive_the_initial_flow_to_the_options_step(hass)
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {**_OPTIONS_PAYLOAD, CONF_FALLBACK_LLM_BASE_URL: "https://backup/v1"},
+    )
+
+    assert result["type"] is FlowResultType.FORM, (
+        "初始流也必须重新显示表单，而不是创建 entry"
+    )
+    assert result["step_id"] == "options"
+    assert result.get("errors", {}).get("base") == "fallback_incomplete"
+    assert hass.config_entries.async_entries(DOMAIN) == [], (
+        "表单报错时 entry 不该被创建"
+    )
+
+
+async def test_a_bad_label_and_a_half_fallback_are_both_reported(
+    hass: HomeAssistant,
+) -> None:
+    """两份校验合并上报，不许一个盖住另一个。
+
+    键本来就不同（标签错 -> 字段名，第二组错 -> `base`），所以合并是安全的；
+    反过来若写成 `errors = _fallback_errors(...) or _label_errors(...)`，用户会
+    先修好一个、再提交一次才看到另一个——修一个冒一个。
+    """
+    from custom_components.frigate_vision.const import CONF_SCENE_LABELS
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"llm_base_url": "https://api.deepseek.com/v1"},
+    )
+    entry.add_to_hass(hass)
+    flow_id = await _open_the_settings_form(hass, entry)
+
+    result = await hass.config_entries.options.async_configure(
+        flow_id,
+        {
+            **_OPTIONS_PAYLOAD,
+            CONF_SCENE_LABELS: "宠物 没有冒号",
+            CONF_FALLBACK_LLM_BASE_URL: "https://backup.example.com/v1",
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"].get("base") == "fallback_incomplete", (
+        f"第二组的错误被标签错误盖住了：{result['errors']}"
+    )
+    assert CONF_SCENE_LABELS in result["errors"], (
+        f"标签的错误被第二组的错误盖住了：{result['errors']}"
+    )
+
+
+def test_the_fallback_error_is_translated_where_each_flow_reads_it() -> None:
+    """错误码要在**两条**路径上都有译文，因为它由两个流各自抛出。
+
+    简报只说加在 `config.error`，但那只够初始流：前端按 flowType 解析基础错误，
+    初始流读 `component.<domain>.config.error.<code>`，选项流读
+    `component.<domain>.options.error.<code>`（见上面那条标签测试里引的
+    frontend 源码）。而设置表单在选项流里，`base` 错误就在那里抛出——只加一份的
+    话，用户在选项流里看到的会是原始键名 `fallback_incomplete`。
+
+    这里同时也检查 `data` 块：初始流渲染 `config.step.options`，选项流渲染
+    `options.step.settings_form`，同一个 `_options_schema()` 两处都要五个标签。
+    """
+    import json
+    from pathlib import Path
+
+    from custom_components.frigate_vision import config_flow
+
+    root = Path(config_flow.__file__).parent
+    for name in ("strings.json", "translations/en.json", "translations/zh-Hans.json"):
+        payload = json.loads((root / name).read_text("utf-8"))
+        for path, blocks in (
+            (
+                "config.error（初始流）",
+                [payload["config"].get("error", {})],
+            ),
+            (
+                "options.error（选项流）",
+                [payload["options"].get("error", {})],
+            ),
+        ):
+            for block in blocks:
+                assert block.get("fallback_incomplete"), (
+                    f"{name} 的 {path} 缺少 fallback_incomplete 译文"
+                )
+        for path, block in (
+            (
+                "config.step.options.data",
+                payload["config"]["step"]["options"].get("data", {}),
+            ),
+            (
+                "options.step.settings_form.data",
+                payload["options"]["step"]["settings_form"].get("data", {}),
+            ),
+        ):
+            missing = sorted(set(_FALLBACK_FIELDS) - set(block))
+            assert not missing, f"{name} 的 {path} 缺少标签：{missing}"
 

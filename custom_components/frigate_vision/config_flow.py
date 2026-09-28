@@ -29,6 +29,11 @@ from .const import (
     CONF_CAMERA,
     CONF_FACE_SERVICE_URL,
     CONF_FACE_SERVICE_URL_DEFAULT,
+    CONF_FALLBACK_LLM_API_KEY,
+    CONF_FALLBACK_LLM_BASE_URL,
+    CONF_FALLBACK_LLM_MODEL,
+    CONF_FALLBACK_LLM_REASONING_EFFORT,
+    CONF_FALLBACK_LLM_THINKING,
     CONF_FAR_ZONES,
     CONF_LLM_API_KEY,
     CONF_LLM_BASE_URL,
@@ -121,6 +126,38 @@ def _options_schema() -> vol.Schema:
                 selector.SelectSelectorConfig(options=list(REASONING_EFFORTS))
             ),
             vol.Optional(CONF_LLM_THINKING, default="default"): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=list(THINKING_MODES))
+            ),
+            # The second provider: tried when the first one cannot answer, so the
+            # activity is not lost. Plain fields rather than a provider menu --
+            # the primary's menu exists because its URL is the part that cannot be
+            # guessed, but the fallback is usually "another known endpoint", and a
+            # menu of its own would double that machinery for little gain.
+            #
+            # All three of URL/key/model are required *together*, and the form
+            # refuses a partial one (`_fallback_errors`) instead of storing it: a
+            # half-configured backup is tried on every failure and fails for a
+            # configuration reason, which hides the real failure behind a second
+            # one. The URL's default is empty rather than the primary's, because
+            # that empty value is what "the fallback is off" looks like -- it is
+            # the default state.
+            vol.Optional(CONF_FALLBACK_LLM_BASE_URL, default=""): _text(),
+            vol.Optional(CONF_FALLBACK_LLM_API_KEY): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+            ),
+            vol.Optional(CONF_FALLBACK_LLM_MODEL): _text(),
+            # Both dropdowns default to `default`, which is also what an
+            # untouched form submits. They carry no evidence that the user meant
+            # to configure a second provider, so the validator ignores them when
+            # deciding whether the three above were filled in as a group.
+            vol.Optional(
+                CONF_FALLBACK_LLM_REASONING_EFFORT, default="default"
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=list(REASONING_EFFORTS))
+            ),
+            vol.Optional(
+                CONF_FALLBACK_LLM_THINKING, default="default"
+            ): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=list(THINKING_MODES))
             ),
             vol.Required("target_width", default=768): vol.All(
@@ -314,6 +351,37 @@ def _label_errors(user_input: Mapping[str, Any]) -> dict[str, str]:
         parse_scene_labels(str(user_input.get(CONF_SCENE_LABELS, "")))
     except ValueError as exc:
         return {CONF_SCENE_LABELS: str(exc)}
+    return {}
+
+
+def _fallback_errors(user_input: Mapping[str, Any]) -> dict[str, str]:
+    """Return form errors for the second provider, or {} when valid.
+
+    Shared by both flows (initial and options) for the same reason
+    `_label_errors` is: two copies drift, and the one that drifts stores a
+    configuration that can never work. The rule is all-or-nothing -- a URL
+    without a key is not a provider, and storing it would make every failover
+    attempt fail for a configuration reason, hiding the real failure behind a
+    second one.
+
+    Only the three fields that are required together count as evidence. The two
+    dropdowns are deliberately excluded: they have defaults (`default`), so they
+    are present on every submit including an untouched one -- a user who only
+    opens the form would otherwise be forced to fill in a provider they do not
+    want. `vision.fallback_config_from` applies the same three-field rule, which
+    is what makes this form's rejection agree with what the runtime will accept.
+    """
+    present = [
+        key
+        for key in (
+            CONF_FALLBACK_LLM_BASE_URL,
+            CONF_FALLBACK_LLM_API_KEY,
+            CONF_FALLBACK_LLM_MODEL,
+        )
+        if str(user_input.get(key) or "").strip()
+    ]
+    if present and len(present) < 3:
+        return {"base": "fallback_incomplete"}
     return {}
 
 
@@ -520,7 +588,11 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
             # 初始流也要校验，与选项流共用同一个 helper：标签会被原样存下，填错
             # 了之后每次分析都失败，而用户只看到「没有通知」。两个流的校验一旦各
             # 写一份，就会有一个先漂移。
-            errors = _label_errors(user_input)
+            #
+            # 两份错误合并而不是二选一：`_label_errors` 的键是字段名、第二组的是
+            # `base`，两者互不相同，合并后能同时显示——否则修好一个才会看见另一个，
+            # 用户要提交两次才知道全部问题。
+            errors = {**_fallback_errors(user_input), **_label_errors(user_input)}
             if not errors:
                 return self.async_create_entry(
                     title=self._data[CONF_NAME], data=self._data, options=user_input
@@ -823,7 +895,11 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
             # 保存时就校验标签格式：这个选项流是整体替换，填错了会被直接存进去，
             # 之后每次分析都失败，而用户只看到「没有通知」——错误发生在离原因
             # 很远的地方。校验与初始流共用 `_label_errors`，两个流不会各漂各的。
-            errors = _label_errors(user_input)
+            #
+            # 第二组服务商同样在保存时校验，理由一样，而且更硬：半配置存进去之后
+            # 每次失败转移都因配置原因失败，把真正的故障藏在第二个故障后面。
+            # 两份错误合并（字段名 + `base`，互不覆盖），一次提交报出全部问题。
+            errors = {**_fallback_errors(user_input), **_label_errors(user_input)}
             if not errors:
                 return self.async_create_entry(data=user_input)
             # 校验失败时回填用户这次提交的内容，否则表单会清空他填的一切。
