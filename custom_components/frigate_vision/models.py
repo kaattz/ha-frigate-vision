@@ -790,18 +790,43 @@ IMMEDIATE_FAILOVER_ERRORS = frozenset(
     }
 )
 
-# 本地错误：换一组供应商会撞同一面墙（同一张图、同一套标签、同一个状态机），
-# 转移纯浪费一次计费调用。`analysis_outcome_unknown` 也在此列，理由不同：
-# 请求可能已到达第一组并被计费，转到第二组等于对同一活动发起第二次可能计费的
-# 调用，而它恰恰是贯穿全项目最不该自动重放的那个状态。
-_NEVER_FAILOVER_ERRORS = frozenset(
+# The local errors, enumerated exhaustively. These are produced by our own
+# validation -- the state machine, the evidence check, the image decode, the
+# label parser -- so unlike provider failures they are a closed set we can list.
+#
+# A second provider would hit the identical wall in every one of them: it gets
+# the same image, the same shared prompt and labels, and the same store. Trying
+# it would be a wasted call, so they are refused here rather than after a failed
+# request.
+#
+# `analysis_outcome_unknown` is denied for a different reason: the request may
+# already have reached the first provider and been billed, so trying the second
+# would risk paying twice for one activity. That uncertainty is exactly what
+# makes it the one state this project never replays automatically.
+_LOCAL_ONLY_ERRORS = frozenset(
     {
-        "evidence_incomplete",
+        # State machine and evidence checks, before any request is built.
+        "activity_missing",
         "stage_conflict",
+        "evidence_incomplete",
         "unsupported_evidence_mode",
         "analysis_already_started",
+        # No client at all: the entry is missing the URL, key or model. The
+        # wall is our own configuration, so the second provider is not merely
+        # useless here -- `_schedule_analysis` never reaches a provider call.
         "vision_not_configured",
-        "activity_missing",
+        # Decoding the evidence sheet: both providers are handed the same file.
+        "invalid_evidence_image",
+        # Parsing the deployment's labels: `scene_labels` is shared, so the
+        # second provider would fail on the same malformed line.
+        "label_malformed",
+        "label_name_too_long",
+        "label_name_invalid",
+        "label_definition_missing",
+        "label_definition_too_long",
+        "label_duplicate",
+        "too_many_labels",
+        # Uncertain outcome: possibly already billed.
         "analysis_outcome_unknown",
     }
 )
@@ -810,19 +835,16 @@ _NEVER_FAILOVER_ERRORS = frozenset(
 def is_failover_eligible(error_code: str) -> bool:
     """Whether another provider could plausibly answer where this one did not.
 
-    Deliberately allow-listed rather than deny-listed: the local errors are the
-    closed set (they are produced by our own validation, so we can enumerate
-    them), while provider-side failures are open -- a gateway can invent a status
-    we have never seen. Treating an unknown code as "the local code's fault"
-    would silently stop failing over the first time a new status appears.
+    Allow-listed by construction: the only codes refused are the local ones,
+    which are a closed set because we raise them ourselves. Everything else --
+    including a status or code we have never seen -- is worth one attempt
+    elsewhere, because the cost of trying is a single call while the cost of not
+    trying is losing the activity.
+
+    The 5xx/429/connection failures this was built for are covered by that same
+    rule without being listed: they are simply not local.
     """
-    if error_code in _NEVER_FAILOVER_ERRORS:
-        return False
-    return (
-        is_provider_side_failure(error_code)
-        or error_code in IMMEDIATE_FAILOVER_ERRORS
-        or error_code == "provider_unavailable"
-    )
+    return error_code not in _LOCAL_ONLY_ERRORS
 
 
 def is_failover_immediate(error_code: str) -> bool:
