@@ -221,14 +221,31 @@ https://github.com/kaattz/ha-frigate-vision/blob/main/blueprints/automation/frig
 | `ambiguous_review_ownership` | Review 归属不唯一，检查 detection ID 与 zone 布局 |
 | `invalid_path_data` | Frigate 路径数据非法，永久失败，不回退像素差分 |
 
-provider 类故障会在「设置 → 修复」中报一条 `provider_error`，并在日志留下一条 WARNING；下一次分析成功时自动清除。具体状态码仍在 `sensor.<name>_last_error` 上。
+provider 类故障会在「设置 → 修复」中报一条修复卡片，并在日志留下一条 WARNING；下一次分析成功时自动清除。具体状态码仍在 `sensor.<name>_last_error` 上。
 
-**判定「是 provider 的问题」用的是同一个谓词驱动转移与告警**，两者不会漂移。已带了专属修复卡片的错误码（`frigate_unavailable`、`media_cleanup_failed` 等）优先显示自己的卡片，不会被归到 `provider_error`——否则 Frigate 掉线时反而会提示你去检查视觉 provider。
+卡片是**哪一条**取决于该错误码有没有自己的专用卡片：
+
+- 有专用卡片的（`provider_unavailable`、`frigate_unavailable`、`media_cleanup_failed`、`storage_corrupt` 等）显示自己的卡片——名字更具体，指向也更准。
+- 没有专用卡片的 provider 故障（`provider_http_503`、`provider_http_429`、`invalid_llm_response` 等）归到共享的 `provider_error` 一条，避免为每个状态码各写一份翻译。
+
+**「要不要换一家再试」与「这是谁的问题」是两个不同的问题，由两个不同的谓词回答**，偏置刻意相反：
+
+| 问题 | 偏置 | 理由 |
+|---|---|---|
+| 值得换第二组再试吗？ | **允许清单**：只要不是本地错误就试 | 未知故障宁可多试一次——不试就是丢活动 |
+| 该归咎于 provider 吗？ | **闭集**：只有确实由 provider 产生的错误码才归咎 | 上报入口接收的是「代码库里任意异常的字符串」，把存储冲突或 Frigate 认证失败算成 provider 故障，会把人引到错误的子系统 |
+
+早期版本让一个谓词同时回答两个问题（用「非本地即 provider」的补集），结果是 store / media / frigate 层抛出的 50 个错误码全部被报成「视觉 provider 正在出错」——包括 `terminal_activity`（存储冲突）和 `authentication_failed`（Frigate 认证）。代码注释与测试现在把两个谓词相反的偏置钉在一起。
+
+**备用地址写错会怎样？** 早期版本会把它变成 `analysis_outcome_unknown`——既不报修、也不能手动补跑的一次静默丢失，比不配备用还糟。现在 URL 类错误被正确归类为 `provider_unavailable`：可转移、有卡片、可 `retry_failed` 补跑，日志里还会同时写下主组和备用组各自的原因。表单也会在保存时校验备用地址（`fallback_invalid_url`），所以手滑少写 `https://` 会在表单上就被拦下。
+
+> **已知遗留（早于本功能）**：`provider_unavailable` 有自己的卡片，但没有任何地方调用 `clear_error("provider_unavailable")`，所以故障恢复后那张卡片可能一直留着。它不影响活动处理，但会让你在「修复」里看到过期提示。
 
 ## 已知问题
 
 - **「夜间未知也分析」选项当前不生效。** 它在配置界面中存在并会被保存，但代码中没有任何地方读取它（`analyze_night_unknown` 仅出现在 schema 定义处）。切换它不会改变行为。
 - 新增场景需要同时改 `scenes.py` 与 `media.py`（见[适配你自己的摄像头](#适配你自己的摄像头)）；仅注册 `Scene` 不会让场景可用。
+- **`provider_unavailable` 的修复卡片可能残留。** 见上方「故障排查」末尾的说明：它有自己的卡片，但没有代码在故障结束后清除它。
 
 ## 升级到 0.1.0（单一流水线）
 
