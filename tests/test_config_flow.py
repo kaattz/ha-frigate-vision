@@ -1584,6 +1584,128 @@ async def test_a_complete_fallback_is_saved(hass: HomeAssistant) -> None:
     assert config.reasoning_effort == "low"
 
 
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "backup.example.com/v1",  # 少了 scheme，最常见的复制粘贴形态
+        "localhost:11434/v1",
+        "192.168.1.50:8080/v1",
+        "ftp://backup.example.com/v1",  # 非 http(s)
+    ],
+    ids=["no-scheme", "host-port", "ip-port", "non-http"],
+)
+async def test_a_malformed_fallback_url_is_rejected_at_the_form(
+    hass: HomeAssistant, bad_url: str
+) -> None:
+    """三项齐全但地址写错 -> 表单报 `fallback_invalid_url`，不存下来。
+
+    这一条是那道防线**唯一**有意义的位置。运行时的 `_fallback_errors` 姊妹修复
+    （把 URL 错误归类成 `provider_unavailable`）能让一次故障仍然可读、可补跑，
+    但那时主组**已经失败过**，备用组的地址错误叠在它上面，用户看到的是第二个
+    故障。表单层在两组都还健康时就拦下它，用户才有机会改。
+
+    地址必须在保存前被拒绝：存下去之后，每次转移都会为配置原因失败一次。
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"llm_base_url": "https://api.deepseek.com/v1", "max_tokens": 1234},
+    )
+    entry.add_to_hass(hass)
+    flow_id = await _open_the_settings_form(hass, entry)
+
+    result = await hass.config_entries.options.async_configure(
+        flow_id,
+        {
+            **_OPTIONS_PAYLOAD,
+            CONF_FALLBACK_LLM_BASE_URL: bad_url,
+            CONF_FALLBACK_LLM_API_KEY: "backup-key",
+            CONF_FALLBACK_LLM_MODEL: "backup-model",
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM, (
+        "地址解析不了时必须重新显示表单，而不是创建 entry"
+    )
+    assert result["step_id"] == "settings_form"
+    assert result["errors"].get("base") == "fallback_invalid_url", (
+        f"{bad_url!r} 应当在保存前被拒绝，实际错误：{result.get('errors')}"
+    )
+    for key in _FALLBACK_REQUIRED:
+        assert key not in entry.options, f"被拒绝的地址仍然把 {key} 存进了 entry"
+    assert entry.options.get("max_tokens") == 1234, "表单报错时不该改动已存的选项"
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    ["backup.example.com/v1", "ftp://backup.example.com/v1"],
+)
+async def test_the_initial_flow_rejects_a_malformed_fallback_url_too(
+    hass: HomeAssistant, bad_url: str
+) -> None:
+    """初始流渲染同一个 `_options_schema()`，也要挡下写错的地址。"""
+    flow_id = await _drive_the_initial_flow_to_the_options_step(hass)
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            **_OPTIONS_PAYLOAD,
+            CONF_FALLBACK_LLM_BASE_URL: bad_url,
+            CONF_FALLBACK_LLM_API_KEY: "backup-key",
+            CONF_FALLBACK_LLM_MODEL: "backup-model",
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "options"
+    assert result["errors"].get("base") == "fallback_invalid_url", (
+        f"{bad_url!r} 应当在保存前被拒绝，实际错误：{result.get('errors')}"
+    )
+    assert hass.config_entries.async_entries(DOMAIN) == [], (
+        "表单报错时 entry 不该被创建"
+    )
+
+
+async def test_a_valid_fallback_url_is_still_accepted(
+    hass: HomeAssistant,
+) -> None:
+    """合格地址不受新校验影响：这道防线不能顺手把能用的配置也拒了。
+
+    主组的地址在本路径上**从不**经过 `_parse_base_url`，这是既有行为，本次修复
+    刻意不动它——新增校验会把已经能用的主组地址挡在门外。备用组是新增字段，
+    对它校验不会锁住任何既有部署。
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"llm_base_url": "https://api.deepseek.com/v1"},
+    )
+    entry.add_to_hass(hass)
+    flow_id = await _open_the_settings_form(hass, entry)
+
+    for good_url in (
+        "https://backup.example.com/v1",
+        "http://192.168.1.50:8080/v1",  # 局域网明文端点也必须能填
+        "https://backup.example.com",  # 无路径
+    ):
+        result = await hass.config_entries.options.async_configure(
+            flow_id,
+            {
+                **_OPTIONS_PAYLOAD,
+                CONF_FALLBACK_LLM_BASE_URL: good_url,
+                CONF_FALLBACK_LLM_API_KEY: "backup-key",
+                CONF_FALLBACK_LLM_MODEL: "backup-model",
+            },
+        )
+        assert result["type"] is FlowResultType.CREATE_ENTRY, (
+            f"{good_url} 是合格地址，不该被拒：{result.get('errors')}"
+        )
+
+        flow_id = await _open_the_settings_form(hass, entry)
+
+
 async def test_the_initial_flow_rejects_a_half_configured_fallback_too(
     hass: HomeAssistant,
 ) -> None:
@@ -1665,6 +1787,9 @@ def test_the_fallback_error_is_translated_where_each_flow_reads_it() -> None:
     from custom_components.frigate_vision import config_flow
 
     root = Path(config_flow.__file__).parent
+    # Both codes `_fallback_errors` can return as a `base` error. A new one added
+    # without a translation shows the user the raw key name in every language.
+    codes = ("fallback_incomplete", "fallback_invalid_url")
     for name in ("strings.json", "translations/en.json", "translations/zh-Hans.json"):
         payload = json.loads((root / name).read_text("utf-8"))
         for path, blocks in (
@@ -1678,9 +1803,8 @@ def test_the_fallback_error_is_translated_where_each_flow_reads_it() -> None:
             ),
         ):
             for block in blocks:
-                assert block.get("fallback_incomplete"), (
-                    f"{name} 的 {path} 缺少 fallback_incomplete 译文"
-                )
+                for code in codes:
+                    assert block.get(code), f"{name} 的 {path} 缺少 {code} 译文"
         for path, block in (
             (
                 "config.step.options.data",

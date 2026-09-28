@@ -370,6 +370,13 @@ def _fallback_errors(user_input: Mapping[str, Any]) -> dict[str, str]:
     opens the form would otherwise be forced to fill in a provider they do not
     want. `vision.fallback_config_from` applies the same three-field rule, which
     is what makes this form's rejection agree with what the runtime will accept.
+
+    Two checks, both about the *second* provider only: the three fields must be
+    present as a group, and their address must parse. The address check exists
+    because a malformed one is not a harmless extra -- the fallback is reached
+    exactly when the primary has already failed, so an unparseable URL stacks a
+    second failure on the first and the diagnosis of the first is what gets
+    lost. This layer reports the typo while both providers are still healthy.
     """
     present = [
         key
@@ -382,6 +389,25 @@ def _fallback_errors(user_input: Mapping[str, Any]) -> dict[str, str]:
     ]
     if present and len(present) < 3:
         return {"base": "fallback_incomplete"}
+    if present:
+        # All three are present, so this is a provider the user means to use.
+        # Its address must survive the same parse the primary's does, because a
+        # malformed one is not merely useless -- it fails *at the moment the
+        # primary has already failed*, so the second fault buries the first.
+        # Refusing it here means the typo is reported while both providers are
+        # still healthy and the user is looking at the form.
+        #
+        # Only the fallback is checked. The primary's URL is not run through
+        # `_parse_base_url` on this path and never has been; adding that here
+        # would start rejecting values that already work, which is a behaviour
+        # change no typo fix is allowed to make.
+        try:
+            _parse_base_url(str(user_input[CONF_FALLBACK_LLM_BASE_URL]).strip())
+        except InvalidURL:
+            # `_parse_base_url` raises HA's `yarl.InvalidURL`, not an aiohttp
+            # error -- a different family from the one `async_request` catches,
+            # which is exactly why the two layers are checked independently.
+            return {"base": "fallback_invalid_url"}
     return {}
 
 

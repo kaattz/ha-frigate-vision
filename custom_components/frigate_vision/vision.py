@@ -133,7 +133,24 @@ _JPEG_QUALITY = 85
 
 # Raised when the process cannot reach the provider at all, as opposed to the
 # provider answering with an error.
-_CONNECTION_ERRORS = (aiohttp.ClientConnectionError, asyncio.TimeoutError)
+#
+# `ClientError` rather than `ClientConnectionError`, because the base class is
+# what the *URL* failures inherit from as well: aiohttp validates the address
+# inside `ClientSession._request`, before any socket exists, and raises
+# `InvalidUrlClientError` (no scheme, blank) or `NonHttpUrlClientError`
+# (`ftp://`, `localhost:11434/v1`) from there. Neither one is a
+# `ClientConnectionError` -- `InvalidUrlClientError` derives from `ValueError`
+# instead, and `NonHttpUrlClientError` derives from `ClientError` directly --
+# so the narrower tuple let a malformed base URL escape this module as a bare
+# exception. Where it landed was the failover loop's catch-all, which can only
+# record `analysis_outcome_unknown`: not failover-eligible, not blamed, not
+# replayable by hand. A typo in one address then cost the activity outright.
+#
+# Catching the base class is safe here: every other `ClientError` the session
+# can raise is a transport fault with the same meaning for the caller, and
+# `VisionError` -- the only exception this block must not swallow -- is not an
+# `aiohttp` type at all.
+_CONNECTION_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
 
 
 class VisionError(RuntimeError):
@@ -601,7 +618,14 @@ class VisionClient:
             except Exception as exc:  # noqa: BLE001
                 # Unexpected: the outcome is unknown, so the request may already
                 # have been billed. Never fail over here -- that would risk
-                # paying twice for one activity.
+                # paying twice for one activity. Log it: this branch means some
+                # failure mode is not classified, and silence here is how the
+                # diagnosis gets lost.
+                _LOGGER.warning(
+                    "Analysis failed with an unclassified error for %s: %s",
+                    activity_id,
+                    exc,
+                )
                 await self._store.async_transition(
                     activity_id,
                     ActivityStage.ANALYSIS_STARTED,

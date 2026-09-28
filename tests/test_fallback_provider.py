@@ -8,10 +8,13 @@ import json
 import logging
 from typing import Any
 
+import aiohttp
 import pytest
+from aiohttp import InvalidURL
 from homeassistant.core import HomeAssistant
 from PIL import Image
 from pytest_homeassistant_custom_component.common import MockConfigEntry
+from yarl import URL
 
 from custom_components.frigate_vision import vision
 from custom_components.frigate_vision.models import (
@@ -379,14 +382,35 @@ class _RoutingSession:
     would silently swap which provider it was answering as soon as the loop's
     attempt count changed, and every assertion about "the fallback answered"
     would then be testing the fake instead of the loop.
+
+    It also runs aiohttp's own two URL checks before routing, because a fake
+    that answers *every* address cannot reproduce a malformed one at all: in it
+    a bad base URL would simply be routed to a scripted answer, and a test that
+    meant to exercise the URL-validation path would pass while proving nothing.
+    Rejecting exactly what aiohttp rejects is what lets the malformed-URL tests
+    below run the real chain at all -- and it is the real exception classes, so
+    the production `except` clause is what is under test, not the fake.
     """
 
     def __init__(self, by_url: dict[str, list[tuple[int, str]]]) -> None:
         self._by_url = by_url
         self.calls: list[str] = []
 
+    @staticmethod
+    def _reject_the_way_aiohttp_does(url: str) -> None:
+        """Mirror `ClientSession._request`'s URL validation."""
+        try:
+            parsed = URL(url)
+        except ValueError as exc:
+            raise aiohttp.InvalidUrlClientError(url) from exc
+        if parsed.scheme not in aiohttp.TCPConnector.allowed_protocol_schema_set:
+            raise aiohttp.NonHttpUrlClientError(parsed)
+        if not parsed.raw_host:
+            raise aiohttp.InvalidUrlClientError(parsed)
+
     def post(self, url: str, *, json: dict[str, Any], **_kwargs: Any):
         self.calls.append(url)
+        self._reject_the_way_aiohttp_does(url)
         script = self._by_url[url]
         index = min(
             sum(1 for seen in self.calls if seen == url) - 1,
@@ -457,6 +481,7 @@ async def _wire(
     primary_script: list[tuple[int, str]],
     fallback_script: list[tuple[int, str]] | None = None,
     with_fallback: bool = True,
+    fallback_url: str = _FALLBACK_URL,
 ) -> tuple[ActivityStore, VisionClient, _RoutingSession]:
     """Build a real store, client and routing session for one analysis.
 
@@ -464,6 +489,12 @@ async def _wire(
     retry: the 2s/6s/18s schedule is a policy this change must not touch, and it
     is pinned as literals by `test_provider_retry.py`, so serving it here would
     only cost 26 seconds per test. The attempt *count* is untouched.
+
+    `fallback_url` exists so a test can hand the client a base URL that is
+    malformed rather than merely unreachable. It is a parameter rather than a
+    second helper because the client wiring -- the claim, the store, the two
+    provider names -- must stay byte-for-byte the production shape for those
+    tests to mean anything.
     """
     monkeypatch.setattr(vision, "PROVIDER_RETRY_BACKOFF_SECONDS", 0.0)
 
@@ -473,7 +504,7 @@ async def _wire(
 
     by_url: dict[str, list[tuple[int, str]]] = {_PRIMARY_URL: primary_script}
     if with_fallback:
-        by_url[_FALLBACK_URL] = fallback_script or [(200, _ok_body("备用组的描述。"))]
+        by_url[fallback_url] = fallback_script or [(200, _ok_body("备用组的描述。"))]
     session = _RoutingSession(by_url)
     monkeypatch.setattr(
         "custom_components.frigate_vision.vision.async_get_clientsession",
@@ -483,7 +514,7 @@ async def _wire(
         hass,
         store,
         _provider_config(_PRIMARY_URL, _PRIMARY_MODEL),
-        _provider_config(_FALLBACK_URL, _FALLBACK_MODEL) if with_fallback else None,
+        _provider_config(fallback_url, _FALLBACK_MODEL) if with_fallback else None,
     )
     return store, client, session
 
@@ -929,6 +960,38 @@ def _issues(hass: HomeAssistant) -> Any:
     return ir.async_get(hass).issues
 
 
+async def _runtime_with_entry(
+    hass: HomeAssistant, store: ActivityStore
+) -> tuple[IntegrationRuntime, MockConfigEntry]:
+    """A runtime whose entry is registered, so a repair card can really be raised.
+
+    `_runtime` above builds one without an entry, which is enough for calling
+    `record_error` directly. A test that drives `_schedule_analysis` end to end
+    needs the entry itself: that is the argument the schedule is keyed on, and
+    the repair registry refuses to raise against an entry that was never added.
+    """
+    entry = MockConfigEntry(
+        domain="frigate_vision",
+        title="Front Door",
+        data={},
+        options={},
+        entry_id=_ENTRY_ID,
+    )
+    entry.add_to_hass(hass)
+
+    async def handler(message: object) -> None:
+        return None
+
+    runtime = IntegrationRuntime(
+        hass=hass,
+        store=store,
+        queue=EntryRuntime(queue_size=1, handler=handler),
+        analysis_tasks={},
+        entry_id=_ENTRY_ID,
+    )
+    return runtime, entry
+
+
 class TestTheProviderAlertCannotDrift:
     """报修与转移由**两个**判断回答，各自的未知偏置相反。
 
@@ -1199,3 +1262,295 @@ class TestMediaRetryExhaustedIsNotProvidersFault:
     def test_it_stays_replayable_by_hand(self) -> None:
         """改判不能伤到人工重放：它仍然是用户可安全重试的。"""
         assert retry_is_safe("media_retry_exhausted")
+
+
+# --------------------------------------------------------------------------- #
+# 一个手滑的备用地址。
+# --------------------------------------------------------------------------- #
+
+
+class TestAMalformedUrlCannotSwallowTheDiagnosis:
+    """一个手滑的备用地址，绝不能把「主组 503」变成一次静默丢失。
+
+    实测：`InvalidUrlClientError` 不是 `ClientConnectionError`，所以它会以裸异常
+    逃出 `async_request`，被转移循环的 `except Exception` 记成
+    `analysis_outcome_unknown` —— 那个错误码既不转移、又不报修、还不能手动补跑。
+    结果是「配了一个写错的备用地址」比「不配备用」更糟：本来可读可补的 503
+    变成了一次无法解释的永久丢失。
+    """
+
+    #: 五种都被 aiohttp 拒绝，且五种都被 `_parse_base_url` 拒绝，所以表单那一层
+    #: 也挡得住它们 —— 两道防线拦的是同一组值，不存在「表单放过、运行时不放过」
+    #: 的窗口。
+    BAD_URLS = [
+        "backup.example.com/v1",  # 少了 scheme，最常见的复制粘贴形态
+        "localhost:11434/v1",
+        "192.168.1.50:8080/v1",
+        "ftp://backup.example.com/v1",  # 非 http(s)
+        "   ",  # 全空白
+    ]
+
+    @pytest.mark.parametrize("bad_url", BAD_URLS)
+    def test_each_bad_url_is_one_aiohttp_really_rejects(self, bad_url: str) -> None:
+        """上面那五个地址必须真的被 aiohttp 判为 URL 错误。
+
+        这一条把 fixture 与真实库钉在一起：假会话复刻了 aiohttp 的两道 URL 校验，
+        若复刻漂了，下面几条测的就会是假会话的脾气而不是 aiohttp 的行为。这里直接
+        调真实库，断言它抛的确实是 `ClientError` 家族的 URL 错误。
+        """
+        with pytest.raises(aiohttp.ClientError) as caught:
+            _RoutingSession._reject_the_way_aiohttp_does(
+                vision.VisionConfig(
+                    base_url=bad_url, api_key="k", model="m"
+                ).endpoint()
+            )
+
+        assert isinstance(
+            caught.value,
+            (aiohttp.InvalidUrlClientError, aiohttp.NonHttpUrlClientError),
+        ), f"{bad_url} 应当是 URL 类错误，实际 {type(caught.value).__name__}"
+
+    @pytest.mark.parametrize("bad_url", BAD_URLS)
+    def test_each_bad_url_is_also_refused_by_the_url_parser(self, bad_url: str) -> None:
+        """同一个值也必须被 `_parse_base_url` 拒绝（表单那道防线）。"""
+        from custom_components.frigate_vision.config_flow import _parse_base_url
+
+        with pytest.raises(InvalidURL):
+            _parse_base_url(bad_url)
+
+    @pytest.mark.parametrize("bad_url", BAD_URLS)
+    async def test_a_bad_fallback_url_does_not_swallow_the_diagnosis(
+        self,
+        hass: HomeAssistant,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        bad_url: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """写错的备用地址不能把一次可恢复的故障变成静默、不可补跑的丢失。
+
+        记录下来的码是 `provider_unavailable`（备用组被真的请求过，只是它的地址
+        解析不了），不是主组的 503 —— 这与「不配备用」时记录的码不同，是对的：
+        最后被请求的端点才是用户重放时要面对的那个。真正要钉死的是那三条被这个
+        缺陷夺走的性质：可转移、会报修、可手动补跑。三条都来自
+        `provider_unavailable`，而它们的共同反例正是 `analysis_outcome_unknown`。
+
+        主组那条 503 只剩一个地方留下：下面这条日志。它就是主组的诊断本身，所以
+        在这里被断言 —— 一旦它不再触发，用户能看到的就只有备用组的地址错误。
+        """
+        store, client, _session = await _wire(
+            hass,
+            tmp_path,
+            monkeypatch,
+            primary_script=[(503, "primary down")],
+            fallback_url=bad_url,
+        )
+
+        with caplog.at_level(logging.WARNING, logger=_VISION_LOGGER):
+            with pytest.raises(VisionError) as caught:
+                await client.async_analyze("activity_1")
+
+        code = str(caught.value)
+        assert code == "provider_unavailable", (
+            "备用组的地址真的被请求过，只是解析不了：这必须是可分类的连接类故障"
+        )
+        assert code != "analysis_outcome_unknown", (
+            "一个手滑的地址不该把结果变成未知：那既不转移、又不报修、还不能补跑"
+        )
+        record = store.get("activity_1")
+        assert record is not None
+        assert record.stage is ActivityStage.FAILED
+        assert record.error_code == code
+        assert record.error_code != "analysis_outcome_unknown"
+        # 三条被缺陷夺走的性质，逐条钉回来。
+        assert is_failover_eligible(code), "不转移，就等于备用组白配了"
+        assert the_provider_is_the_suspect(code), "不报修，用户就永远不知道出了事"
+        assert retry_is_safe(code), "不能手动补跑，这次活动就永久丢了"
+
+        messages = [failed.getMessage() for failed in caplog.records]
+        assert any(
+            "Both providers failed (provider_http_503, then provider_unavailable)"
+            in message
+            for message in messages
+        ), (
+            "主组的 503 只剩这一行日志留痕；它不再触发，主组的诊断就彻底没了："
+            f"{messages}"
+        )
+
+    @pytest.mark.parametrize("bad_url", BAD_URLS)
+    async def test_a_bad_fallback_url_still_raises_the_repair_card(
+        self,
+        hass: HomeAssistant,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        bad_url: str,
+    ) -> None:
+        """端到端：写错的备用地址不能让「修复」卡片消失。
+
+        与 `test_both_providers_failing_reaches_the_alert_through_the_real_path`
+        同一条接线（`_schedule_analysis` -> `async_analyze` -> `record_error`），
+        只把备用地址换成一个写错的：报修必须照旧亮起。卡片上的码是备用组的
+        `provider_unavailable`，因为它是最后被请求的那一组——但卡片**必须在**，
+        这正是缺陷期间丢掉的东西。
+        """
+        store, client, _session = await _wire(
+            hass,
+            tmp_path,
+            monkeypatch,
+            primary_script=[(503, "primary down")],
+            fallback_url=bad_url,
+        )
+
+        runtime, entry = await _runtime_with_entry(hass, store)
+        runtime.vision = client
+
+        record = store.get("activity_1")
+        assert record is not None
+        runtime._schedule_analysis(entry, record)
+        await asyncio.gather(*(runtime.analysis_tasks or {}).values())
+
+        # `provider_unavailable` 有自己的专属卡片，`record_error` 刻意让它优先于
+        # 公共的 `provider_error`。缺陷期间这里一张卡片都没有：
+        # `analysis_outcome_unknown` 不在 ISSUES 里，也不是供应商嫌疑码，
+        # 于是「一片安静」正是它的形态。
+        raised = {
+            issue_id
+            for domain, issue_id in _issues(hass)
+            if domain == "frigate_vision"
+        }
+        assert raised, (
+            "主组 503、备用地址写错：用户必须看到一张修复卡片，而不是一片安静"
+        )
+        assert f"{_ENTRY_ID}_provider_unavailable" in raised, (
+            f"最后被请求的备用组解析不了，它该亮自己的卡片，实际亮了 {sorted(raised)}"
+        )
+        assert runtime.last_error == "provider_unavailable", (
+            "最后被请求的是备用组，它的失败才是重放时要面对的那个"
+        )
+        assert runtime.last_error != "analysis_outcome_unknown", (
+            "一个手滑的地址不该让告警与补跑一起消失"
+        )
+        failed = store.get("activity_1")
+        assert failed is not None
+        assert failed.stage is ActivityStage.FAILED
+        assert failed.error_code == "provider_unavailable"
+        assert retry_is_safe(failed.error_code)
+
+    @pytest.mark.parametrize("bad_url", BAD_URLS)
+    async def test_the_outcome_is_unknown_only_when_it_really_is(
+        self,
+        hass: HomeAssistant,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        bad_url: str,
+    ) -> None:
+        """判别版：坏的备用地址**确实**被尝试过，只是它的失败被归类了。
+
+        上一组断言依赖「主组的 503 最后被记录」，而一个「根本不调备用组」的实现
+        也能让它成立 —— 那样这条测试就变成了在测别的实现。坏的备用地址会被真的
+        调用一次（`provider_unavailable`，可转移），所以主组的 503 先被记为
+        `last_failure`，再由备用组的失败覆盖，用户看到的仍是可读可补的那一个。
+        """
+        store, client, session = await _wire(
+            hass,
+            tmp_path,
+            monkeypatch,
+            primary_script=[(503, "primary down")],
+            fallback_url=bad_url,
+        )
+
+        with pytest.raises(VisionError):
+            await client.async_analyze("activity_1")
+
+        # 备用组的地址真的被请求过：两次尝试（它自己的两次）加主组的四次。
+        assert len(session.calls) > PROVIDER_RETRY_ATTEMPTS, (
+            f"备用组根本没被尝试，实际调用 {session.calls}"
+        )
+        assert client.provider_for("activity_1") is None, "没有任何一组答出来"
+
+    async def test_a_malformed_url_raises_provider_unavailable_not_a_bare_error(
+        self,
+    ) -> None:
+        """aiohttp 的 URL 错误必须被归类，而不是漏成裸异常。
+
+        直接打 `async_request`：一个没有 scheme 的地址必须变成带具体错误码的
+        `VisionError`。漏成裸异常时，分类它的位置就只剩转移循环的兜底分支，
+        而那里只能给出 `analysis_outcome_unknown`。
+        """
+        session = _RoutingSession({})
+        config = VisionConfig(
+            base_url="backup.example.com/v1",
+            api_key="k",
+            model="m",
+        )
+
+        with pytest.raises(VisionError) as caught:
+            await vision.async_request(session, config, {"model": "m"})
+
+        assert str(caught.value) == "provider_unavailable", (
+            f"URL 错误被漏成了 {type(caught.value).__name__}"
+        )
+
+    @pytest.mark.parametrize(
+        "bad_url",
+        ["localhost:11434/v1", "ftp://backup.example.com/v1", "   "],
+    )
+    async def test_the_whole_url_error_family_is_classified(
+        self, bad_url: str
+    ) -> None:
+        """不止 `InvalidUrlClientError`：整个 `ClientError` 家族都要被归类。
+
+        `NonHttpUrlClientError`（`localhost:11434/v1`、`ftp://`）与
+        `InvalidUrlClientError`（缺 scheme、全空白）是**并列**两支，都不是
+        `ClientConnectionError`。只宽到前者会漏掉后者，反之亦然。
+        """
+        session = _RoutingSession({})
+
+        with pytest.raises(VisionError) as caught:
+            await vision.async_request(
+                session,
+                VisionConfig(base_url=bad_url, api_key="k", model="m"),
+                {"model": "m"},
+            )
+
+        assert str(caught.value) == "provider_unavailable"
+
+    async def test_an_unclassified_error_is_logged_where_it_escapes(
+        self,
+        hass: HomeAssistant,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """兜底分支不许静默：它意味着有失败模式没被分类。
+
+        这一条不测「哪个码」，测的是**这个分支还在不在**。URL 错误已经不走它了，
+        但别的没被分类的异常仍会落到这里 —— 而它过去既不转移、不报修、也不写日志，
+        诊断就断在这里。异常仍按原样抛出（结果未知，不许转移）。
+        """
+        sheet = tmp_path / "activity.png"
+        sheet.write_bytes(_png(640, 240))
+        store = await _ready_store(hass, sheet)
+
+        async def explode(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("socket layer blew up")
+
+        monkeypatch.setattr(
+            "custom_components.frigate_vision.vision.async_analyze", explode
+        )
+        client = VisionClient(
+            hass,
+            store,
+            _provider_config(_PRIMARY_URL, _PRIMARY_MODEL),
+            _provider_config(_FALLBACK_URL, _FALLBACK_MODEL),
+        )
+
+        with caplog.at_level(logging.WARNING, logger=_VISION_LOGGER):
+            with pytest.raises(VisionError, match="analysis_outcome_unknown"):
+                await client.async_analyze("activity_1")
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "unclassified" in message and "socket layer blew up" in message
+            for message in messages
+        ), f"兜底分支把失败模式吞了，日志里只有 {messages}"
