@@ -133,9 +133,10 @@ class DeliveryManager:
                 "confidence": record.confidence,
                 "evidence_url": record.evidence_media_url,
                 "evidence_image_url": evidence_image_url,
-                # Comma-separated seconds, one per sheet cell, in cell order.
-                # A string so it survives every hop as the same type; see
-                # `evidence_offsets_text`.
+                # Pipe-separated seconds, one per sheet cell, in cell order. A
+                # string so it survives every hop as the same type, and a pipe
+                # rather than a comma because HA's template parser reads a
+                # comma-separated result as a tuple; see `evidence_offsets_text`.
                 "evidence_offsets": evidence_offsets_text(record),
                 "clip_url": clip_url,
                 "hls_url": hls_url,

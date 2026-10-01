@@ -111,7 +111,12 @@ MODE_CLASSIFICATIONS: dict[str, set[str]] = {
 }
 
 # Text-mode replies can carry the object bare, inside a fenced block, or wrapped
-# in prose; both patterns are bounded to a single object.
+# in prose. `_JSON_FENCE` is anchored to the fence so it yields the fenced object
+# alone. `_JSON_OBJECT` is a greedy brace span and is NOT itself single-object: with
+# two objects in the text it runs from the first `{` to the last `}`, which is not
+# valid JSON. That is safe only because `extract_json_object` treats a parse failure
+# as "no object found" and the caller then refuses the reply -- the guarantee is the
+# rejection, not the pattern.
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
 
