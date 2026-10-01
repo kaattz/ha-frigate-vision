@@ -19,7 +19,16 @@ on:
         required: true
 permissions: {contents: write}
 jobs:
+  # Gate the release on the same job that guards main. Without it a tag could be
+  # pushed on a red commit and HACS would offer it to every installation, which is
+  # the one direction this pipeline cannot take back.
+  #
+  # Calling the reusable workflow rather than repeating its steps keeps a single
+  # source of truth: a duplicated list would silently stop gating once it drifted.
+  verify:
+    uses: ./.github/workflows/tests.yml
   release:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
