@@ -296,3 +296,39 @@ async def test_native_client_reauthenticates_once_after_expired_session(
     assert login_count == 2
     assert version_count == 2
     await client.async_close()
+
+
+async def test_a_404_names_the_call_that_failed(
+    hass: HomeAssistant, aiohttp_server, socket_enabled
+) -> None:
+    """A failed request must say WHICH request failed.
+
+    Diagnosed from a real deployment: an activity died with the bare code
+    `http_404` -- no URL, no operation -- while every Frigate endpoint answered
+    200 when probed by hand, so the one fact needed to locate the fault was the
+    one fact the error discarded.
+
+    `str(exc)` must stay exactly the code: callers compare it against
+    `TRANSIENT_MEDIA_ERRORS`, pass it to `record_error`, and store it as an
+    activity's `error_code`, so decorating the message would silently
+    reclassify every failure.
+    """
+    app = web.Application()
+
+    async def missing(request: web.Request) -> web.Response:
+        return web.Response(status=404, text="not found")
+
+    app.router.add_get("/api/front/recordings/1.500000/snapshot.jpg", missing)
+    server = await aiohttp_server(app)
+    client = FrigateClient(async_get_clientsession(hass), str(server.make_url("/")))
+
+    with pytest.raises(FrigateApiError) as caught:
+        await client.async_get_snapshot("front", 1.5, 360)
+
+    error = caught.value
+    assert str(error) == "http_404", (
+        "错误码必须保持原样：调用方拿它和 TRANSIENT_MEDIA_ERRORS 比较、"
+        "写进 record_error、存成活动的 error_code"
+    )
+    assert error.url is not None, "错误必须带上失败的那个 URL，否则无法定位"
+    assert "/api/front/recordings/1.500000/snapshot.jpg" in error.url

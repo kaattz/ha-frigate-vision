@@ -28,7 +28,17 @@ from .models import (
 
 
 class FrigateApiError(RuntimeError):
-    """A Frigate API response violated the public contract."""
+    """A Frigate API response violated the public contract.
+
+    Carries the URL of the call that failed, so a bare code like `http_404` can be
+    traced to the request that produced it. `str(error)` is deliberately still the
+    code alone: callers match it against `TRANSIENT_MEDIA_ERRORS`, hand it to
+    `record_error`, and persist it as an activity's `error_code`.
+    """
+
+    def __init__(self, code: str, *, url: str | None = None) -> None:
+        super().__init__(code)
+        self.url = url
 
 
 class FrigatePayloadError(ValueError):
@@ -233,7 +243,7 @@ class FrigateClient:
                         retry_auth = True
                     else:
                         retry_auth = False
-                        self._check_status(response.status)
+                        self._check_status(response.status, url=url)
                         return response.content_type, await response.read()
             except TimeoutError as exc:
                 raise FrigateApiError("request_timeout") from exc
@@ -304,11 +314,11 @@ class FrigateClient:
             raise FrigateApiError(code)
 
     @staticmethod
-    def _check_status(status: int) -> None:
+    def _check_status(status: int, *, url: str | None = None) -> None:
         if status == 401 or status == 403:
-            raise FrigateApiError("authentication_failed")
+            raise FrigateApiError("authentication_failed", url=url)
         if status < 200 or status >= 300:
-            raise FrigateApiError(f"http_{status}")
+            raise FrigateApiError(f"http_{status}", url=url)
 
 
 def _load_payload(payload: str) -> Mapping[str, Any]:

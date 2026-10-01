@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -489,6 +490,185 @@ async def test_media_failure_during_stop_keeps_activity_sealed(
     assert store.get("activity_1").stage is ActivityStage.SEALED  # type: ignore[union-attr]
 
 
+async def test_a_frigate_404_does_not_raise_the_connection_card(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Frigate answering 404 is not Frigate being unreachable.
+
+    Measured on this deployment: the evidence plan derives its frames from the
+    *detections*, but the build is scheduled at the *review's* end. A detection
+    can outlive its review, so `last` and `postroll` are requested up to ~8s
+    before the moments they depict are recorded, and Frigate answers 404 for an
+    instant it has no segment for yet -- true of 11 of 11 real reviews measured,
+    gaps 5.4-8.0s.
+
+    That is a recording gap on a Frigate that is up and answering. Raising
+    `frigate_unavailable` sent the user to check a service that was never down,
+    which is what "无法连接 Frigate" told them.
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = ActivityRecord(
+        activity_id="activity_404",
+        entry_id="entry_1",
+        source=ActivitySource.STANDALONE_REVIEW,
+        stage=ActivityStage.SEALED,
+        created_at=100,
+        updated_at=120,
+        camera="front",
+        detection_ids=("event_1",),
+        finalization_deadline=time.time() - 1,
+    )
+    await store.async_create(record)
+
+    calls: list[str] = []
+
+    class Manager:
+        async def async_build(self, activity_id: str):
+            calls.append(activity_id)
+            raise runtime_module.FrigateApiError("http_404")
+
+    async def handler(message: object) -> None:
+        return None
+
+    entry = _entry({})
+    entry.add_to_hass(hass)
+    runtime = IntegrationRuntime(
+        hass=hass,
+        store=store,
+        queue=EntryRuntime(queue_size=1, handler=handler),
+        media_manager=Manager(),
+        media_tasks={},
+        entry_id=entry.entry_id,
+    )
+    # One attempt: this test is about the classification, not the retry budget.
+    monkeypatch.setattr(runtime_module, "MEDIA_RETRY_ATTEMPTS", 1)
+    monkeypatch.setattr(runtime_module, "MEDIA_RETRY_SECONDS", 0)
+    runtime._schedule_media(entry, record)
+    await asyncio.gather(*(runtime.media_tasks or {}).values())
+
+    registry = ir.async_get(hass)
+    assert (
+        "frigate_vision",
+        f"{entry.entry_id}_frigate_unavailable",
+    ) not in registry.issues, (
+        "Frigate 回答了 404 说明它可达；报「无法连接 Frigate」把录像缺口说成了连接故障"
+    )
+    # The failure is still recorded, and still visible: an activity was lost.
+    assert runtime.last_error == "http_404"
+    assert calls == ["activity_404"]
+    failed = store.get(record.activity_id)
+    assert failed is not None and failed.stage is ActivityStage.FAILED
+    assert failed.error_code == "media_retry_exhausted"
+
+
+async def test_a_frigate_404_is_still_retried_as_a_transient_gap(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing frame is usually not-yet-written, so it must still be retried.
+
+    This is the other half of the fix: the code is no longer *reported* as a
+    connection failure, but it must not stop being treated as transient either.
+    Frigate closes recording segments every 10s, so an instant at the live edge
+    becomes servable moments later -- the same retry that papers over the gap
+    today has to stay.
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = ActivityRecord(
+        activity_id="activity_404_retry",
+        entry_id="entry_1",
+        source=ActivitySource.STANDALONE_REVIEW,
+        stage=ActivityStage.SEALED,
+        created_at=100,
+        updated_at=120,
+        camera="front",
+        detection_ids=("event_1",),
+        finalization_deadline=time.time() - 1,
+    )
+    await store.async_create(record)
+
+    calls: list[str] = []
+
+    class Manager:
+        async def async_build(self, activity_id: str):
+            calls.append(activity_id)
+            raise runtime_module.FrigateApiError("http_404")
+
+    async def handler(message: object) -> None:
+        return None
+
+    entry = _entry({})
+    entry.add_to_hass(hass)
+    runtime = IntegrationRuntime(
+        hass=hass,
+        store=store,
+        queue=EntryRuntime(queue_size=1, handler=handler),
+        media_manager=Manager(),
+        media_tasks={},
+        entry_id=entry.entry_id,
+    )
+    monkeypatch.setattr(runtime_module, "MEDIA_RETRY_ATTEMPTS", 3)
+    monkeypatch.setattr(runtime_module, "MEDIA_RETRY_SECONDS", 0)
+    runtime._schedule_media(entry, record)
+    await asyncio.gather(*(runtime.media_tasks or {}).values())
+
+    assert len(calls) == 3, "一次 404 就放弃会丢掉本来只是还没写完的帧"
+
+
+async def test_a_genuine_connection_failure_still_raises_the_card(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fix must not over-correct: a real outage keeps its own repair.
+
+    `frigate_unavailable` means the client could not reach Frigate at all. That
+    card is correct and must survive, or the repair added for a real outage
+    would have been replaced by silence.
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = ActivityRecord(
+        activity_id="activity_offline",
+        entry_id="entry_1",
+        source=ActivitySource.STANDALONE_REVIEW,
+        stage=ActivityStage.SEALED,
+        created_at=100,
+        updated_at=120,
+        camera="front",
+        detection_ids=("event_1",),
+        finalization_deadline=time.time() - 1,
+    )
+    await store.async_create(record)
+
+    class Manager:
+        async def async_build(self, activity_id: str):
+            raise runtime_module.FrigateApiError("frigate_unavailable")
+
+    async def handler(message: object) -> None:
+        return None
+
+    entry = _entry({})
+    entry.add_to_hass(hass)
+    runtime = IntegrationRuntime(
+        hass=hass,
+        store=store,
+        queue=EntryRuntime(queue_size=1, handler=handler),
+        media_manager=Manager(),
+        media_tasks={},
+        entry_id=entry.entry_id,
+    )
+    monkeypatch.setattr(runtime_module, "MEDIA_RETRY_ATTEMPTS", 1)
+    monkeypatch.setattr(runtime_module, "MEDIA_RETRY_SECONDS", 0)
+    runtime._schedule_media(entry, record)
+    await asyncio.gather(*(runtime.media_tasks or {}).values())
+
+    registry = ir.async_get(hass)
+    assert (
+        "frigate_vision",
+        f"{entry.entry_id}_frigate_unavailable",
+    ) in registry.issues, "真正连不上 Frigate 时必须保留这张修复卡片"
+
+
 async def test_the_runtime_loop_does_not_retry_a_spent_provider_failure(
     hass: HomeAssistant,
 ) -> None:
@@ -685,6 +865,80 @@ async def test_runtime_loads_with_review_only_configuration(
     assert runtime.frigate_client is client
     assert runtime.correlation is not None
     await runtime.async_stop()
+
+
+async def test_a_media_failure_is_logged_so_it_can_be_diagnosed(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A lost activity must leave a trace in the log, not only on a sensor.
+
+    Diagnosed from a real deployment: two activities died in frame extraction and
+    the only surviving evidence was `media_retry_exhausted` on the `Last error`
+    sensor. `media.py` logs nothing at all and this failure branch logged nothing
+    either, so the code named neither the operation that failed nor the exception
+    that caused it -- an hour went into re-probing Frigate endpoints by hand, all
+    of which turned out to answer 200.
+
+    The log line is the difference between "something failed" and "this call
+    failed with this exception".
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = ActivityRecord(
+        activity_id="activity_logged",
+        entry_id="entry_1",
+        source=ActivitySource.STANDALONE_REVIEW,
+        stage=ActivityStage.SEALED,
+        created_at=100,
+        updated_at=120,
+        camera="front",
+        detection_ids=("event_1",),
+        finalization_deadline=time.time() - 1,
+    )
+    await store.async_create(record)
+
+    class Manager:
+        async def async_build(self, activity_id: str):
+            raise runtime_module.FrigateApiError("http_404")
+
+    async def handler(message: object) -> None:
+        return None
+
+    entry = _entry({})
+    entry.add_to_hass(hass)
+    runtime = IntegrationRuntime(
+        hass=hass,
+        store=store,
+        queue=EntryRuntime(queue_size=1, handler=handler),
+        media_manager=Manager(),
+        media_tasks={},
+        entry_id=entry.entry_id,
+    )
+    monkeypatch.setattr(runtime_module, "MEDIA_RETRY_ATTEMPTS", 1)
+    monkeypatch.setattr(runtime_module, "MEDIA_RETRY_SECONDS", 0)
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.frigate_vision"):
+        runtime._schedule_media(entry, record)
+        await asyncio.gather(*(runtime.media_tasks or {}).values())
+
+    # Only our own logger's records count. The store writes its whole state at
+    # DEBUG on every transition, which contains both the activity id and (via the
+    # record) the closing error code -- matching against the raw capture would
+    # pass without a single line of our own being emitted.
+    ours = [
+        record_
+        for record_ in caplog.records
+        if record_.name.startswith("custom_components.frigate_vision")
+    ]
+    assert ours, (
+        "活动因取帧失败而丢失，却没有任何日志：只有传感器上的一个错误码，"
+        "无法判断是哪一步、哪个异常"
+    )
+    message = "\n".join(record_.getMessage() for record_ in ours)
+    assert "activity_logged" in message, "日志必须点名是哪条活动失败了"
+    assert "http_404" in message, "日志必须带上底层异常，否则仍然无法定位"
 
 
 def _door_data_legacy() -> dict:

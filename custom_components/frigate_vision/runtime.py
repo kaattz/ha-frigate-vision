@@ -485,10 +485,28 @@ class IntegrationRuntime:
                     if self.stopping:
                         return
                     code = str(exc)
+                    # A 404 is deliberately NOT in this set. It is not a
+                    # connection failure: Frigate answered, and said it has no
+                    # frame at that instant. Folding it in here raised
+                    # "无法连接 Frigate" for a recording gap, sending the user to
+                    # check a service that was up the whole time.
+                    #
+                    # The gap is structural rather than rare. The plan derives
+                    # its frames from the *detections* while the build is
+                    # scheduled at the *review's* end, and a detection can
+                    # outlive its review -- so `last` and `postroll` are asked
+                    # for up to ~8s before the moments they depict exist, and
+                    # Frigate answers 404 until the segment is closed. Measured
+                    # across 11 of 11 real reviews, gaps 5.4-8.0s.
+                    #
+                    # It stays transient (`TRANSIENT_MEDIA_ERRORS`), so the
+                    # retry below still waits the gap out; only the diagnosis
+                    # changes. The specific code reaches the `Last error`
+                    # sensor, and the activity still fails as
+                    # `media_retry_exhausted`, which `retry_failed` can replay.
                     if code in {
                         "frigate_unavailable",
                         "request_timeout",
-                        "http_404",
                     }:
                         self.record_error("frigate_unavailable")
                     attempts += 1
@@ -506,6 +524,21 @@ class IntegrationRuntime:
                         await asyncio.sleep(retry_seconds)
                         continue
                     self.last_error = code
+                    # The sensor carries the code; the log carries why. Without
+                    # this line a lost activity left only `media_retry_exhausted`
+                    # on the sensor, naming neither the operation nor the
+                    # exception -- the code alone sent a real diagnosis down an
+                    # hour of hand-probing Frigate endpoints that all answered
+                    # 200. Logged on the terminal attempt so a retried gap does
+                    # not repeat the same line at every backoff step.
+                    failure_url = getattr(exc, "url", None)
+                    _LOGGER.warning(
+                        "Media build failed for %s after %d attempt(s): %r%s",
+                        record.activity_id,
+                        attempts,
+                        exc,
+                        f" (url={failure_url})" if failure_url else "",
+                    )
                     current = self.store.get(record.activity_id)
                     if current is not None and current.stage is ActivityStage.SEALED:
                         error_code = (
