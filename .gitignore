@@ -42,3 +42,10 @@ sub/
 .codex-*.ps1
 diag2.py
 repair_sessions.py
+
+# Snapshots of a deployment's own activity store, taken while repairing it.
+# They hold real classifications and descriptions of a household's footage --
+# clothing, appearance, comings and goings -- so they must never be published,
+# the same reason `evidence-review/` is excluded above. They were absent from this
+# list once and only stayed local by luck.
+.store-backups/
