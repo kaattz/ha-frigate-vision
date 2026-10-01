@@ -3055,12 +3055,16 @@ async def test_the_close_up_prefers_a_frontal_frame_from_the_sheet(
 
 
 async def test_an_unreachable_face_service_still_produces_a_close_up(
-    hass: HomeAssistant, tmp_path
+    hass: HomeAssistant, tmp_path, socket_enabled
 ) -> None:
     """人脸服务连不上时，特写照常生成 —— 它是提升项，不是关键路径。
 
     这是整个功能的硬约束：服务没配、连不上、超时、答不上来，行为必须和
     「没这个功能」完全一样，绝不能因此丢掉整条活动的分析。
+
+    `socket_enabled` 是必须的：这个测试**故意**连一个没人监听的端口
+    （127.0.0.1:1）来模拟「服务连不上」。HA 的测试夹具默认禁止 socket，会把它
+    判成「测试偷偷联网」——但这里联网正是被测行为本身。
     """
     store = ActivityStore(hass, "entry_1")
     await store.async_load()

@@ -8,6 +8,8 @@ cause lived in the round trips between steps, which only a real flow reproduces.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -15,6 +17,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 # Importing the module is what registers the integration with the config-entry
 # flow manager; without it the flow manager raises UnknownHandler.
 from custom_components.frigate_vision import config_flow  # noqa: F401
+from custom_components.frigate_vision.vision import VisionError
 
 DOMAIN = "frigate_vision"
 
@@ -285,17 +288,27 @@ async def test_the_settings_menu_groups_the_form_with_the_connection_test(
 async def test_the_connection_test_is_reachable_from_inside_the_settings_menu(
     hass: HomeAssistant,
 ) -> None:
-    """连通性测试仍能到达（只是位置变了），别把它弄丢。"""
+    """连通性测试仍能到达（只是位置变了），别把它弄丢。
+
+    探针被替换掉，而不是允许真实联网：这个测试要断言的是**入口还在、且回的是
+    表单**，与那次往返成不成功无关。让它真发请求会依赖外网、拖慢 CI，并且
+    在 provider 恰好离线时给出与本题无关的失败。往返本身由
+    `async_test_connection` 的单元测试覆盖。
+    """
     entry = MockConfigEntry(
         domain=DOMAIN, title="Front Door", data={}, options=dict(LIVE)
     )
     entry.add_to_hass(hass)
-    result = await hass.config_entries.options.async_init(entry.entry_id)
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"], {"next_step_id": "settings"}
-    )
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"], {"next_step_id": "test_connection"}
-    )
+    with patch(
+        "custom_components.frigate_vision.config_flow.async_test_connection",
+        AsyncMock(side_effect=VisionError("provider_unavailable")),
+    ):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"next_step_id": "settings"}
+        )
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"next_step_id": "test_connection"}
+        )
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "test_connection"
