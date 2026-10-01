@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import voluptuous_serialize
 from aiohttp import InvalidURL, web
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.frigate_vision import config_flow
@@ -927,6 +930,292 @@ async def test_the_close_up_form_merges_instead_of_wiping_the_other_options(
     assert saved["target_width"] == 767, "合并丢了宽度"
     assert saved[CONF_PERSON_HIGHLIGHT] is True
     assert saved[CONF_FACE_SERVICE_URL] == "http://192.168.166.50:8788"
+
+
+async def test_the_settings_form_merges_instead_of_wiping_the_close_up(
+    hass: HomeAssistant,
+) -> None:
+    """主设置表单也必须【合并】——否则它会静默清空人物特写。
+
+    这与 `test_the_close_up_form_merges_instead_of_wiping_the_other_options` 是同一个
+    缺陷的**相反方向**，而那一半此前没人测：特写字段被移到 `_close_up_schema()` 之
+    后，就不再出现在 `_options_schema()` 里，而 `async_step_settings_form` 仍然用
+    `async_create_entry(data=user_input)` 整体替换。
+
+    实测的后果：用户打开特写、之后只是改了保留天数，特写就被静默关闭、人脸服务地址
+    被删除，没有任何报错。`person_highlight` 还参与 `effective_prompt_version`，所以
+    缓存键一起回退，证据图也跟着变回没有特写的形态——用户看到的只是「功能自己关了」。
+    """
+    from custom_components.frigate_vision.const import (
+        CONF_FACE_SERVICE_URL,
+        CONF_PERSON_HIGHLIGHT,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={
+            "llm_base_url": "http://keep.me/v1",
+            "llm_api_key": "secret",
+            CONF_PERSON_HIGHLIGHT: True,
+            CONF_FACE_SERVICE_URL: "http://192.168.166.50:8788",
+        },
+    )
+    entry.add_to_hass(hass)
+    flow_id = await _open_the_settings_form(hass, entry)
+
+    # Submit what the real frontend sends: every field this form owns, including the
+    # provider block (they carry schema defaults, so omitting them would have the
+    # form supply those defaults -- which is pre-existing form behaviour, not what
+    # this test is about).
+    submitted = {
+        **_OPTIONS_PAYLOAD,
+        "llm_base_url": "http://keep.me/v1",
+        "llm_model": "m",
+    }
+    result = await hass.config_entries.options.async_configure(flow_id, submitted)
+    assert result["type"] is FlowResultType.CREATE_ENTRY, result
+
+    saved = entry.options
+    assert saved.get(CONF_PERSON_HIGHLIGHT) is True, (
+        "保存主设置表单把人物特写静默关掉了——它不是这个表单的字段，"
+        "但整体替换会把它删掉"
+    )
+    assert saved.get(CONF_FACE_SERVICE_URL) == "http://192.168.166.50:8788", (
+        "保存主设置表单把人脸服务地址删掉了"
+    )
+    # And the fields this form does own must still be written.
+    assert saved["target_width"] == 768, "合并不能反过来丢掉本次提交的字段"
+    assert saved["llm_base_url"] == "http://keep.me/v1"
+
+
+async def test_the_stored_api_keys_never_reach_the_browser(
+    hass: HomeAssistant,
+) -> None:
+    """密钥不能出现在任何流的结果里——只遮蔽渲染不算遮蔽传输。
+
+    缺陷实测：两个 key 字段是 `vol.Optional(...)` 且**没有 default**，于是
+    `add_suggested_values_to_schema` 会把**存储的明文密钥**塞进
+    `description.suggested_value`，随表单序列化发给浏览器。密码选择器只让它在界面上
+    显示为圆点，payload 里仍是明文——会进入 DOM、devtools、截图与会话恢复。
+
+    HA 内核的 ollama 集成对 model 设 suggested_value，对 api_key 从不设；这里对齐
+    同一约定。校验用**哨兵值**而非真实密钥，断言的是"不出现在 payload 里"。
+    """
+    from custom_components.frigate_vision.const import (
+        CONF_FALLBACK_LLM_API_KEY,
+        CONF_LLM_API_KEY,
+    )
+
+    primary = "SENTINEL-PRIMARY-DO-NOT-SHIP"
+    fallback = "SENTINEL-FALLBACK-DO-NOT-SHIP"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={
+            "llm_base_url": "http://keep.me/v1",
+            CONF_LLM_API_KEY: primary,
+            "llm_model": "m",
+            "fallback_llm_base_url": "http://backup.me/v1",
+            CONF_FALLBACK_LLM_API_KEY: fallback,
+            "fallback_llm_model": "m2",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    # Drive the flow by hand rather than through `_open_the_settings_form`, because
+    # the form RESULT is what carries the schema -- the helper returns only the id.
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "settings_form"}
+    )
+    assert result["type"] is FlowResultType.FORM, result
+    assert result["step_id"] == "settings_form"
+
+    # Serialise exactly as HA's HTTP layer does for the browser.
+    wire = voluptuous_serialize.convert(
+        result["data_schema"], custom_serializer=cv.custom_serializer
+    )
+    payload = json.dumps(wire)
+
+    assert primary not in payload, "主密钥随表单下发到浏览器了"
+    assert fallback not in payload, "备用密钥随表单下发到浏览器了"
+
+    # And the non-secret values must still be pre-filled, or the form loses its
+    # point: the user could not tell what is currently configured.
+    assert "http://keep.me/v1" in payload, "非密钥字段仍应预填"
+
+
+async def test_an_untouched_api_key_survives_a_settings_save(
+    hass: HomeAssistant,
+) -> None:
+    """不再预填密钥之后，必须保证「没动它」不等于「删掉它」。
+
+    这是上一个修复的必然配套：浏览器对未改动的密码框提交空串，而空串会被合并写回、
+    把凭据清空。内核 ollama 的做法是 `if api_key:` 才写入——空值表示「保持原样」，
+    这里采用同一规则。
+    """
+    from custom_components.frigate_vision.const import CONF_LLM_API_KEY
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={
+            "llm_base_url": "http://keep.me/v1",
+            CONF_LLM_API_KEY: "STORED-SECRET",
+            "llm_model": "m",
+        },
+    )
+    entry.add_to_hass(hass)
+    flow_id = await _open_the_settings_form(hass, entry)
+
+    # What the frontend really submits when the user never touches the password box.
+    result = await hass.config_entries.options.async_configure(
+        flow_id,
+        {
+            **_OPTIONS_PAYLOAD,
+            "llm_base_url": "http://keep.me/v1",
+            "llm_model": "m",
+            CONF_LLM_API_KEY: "",
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY, result
+
+    assert entry.options.get(CONF_LLM_API_KEY) == "STORED-SECRET", (
+        "未改动的密码框提交空串时，存储的密钥被清空了——用户只是改了别的设置"
+    )
+
+
+async def test_an_untouched_fallback_survives_a_settings_save(
+    hass: HomeAssistant,
+) -> None:
+    """未改动的备用组也必须整体存活，而不是报「半配置」。
+
+    这条是密钥不再预填之后的**连锁后果**，必须一起修：密码框空着提交后，
+    `_fallback_errors` 看到「地址和模型有值、密钥为空」，会判成 `fallback_incomplete`
+    并拒绝保存——用户只是改了保留天数，却被告知备用组没填完。而备用组一旦被删，
+    第一组故障时就再也没有救兵。
+    """
+    from custom_components.frigate_vision.const import (
+        CONF_FALLBACK_LLM_API_KEY,
+        CONF_FALLBACK_LLM_BASE_URL,
+        CONF_FALLBACK_LLM_MODEL,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={
+            "llm_base_url": "http://keep.me/v1",
+            "llm_api_key": "primary-secret",
+            "llm_model": "m",
+            CONF_FALLBACK_LLM_BASE_URL: "http://backup.me/v1",
+            CONF_FALLBACK_LLM_API_KEY: "STORED-FALLBACK",
+            CONF_FALLBACK_LLM_MODEL: "m2",
+        },
+    )
+    entry.add_to_hass(hass)
+    flow_id = await _open_the_settings_form(hass, entry)
+
+    result = await hass.config_entries.options.async_configure(
+        flow_id,
+        {
+            **_OPTIONS_PAYLOAD,
+            "llm_base_url": "http://keep.me/v1",
+            "llm_model": "m",
+            CONF_FALLBACK_LLM_BASE_URL: "http://backup.me/v1",
+            CONF_FALLBACK_LLM_MODEL: "m2",
+            # The password box, left alone by the user.
+            CONF_FALLBACK_LLM_API_KEY: "",
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY, (
+        f"未改动的备用组被拒绝保存了，错误：{result.get('errors')}"
+    )
+    saved = entry.options
+    assert saved.get(CONF_FALLBACK_LLM_API_KEY) == "STORED-FALLBACK", (
+        "备用组的密钥被清空，第一组故障时就没有救兵了"
+    )
+    assert saved.get(CONF_FALLBACK_LLM_BASE_URL) == "http://backup.me/v1"
+    assert saved.get(CONF_FALLBACK_LLM_MODEL) == "m2"
+
+
+async def test_the_primary_url_is_validated_like_the_fallback(
+    hass: HomeAssistant,
+) -> None:
+    """主组地址也必须校验——写错一次就永久丢掉所有活动。
+
+    此前只有备用组的地址过 `_parse_base_url`，主组不过。后果不是"少一次分析"：
+    带 userinfo 的地址（例如把密钥粘进了 URL）会让 aiohttp 在发请求时抛
+
+        ValueError: Cannot combine AUTHORIZATION header with AUTH argument or
+                    credentials encoded in URL
+
+    实测这个 `ValueError` **既不是** `ClientError`/`TimeoutError`（`_CONNECTION_ERRORS`
+    不接）**也不是** `VisionError`（所以故障转移循环的 `except VisionError` 不接）。
+    它一路落到兜底的 `except Exception`，记成 `analysis_outcome_unknown`：该错误码
+    不可转移、不报修、不可手动补跑。一次粘贴失误 = 静默失效，而且密钥还明文躺在
+    entry options 里。
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"llm_base_url": "http://keep.me/v1", "llm_api_key": "k"},
+    )
+    entry.add_to_hass(hass)
+    flow_id = await _open_the_settings_form(hass, entry)
+
+    result = await hass.config_entries.options.async_configure(
+        flow_id,
+        {
+            **_OPTIONS_PAYLOAD,
+            "llm_base_url": "https://user:sk-SECRET@api.example.invalid/v1",
+            "llm_model": "m",
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM, (
+        "带凭据的主组地址被存进了 entry——它会在每次分析时抛未处理的 ValueError"
+    )
+    assert result.get("errors", {}).get("base") == "invalid_url", (
+        f"应报地址非法，实际：{result.get('errors')}"
+    )
+    assert "sk-SECRET" not in str(entry.options.get("llm_base_url", "")), (
+        "被拒绝的地址不能已经写进 entry"
+    )
+
+
+async def test_a_plain_primary_url_is_still_accepted(hass: HomeAssistant) -> None:
+    """校验不能把正常地址一起拒掉。"""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Front Door",
+        data={},
+        options={"llm_base_url": "http://keep.me/v1", "llm_api_key": "k"},
+    )
+    entry.add_to_hass(hass)
+    flow_id = await _open_the_settings_form(hass, entry)
+
+    result = await hass.config_entries.options.async_configure(
+        flow_id,
+        {
+            **_OPTIONS_PAYLOAD,
+            "llm_base_url": "http://192.168.166.50:7864/v1",
+            "llm_model": "m",
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY, (
+        f"正常地址被拒了：{result.get('errors')}"
+    )
+    assert entry.options["llm_base_url"] == "http://192.168.166.50:7864/v1"
 
 
 def test_every_options_field_has_a_translated_label() -> None:

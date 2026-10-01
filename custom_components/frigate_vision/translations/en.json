@@ -171,6 +171,7 @@
       "provider_http_403": "The provider denied access",
       "provider_http_404": "The model or endpoint was not found",
       "provider_http_400": "The provider rejected the request",
+      "llm_invalid_url": "The provider URL is invalid; include the scheme and no credentials, e.g. https://host/v1",
       "fallback_incomplete": "The fallback provider needs a base URL, an API key and a model together; leave all three empty to disable it",
       "fallback_invalid_url": "The fallback provider URL is invalid; include the scheme, e.g. https://host/v1",
       "label_malformed": "Each line must be `name: definition`, with a half-width colon",

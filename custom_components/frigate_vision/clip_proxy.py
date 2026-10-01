@@ -366,7 +366,13 @@ class FrigateClipView(HomeAssistantView):
         client = getattr(runtime, "frigate_client", None)
         if client is None:
             raise web.HTTPServiceUnavailable
-        session = getattr(client, "session", None) or aiohttp.ClientSession()
+        # The client's own session, never a new one. It is the only one carrying the
+        # login cookie under `auth_mode: native`, and creating one per request leaks a
+        # connector that is never closed -- the previous form here was
+        # `getattr(client, "session", None) or aiohttp.ClientSession()`, which fell
+        # through to the new-session branch on EVERY call because the client stores
+        # `_session`. Reaching the fallback is what made clips 502 under native auth.
+        session = client.session
         try:
             async with session.get(
                 upstream, timeout=_UPSTREAM_TIMEOUT, allow_redirects=True

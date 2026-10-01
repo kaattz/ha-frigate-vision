@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -367,7 +368,11 @@ class ActivityStore:
                 updated_at=max(existing.updated_at, updated_at),
             )
             candidate = {**self._activities, activity_id: updated}
-            await self._async_save(candidate)
+            # Save BEFORE committing to memory, and durably: this claim authorises a
+            # billed model call or a notification, so an unconfirmed write must not
+            # advance the in-memory stage -- a restart would then replay the effect.
+            # Order matters and is the same rule every other mutation here follows.
+            await self._async_save_durably_with(candidate)
             self._activities = candidate
             return True
 
@@ -618,3 +623,58 @@ class ActivityStore:
                 },
             }
         )
+
+    async def _async_save_durably_with(
+        self, activities: dict[str, ActivityRecord]
+    ) -> None:
+        """Save the given records, then prove the bytes reached the file.
+
+        `async_save` cannot report a failed write, and that silence is dangerous in
+        exactly one place: the side-effect claims. `Store._async_handle_write_data`
+        catches WriteError and SerializationError, logs "Error writing config for
+        <key>", and RETURNS without re-raising (helpers/storage.py:588), while
+        `write_utf8_file_atomic` wraps every OSError into that WriteError. So a full
+        disk or a read-only config directory yields a save that reports success with
+        nothing on disk.
+
+        For an ordinary stage transition a lost write costs a re-run from an earlier
+        stage. For a side-effect claim it costs a SECOND billed analysis or a
+        duplicate notification: memory advances to `*_started` while disk keeps the
+        previous stage, and a restart replays the effect. On this deployment a full
+        disk is plausible -- 78% used, with a 307 GB recorder database on the same
+        volume.
+
+        The read-back is spent only on those claims. Doing it after every transition
+        would put an I/O round trip on the hot path to guard a case whose worst
+        outcome is a retry.
+        """
+        before = self._observed_write_state()
+        await self._async_save(activities)
+        after = self._observed_write_state()
+        if before == after and after is not None:
+            # Nothing on disk changed, so the write did not land. HA's
+            # `Store._async_handle_write_data` swallows WriteError into a log line
+            # (helpers/storage.py:588), so comparing the file is the only way to
+            # learn that a save reported success with nothing written.
+            raise StoreConflictError("store_write_failed")
+
+    def _observed_write_state(self) -> tuple[int, int] | None:
+        """A cheap fingerprint of the store file, or None when it cannot be observed.
+
+        Size and mtime together, because either alone can repeat: a same-size
+        overwrite within one filesystem timestamp tick would look unchanged, and the
+        payload here is small enough for that to be plausible.
+
+        None means "no opinion": a store double with no file of its own (HA's
+        `StoreWithoutWriteLoad`, used by the test harness) and a first-ever save are
+        both unobservable, and refusing those would reject every claim on a fresh
+        install -- worse than the risk this guards.
+        """
+        path = getattr(self._store, "path", None)
+        if path is None:
+            return None
+        try:
+            stat = Path(path).stat()
+        except OSError:
+            return None
+        return (stat.st_size, stat.st_mtime_ns)

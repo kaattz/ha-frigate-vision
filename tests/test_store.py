@@ -408,3 +408,98 @@ async def test_complete_analysis_accepts_the_key_that_was_actually_claimed(
     )
     assert done.stage is ActivityStage.ANALYSIS_DONE
     assert done.classification == "visitor"
+
+
+async def test_a_swallowed_write_is_detected_when_a_file_exists(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """有文件可比对时，被吞掉的写必须被发现。
+
+    这是契约的核心，用**真实文件**验证：HA 的 `Store._async_handle_write_data` 把
+    `WriteError` 吞成一条日志（`helpers/storage.py:588`），所以"保存成功了没有"只能
+    靠观察文件本身。把 `_async_write_data` 换成不写任何东西，然后确认守卫报错。
+
+    用真实 `Store`（指向 tmp_path）而不是 harness 的 store double：后者本就不写文件，
+    在那里这个失败模式不可观测——这也是守卫把"看不到文件"当作"不表态"的原因，
+    见 `test_an_unobservable_store_is_not_treated_as_a_failure`。
+    """
+    from homeassistant.helpers.storage import Store as HAStore
+
+    target = tmp_path / "frigate_vision.probe"
+    target.write_text('{"seeded": true}', encoding="utf-8")
+
+    store = ActivityStore(hass, "entry_1")
+    # A real Store writing to a real file, so the guard has something to compare.
+    real = HAStore(hass, 1, "probe", atomic_writes=True)
+    real.path = str(target)  # type: ignore[misc]
+    store._store = real  # type: ignore[assignment]
+    await store.async_load()
+    await store.async_create(_record())
+    await store.async_transition(
+        "activity_1", ActivityStage.COLLECTING, ActivityStage.SEALED, updated_at=101
+    )
+    await store.async_transition(
+        "activity_1", ActivityStage.SEALED, ActivityStage.EVIDENCE_READY, updated_at=102
+    )
+
+    before = store._observed_write_state()
+    assert before is not None, "guard should be able to observe the seeded file"
+
+    # Silently do nothing: exactly what HA does when the write fails.
+    async def silent_noop(_data):
+        return None
+
+    real._async_write_data = silent_noop  # type: ignore[method-assign]
+
+    with pytest.raises(StoreConflictError, match="store_write_failed"):
+        await store.async_start_side_effect(
+            "activity_1",
+            "analysis:activity_1:1",
+            ActivityStage.EVIDENCE_READY,
+            ActivityStage.ANALYSIS_STARTED,
+            updated_at=110,
+        )
+
+    # And the consequence that makes it matter: memory must not have advanced past
+    # what disk holds, or a restart replays the effect this claim was guarding.
+    current = store.get("activity_1")
+    assert current is not None
+    assert current.claimed_side_effects == (), (
+        "写没落盘，内存却记下了副作用声明——重启后会重放这次付费调用"
+    )
+    assert current.stage is ActivityStage.EVIDENCE_READY, (
+        "写没落盘，内存阶段却推进了"
+    )
+
+
+async def test_an_unobservable_store_is_not_treated_as_a_failure(
+    hass: HomeAssistant,
+) -> None:
+    """看不到文件时必须放行，而不是一律判失败。
+
+    首次保存（文件尚不存在）与测试用的 store double 都属于"没有可比对的对象"。此时
+    一律拒绝会让**全新安装的第一次声明**就失败，比它要防的风险更糟。守卫只在真正
+    有东西可比对、且对比结果说明没写进去时才说话。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    assert store._observed_write_state() is None, (
+        "harness store writes no file, so it must report 'no opinion'"
+    )
+
+    await store.async_create(_record())
+    await store.async_transition(
+        "activity_1", ActivityStage.COLLECTING, ActivityStage.SEALED, updated_at=101
+    )
+    await store.async_transition(
+        "activity_1", ActivityStage.SEALED, ActivityStage.EVIDENCE_READY, updated_at=102
+    )
+    # Must not raise: there is nothing to compare, so the guard abstains.
+    claimed = await store.async_start_side_effect(
+        "activity_1",
+        "analysis:activity_1:1",
+        ActivityStage.EVIDENCE_READY,
+        ActivityStage.ANALYSIS_STARTED,
+        updated_at=110,
+    )
+    assert claimed is True

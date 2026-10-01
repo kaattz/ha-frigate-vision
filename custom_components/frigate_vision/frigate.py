@@ -98,6 +98,24 @@ class FrigateClient:
         if self._owned_session:
             self._session.detach()
 
+    @property
+    def session(self) -> ClientSession:
+        """The session this client is already authenticated on.
+
+        Exposed because the clip proxy has to stream from Frigate through the SAME
+        session, for two reasons that both matter. A fresh `ClientSession` leaks: one
+        connector and connection pool per clip playback, never closed, accumulating
+        until restart. And under `auth_mode: native` it is simply unauthenticated --
+        the login cookie lives in this client's `CookieJar(unsafe=True)`, so a new
+        session gets a 401 and every clip fails with 502.
+
+        A property rather than a rename, so `_session` stays private to the client and
+        callers stop guessing the attribute name. The guess is what caused it: the
+        proxy used `getattr(client, "session", None)` against a client that stores
+        `_session`, so the fallback ran EVERY time and the bug hid behind a default.
+        """
+        return self._session
+
     async def async_get_version(self) -> str:
         _, data = await self._request_bytes("GET", f"{self._base_url}/api/version")
         version = data.decode("utf-8", errors="strict").strip()

@@ -354,6 +354,110 @@ def _label_errors(user_input: Mapping[str, Any]) -> dict[str, str]:
     return {}
 
 
+def _strip_secrets(suggestions: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the suggestions with every credential removed.
+
+    `add_suggested_values_to_schema` writes each suggestion into
+    `description.suggested_value`, which is serialised into the flow result the
+    browser receives. A password selector only masks the *rendering*; the payload
+    still carries the plaintext, so prefilling a stored key ships it to the DOM,
+    devtools, screenshots and session restore. Measured: both keys appeared
+    verbatim in the serialised form.
+
+    Home Assistant's own `ollama` integration draws the same line -- it suggests
+    the model but never the api_key. The rule here is the whole set of credential
+    fields, so a future provider cannot reintroduce the leak by forgetting one.
+
+    Everything else is still suggested: the user has to be able to see which
+    address, model and retention they currently have.
+    """
+    return {
+        key: value
+        for key, value in suggestions.items()
+        if key not in _SECRET_OPTION_KEYS
+    }
+
+
+# Every option that holds a credential. Listed once so the two flows and the
+# provider menu cannot drift apart on which fields are safe to prefill.
+_SECRET_OPTION_KEYS = frozenset(
+    {
+        CONF_LLM_API_KEY,
+        CONF_FALLBACK_LLM_API_KEY,
+    }
+)
+
+
+def _merge_options(
+    submitted: Mapping[str, Any], stored: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Fold a form submission into the stored options, keeping blank secrets.
+
+    Two rules, both needed together:
+
+    * **Merge, never replace.** `async_create_entry` replaces the whole options
+      dict, and no single form owns all of it -- the close-up fields live in their
+      own submenu schema. Writing a form back verbatim therefore deleted every
+      field that form does not show, silently.
+
+    * **A blank credential means "leave it alone".** Keys are no longer prefilled
+      (see `_strip_secrets`), so the browser submits the password box empty
+      whenever the user does not retype it, and an empty string written back would
+      delete the credential. `if api_key:` in Home Assistant's `ollama` flow is the
+      same rule.
+
+    The result is what validation runs against, so an untouched fallback is judged
+    on the credentials that will actually be stored rather than on the empty box
+    the browser sent.
+    """
+    merged = dict(stored)
+    merged.update(submitted)
+    for key in _SECRET_OPTION_KEYS:
+        if not str(submitted.get(key) or "").strip():
+            if key in stored:
+                merged[key] = stored[key]
+            else:
+                merged.pop(key, None)
+    return merged
+
+
+def _primary_url_errors(user_input: Mapping[str, Any]) -> dict[str, str]:
+    """Return form errors for the primary provider's address, or {} when valid.
+
+    The fallback's address has always been checked here; the primary's was not, on
+    the reasoning that adding the check "would start rejecting values that already
+    work". That reasoning does not hold for the cases this catches.
+
+    A URL carrying credentials -- the realistic mistake being a key pasted into the
+    address -- makes aiohttp raise
+
+        ValueError: Cannot combine AUTHORIZATION header with AUTH argument or
+                    credentials encoded in URL
+
+    when the request is built. Measured: that `ValueError` is neither a `ClientError`
+    nor a `TimeoutError`, so `_CONNECTION_ERRORS` does not catch it, and it is not a
+    `VisionError`, so the failover loop's `except VisionError` does not either. It
+    reaches the catch-all as `analysis_outcome_unknown`: not failover-eligible, no
+    repair card, and refused by `retry_failed`. One paste therefore disables analysis
+    silently and permanently, with the credential sitting in cleartext in the entry's
+    options.
+
+    Only the address is checked, and only for the reasons `_parse_base_url` already
+    enforces (scheme, host, no userinfo). A working endpoint keeps working: the test
+    beside this one pins that.
+    """
+    url = str(user_input.get(CONF_LLM_BASE_URL) or "").strip()
+    if not url:
+        # An empty address is the initial flow's normal state, and the schema's own
+        # default fills it; "missing" is reported elsewhere (`llm_incomplete`).
+        return {}
+    try:
+        _parse_base_url(url)
+    except InvalidURL:
+        return {"base": "invalid_url"}
+    return {}
+
+
 def _fallback_errors(user_input: Mapping[str, Any]) -> dict[str, str]:
     """Return form errors for the second provider, or {} when valid.
 
@@ -566,10 +670,12 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
                     step_id="llmvision",
                     data_schema=self.add_suggested_values_to_schema(
                         _llm_schema(),
-                        {
-                            CONF_LLM_PROVIDER: provider,
-                            CONF_LLM_BASE_URL: preset_url,
-                        },
+                        _strip_secrets(
+                            {
+                                CONF_LLM_PROVIDER: provider,
+                                CONF_LLM_BASE_URL: preset_url,
+                            }
+                        ),
                     ),
                     errors=errors,
                 )
@@ -603,7 +709,13 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
             }
         return self.async_show_form(
             step_id="llmvision",
-            data_schema=self.add_suggested_values_to_schema(_llm_schema(), suggestions),
+            # Stripped even though this path's `suggestions` are built from explicit
+            # non-secret fields: the guarantee belongs with the schema that carries a
+            # key, not with each caller's care. A future edit that adds the typed key
+            # here would otherwise ship it back to the browser.
+            data_schema=self.add_suggested_values_to_schema(
+                _llm_schema(), _strip_secrets(suggestions)
+            ),
             errors=errors,
         )
 
@@ -615,10 +727,15 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
             # 了之后每次分析都失败，而用户只看到「没有通知」。两个流的校验一旦各
             # 写一份，就会有一个先漂移。
             #
-            # 两份错误合并而不是二选一：`_label_errors` 的键是字段名、第二组的是
+            # 三份错误合并而不是二选一：`_label_errors` 的键是字段名、另两份是
             # `base`，两者互不相同，合并后能同时显示——否则修好一个才会看见另一个，
-            # 用户要提交两次才知道全部问题。
-            errors = {**_fallback_errors(user_input), **_label_errors(user_input)}
+            # 用户要提交两次才知道全部问题。主组地址与第二组地址都校验，理由见
+            # `_primary_url_errors`。
+            errors = {
+                **_primary_url_errors(user_input),
+                **_fallback_errors(user_input),
+                **_label_errors(user_input),
+            }
             if not errors:
                 return self.async_create_entry(
                     title=self._data[CONF_NAME], data=self._data, options=user_input
@@ -875,7 +992,7 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
         return self.async_show_form(
             step_id="settings_form",
             data_schema=self.add_suggested_values_to_schema(
-                _options_schema(), suggestions
+                _options_schema(), _strip_secrets(suggestions)
             ),
         )
 
@@ -925,15 +1042,36 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
             # 第二组服务商同样在保存时校验，理由一样，而且更硬：半配置存进去之后
             # 每次失败转移都因配置原因失败，把真正的故障藏在第二个故障后面。
             # 两份错误合并（字段名 + `base`，互不覆盖），一次提交报出全部问题。
-            errors = {**_fallback_errors(user_input), **_label_errors(user_input)}
+            #
+            # Validate the options that will actually be STORED, not the raw
+            # submission: a blank password box is not a missing credential once the
+            # stored one is carried forward, and judging the raw payload would report
+            # an untouched fallback as half-configured (`fallback_incomplete`) and
+            # refuse a save the user made for an unrelated reason.
+            merged_input = _merge_options(user_input, self.config_entry.options)
+            errors = {
+                **_primary_url_errors(merged_input),
+                **_fallback_errors(merged_input),
+                **_label_errors(merged_input),
+            }
             if not errors:
-                return self.async_create_entry(data=user_input)
+                # Merge, never replace. `async_create_entry` replaces the whole
+                # options dict, and this form is not the only owner of it: the
+                # close-up fields live in `_close_up_schema()` and are reached
+                # through their own submenu. Submitting this form alone therefore
+                # used to delete `person_highlight` and `face_service_url` with no
+                # error -- the user enables the close-up, later edits an unrelated
+                # setting, and the feature silently turns off. `person_highlight`
+                # also feeds `effective_prompt_version`, so the cache key reverted
+                # with it. The sibling `close_up_form` already merged; this is the
+                # same rule applied to the larger form.
+                return self.async_create_entry(data=merged_input)
             # 校验失败时回填用户这次提交的内容，否则表单会清空他填的一切。
             suggestions = user_input
         return self.async_show_form(
             step_id="settings_form",
             data_schema=self.add_suggested_values_to_schema(
-                _options_schema(), suggestions
+                _options_schema(), _strip_secrets(suggestions)
             ),
             errors=errors,
         )

@@ -369,6 +369,53 @@ def test_validate_parses_a_fenced_reply_with_float_confidence() -> None:
     assert (classification, confidence) == ("visitor", 80)
 
 
+def test_validate_rejects_a_confidence_that_is_not_really_a_number() -> None:
+    """`isdigit()` accepts characters `int()` refuses, and that loses an activity.
+
+    缺陷实测：`"²"`、`"①"`、`"12³"` 的 `str.isdigit()` 都是 True，但 `int()` 抛
+    `ValueError`。同样，超过 4300 位的十进制串会触发 CPython 的整数转换上限。
+
+    后果比"少一次分析"更重：抛的是 `ValueError`，不是 `VisionError`，所以它绕过
+    故障转移循环的 `except VisionError`，落到兜底的 `except Exception` → 记为
+    `analysis_outcome_unknown`。而该错误码**不可转移、不报修、不可手动补跑**——
+    也就是说，模型**确实返回了答案**，整条活动却永久丢失。
+
+    正确判据是 `isdecimal()`（只对真正能转成 int 的十进制数字为真），并且转换本身
+    也要能容忍超长串。
+    """
+    for bad in ("²", "①", "12³", "½"):
+        with pytest.raises(VisionError, match="invalid_llm_response"):
+            validate_response(
+                _body(
+                    '{"classification":"visitor","description":"x","confidence":"'
+                    + bad
+                    + '"}'
+                ),
+                ALLOWED,
+            )
+
+    # A digit string long enough to trip CPython's int-conversion limit (4300).
+    with pytest.raises(VisionError, match="invalid_llm_response"):
+        validate_response(
+            _body(
+                '{"classification":"visitor","description":"x","confidence":"'
+                + "9" * 4400
+                + '"}'
+            ),
+            ALLOWED,
+        )
+
+    # The legitimate cases must keep working, including non-ASCII decimal digits.
+    assert validate_response(
+        _body('{"classification":"visitor","description":"x","confidence":"85"}'),
+        ALLOWED,
+    )[2] == 85
+    assert validate_response(
+        _body('{"classification":"visitor","description":"x","confidence":"٨٥"}'),
+        ALLOWED,
+    )[2] == 85
+
+
 def test_validate_rejects_a_classification_outside_the_enum() -> None:
     """The enum cannot be enforced by the provider, so it is enforced here.
 

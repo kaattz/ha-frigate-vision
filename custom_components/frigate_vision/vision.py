@@ -706,8 +706,25 @@ def validate_response(body: Any, allowed: set[str]) -> tuple[str, str, int]:
     confidence = value["confidence"]
     if isinstance(confidence, float) and confidence.is_integer():
         confidence = int(confidence)
-    elif isinstance(confidence, str) and confidence.strip().isdigit():
-        confidence = int(confidence.strip())
+    elif isinstance(confidence, str):
+        # `isdecimal()`, not `isdigit()`: the two differ on exactly the characters
+        # that matter here. `"²"`, `"①"` and `"12³"` are all `isdigit() == True` but
+        # `int()` rejects them, so `isdigit()` let a `ValueError` escape -- and a
+        # bare `ValueError` is not a `VisionError`, so it skipped the failover arm
+        # and landed in the catch-all as `analysis_outcome_unknown`: not
+        # failover-eligible, no repair card, not replayable. A reply the provider
+        # really sent cost the whole activity.
+        #
+        # `isdecimal()` accepts only strings `int()` can always parse, which includes
+        # non-ASCII decimal digits such as `"٨٥"` -- those are genuine numbers and
+        # keep working.
+        stripped = confidence.strip()
+        # CPython refuses to convert an integer literal past 4300 digits, so a long
+        # enough digit string would raise from `int()` itself. Bound it by the
+        # domain instead: a confidence is 0-100, so anything longer than three
+        # characters is not a confidence whatever it parses to.
+        if len(stripped) <= 3 and stripped.isdecimal():
+            confidence = int(stripped)
     if (
         not isinstance(classification, str)
         or classification not in allowed

@@ -27,11 +27,46 @@ def _runtime(
     return entry, entry.runtime_data
 
 
+async def _require_admin(hass: HomeAssistant, call: ServiceCall) -> None:
+    """Refuse a call from anything that is not an administrator.
+
+    Two of these services spend the owner's provider credits (`retry_failed`,
+    `process_review` enqueue a real analysis), and two return prose about who was at
+    the camera (`get_activity`) or change a delivery's state (`ack_delivery`). None of
+    that should be available to every logged-in account.
+
+    Home Assistant does not enforce this for us: the `call_service` WebSocket command
+    carries no `require_admin`, and the entity permission check in
+    `helpers/service.py` only engages for services that target entities -- these
+    target an `entry_id`, and `services.yaml` declares no entity selector, so nothing
+    runs. The check has to live here. `context.user_id` is the only caller identity a
+    service receives.
+
+    A call with no `user_id` is allowed: that is an automation, a script, or the
+    integration itself, none of which has a user and all of which the owner already
+    controls. Refusing those would break the shipped blueprint, which calls
+    `ack_delivery` from an automation.
+
+    `async_get_user` is awaited rather than called: it is a coroutine, so a missing
+    `await` would return a truthy coroutine object and admit every caller while
+    looking like a check.
+    """
+    user_id = call.context.user_id
+    if user_id is None:
+        return
+    user = await hass.auth.async_get_user(user_id)
+    if user is None or not user.is_admin:
+        # An unknown or deleted user id cannot be shown to be an administrator, so it
+        # is refused rather than allowed: the default must be closed.
+        raise ValueError("admin_required")
+
+
 async def async_register_services(hass: HomeAssistant) -> None:
     if hass.services.has_service(DOMAIN, "get_activity"):
         return
 
     async def get_activity(call: ServiceCall) -> ServiceResponse:
+        await _require_admin(hass, call)
         _, runtime = _runtime(hass, call.data["entry_id"])
         record = runtime.store.get(call.data["activity_id"])
         if record is None:
@@ -62,6 +97,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
         }
 
     async def retry_failed(call: ServiceCall) -> None:
+        await _require_admin(hass, call)
         entry, runtime = _runtime(hass, call.data["entry_id"])
         retry = await runtime.store.async_create_retry(
             call.data["activity_id"], now=time.time()
@@ -69,6 +105,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
         runtime.async_schedule_record(entry, retry)
 
     async def process_review(call: ServiceCall) -> None:
+        await _require_admin(hass, call)
         entry, runtime = _runtime(hass, call.data["entry_id"])
         if runtime.frigate_client is None or runtime.correlation is None:
             raise ValueError("frigate_not_configured")
@@ -102,6 +139,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
         )
 
     async def ack_delivery(call: ServiceCall) -> None:
+        await _require_admin(hass, call)
         _, runtime = _runtime(hass, call.data["entry_id"])
         if runtime.delivery is None:
             raise ValueError("delivery_not_configured")

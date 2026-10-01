@@ -168,6 +168,84 @@ async def test_clip_view_refuses_an_unknown_activity(hass: HomeAssistant) -> Non
         await view.get(Mock(spec=web.Request), "entry_1", "nope")
 
 
+async def test_the_clip_view_streams_on_the_clients_own_session(
+    hass: HomeAssistant,
+) -> None:
+    """片段必须走 FrigateClient 已经登录的那个 session。
+
+    缺陷实测：取 session 的写法是
+    `getattr(client, "session", None) or aiohttp.ClientSession()`，而
+    `FrigateClient` 存的是 `self._session`，**没有公开的 `session`**——所以 `or`
+    右侧每次都会执行。两个后果：
+
+    * **泄漏**：每次播放片段都新建一个连接池，且从不关闭。播放在手机上会反复触发，
+      积累到重启为止。
+    * **原生认证下直接坏掉**：`auth_mode: native` 的登录 cookie 在这个 client 自己的
+      `CookieJar` 里，新 session 的 jar 是空的，上游必然非 200 → 502。
+
+    这个缺陷能存活是因为既有测试只走到 `upstream_url` 与"未知活动 404"，从未驱动
+    `get()` 越过第 361 行。
+    """
+    session = Mock()
+    session.get = Mock(side_effect=AssertionError("must use the shared session"))
+
+    # A fake with the same shape as the real client: the session lives in
+    # `_session` and is reachable through the public `session` accessor. The
+    # accessor is what makes `client.session` work at all -- see
+    # `test_the_client_exposes_the_session_it_actually_uses` for the guard on the
+    # real class, which is where the wrong attribute name was.
+    class Client:
+        def __init__(self, shared: Mock) -> None:
+            self._session = shared
+
+        @property
+        def session(self) -> Mock:
+            return self._session
+
+    client = Client(session)
+
+    store = Mock()
+    store.get = Mock(return_value=_record())
+    runtime = Mock()
+    runtime.store = store
+    runtime.frigate_client = client
+    entry = Mock()
+    entry.runtime_data = runtime
+    hass.config_entries.async_get_entry = Mock(return_value=entry)  # type: ignore[method-assign]
+
+    view = FrigateClipView(hass, "http://frigate.test:5001")
+    with pytest.raises(AssertionError, match="must use the shared session"):
+        await view.get(Mock(spec=web.Request), "entry_1", "activity_1")
+
+    session.get.assert_called_once()
+
+
+def test_the_client_exposes_the_session_it_actually_uses(
+    hass: HomeAssistant, socket_enabled
+) -> None:
+    """`FrigateClient.session` 必须真的存在——这正是片段代理踩空的地方。
+
+    代理原来写的是 `getattr(client, "session", None) or aiohttp.ClientSession()`，
+    而客户端把 session 存在 `_session`、没有公开属性，于是**每一次**都落到"新建
+    session"那一支：泄漏连接池，并且在原生认证下因为新 session 没有登录 cookie 而
+    必然 502。
+
+    这条断言打在**真实类**上，而不是 Mock 上。Mock 会为任何被问到的属性自动编造
+    一个值，所以 `getattr(mock, "session", None)` 永远成功——缺陷因此躲过了既有
+    测试。要抓住它，就必须问真实对象。
+    """
+    from custom_components.frigate_vision.frigate import FrigateClient
+
+    session = Mock()
+    client = FrigateClient(session, "http://frigate.test:5001")
+
+    assert hasattr(client, "session"), (
+        "FrigateClient 没有公开的 session：clip 代理只能猜属性名，"
+        "而猜错的默认值会静默生效"
+    )
+    assert client.session is session, "公开的 session 必须是实际在用的那一个"
+
+
 def test_hls_path_uses_integer_seconds_and_no_instance_id() -> None:
     """Frigate's VOD path segments accept integers, and this proxy form needs
     no instance id.

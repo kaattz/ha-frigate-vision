@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Context, HomeAssistant
 from PIL import Image
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -346,6 +348,132 @@ async def test_get_activity_reports_no_provider_before_analysis(
     assert response["provider"] is None
     assert set(response) == _EXPECTED_KEYS
     await runtime.queue.async_stop()
+
+
+async def _register_with_one_activity(hass: HomeAssistant):
+    """Register the services over a runtime holding one sealed activity."""
+    store = ActivityStore(hass, _ENTRY_ID)
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id=_ACTIVITY_ID,
+            entry_id=_ENTRY_ID,
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.SEALED,
+            created_at=1,
+            updated_at=2,
+            camera="front",
+        )
+    )
+
+    async def handler(value: object) -> None:
+        return None
+
+    queue = EntryRuntime(queue_size=1, handler=handler)
+    await queue.async_start()
+    runtime = IntegrationRuntime(
+        hass=hass, store=store, queue=queue, entry_id=_ENTRY_ID
+    )
+    entry = MockConfigEntry(domain="frigate_vision", title="Front", entry_id=_ENTRY_ID)
+    entry.add_to_hass(hass)
+    entry.runtime_data = runtime
+    await async_register_services(hass)
+    return runtime, queue
+
+
+async def test_a_non_admin_cannot_call_the_services(hass: HomeAssistant) -> None:
+    """非管理员不得调用这些服务——其中两个会花掉机主的额度。
+
+    `retry_failed` 与 `process_review` 都会真的触发一次分析（计费），`get_activity`
+    返回"谁在摄像头前、穿了什么"的描述。HA 不会替我们拦：`call_service` 这个
+    WebSocket 命令没有 `require_admin`，而 `helpers/service.py` 的实体权限检查只对
+    **带实体目标**的服务生效——这些服务用的是 `entry_id`，`services.yaml` 里也没有
+    实体选择器，所以什么都不跑。
+
+    因此检查必须落在服务自己身上，而 `context.user_id` 是服务能拿到的唯一调用者身份。
+    """
+    runtime, queue = await _register_with_one_activity(hass)
+
+    # A minimal stand-in: only `is_admin` is read, and constructing the real
+    # `auth.models.User` needs a permission lookup and groups that add nothing here.
+    non_admin = SimpleNamespace(is_admin=False)
+    hass.auth.async_get_user = AsyncMock(return_value=non_admin)  # type: ignore[method-assign]
+
+    with pytest.raises(Exception) as caught:
+        await hass.services.async_call(
+            "frigate_vision",
+            "get_activity",
+            {"entry_id": _ENTRY_ID, "activity_id": _ACTIVITY_ID},
+            blocking=True,
+            return_response=True,
+            context=Context(user_id="non-admin-1"),
+        )
+    assert "admin_required" in str(caught.value), (
+        f"非管理员被放进来了，实际异常：{caught.value!r}"
+    )
+    await queue.async_stop()
+
+
+async def test_an_admin_can_call_the_services(hass: HomeAssistant) -> None:
+    """管理员必须照常可用——否则这个门禁就是把功能关掉了。"""
+    runtime, queue = await _register_with_one_activity(hass)
+    hass.auth.async_get_user = AsyncMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(is_admin=True)
+    )
+
+    response = await hass.services.async_call(
+        "frigate_vision",
+        "get_activity",
+        {"entry_id": _ENTRY_ID, "activity_id": _ACTIVITY_ID},
+        blocking=True,
+        return_response=True,
+        context=Context(user_id="admin-1"),
+    )
+    assert response is not None
+    await queue.async_stop()
+
+
+async def test_an_unknown_user_id_is_refused(hass: HomeAssistant) -> None:
+    """查不到的 user_id 必须拒绝，而不是放行。
+
+    默认方向要选"关"：一个已删除用户的 context 不能因为"查不到"就被当作管理员。
+    """
+    runtime, queue = await _register_with_one_activity(hass)
+    hass.auth.async_get_user = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    with pytest.raises(Exception) as caught:
+        await hass.services.async_call(
+            "frigate_vision",
+            "get_activity",
+            {"entry_id": _ENTRY_ID, "activity_id": _ACTIVITY_ID},
+            blocking=True,
+            return_response=True,
+            context=Context(user_id="deleted-user"),
+        )
+    assert "admin_required" in str(caught.value)
+    await queue.async_stop()
+
+
+async def test_a_call_without_a_user_is_still_allowed(hass: HomeAssistant) -> None:
+    """没有 user_id 的调用必须放行——自动化与蓝图正是这样调的。
+
+    随集成发布的蓝图用 `frigate_vision.ack_delivery` 收尾通知，而自动化没有用户身
+    份。若把「没有 user_id」判为拒绝，交付流程会当场断掉。
+    """
+    runtime, queue = await _register_with_one_activity(hass)
+    hass.auth.async_get_user = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("a user-less call must not look up a user")
+    )
+
+    response = await hass.services.async_call(
+        "frigate_vision",
+        "get_activity",
+        {"entry_id": _ENTRY_ID, "activity_id": _ACTIVITY_ID},
+        blocking=True,
+        return_response=True,
+    )
+    assert response is not None, "自动化/蓝图的调用被门禁挡住了"
+    await queue.async_stop()
 
 
 async def test_get_activity_reports_no_provider_when_vision_is_not_configured(
