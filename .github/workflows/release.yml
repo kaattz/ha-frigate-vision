@@ -1,0 +1,63 @@
+name: Release
+# HACS reads the remote version from the latest GitHub RELEASE's tag. Tags alone
+# do not count: without a release, HACS falls back to the first 7 characters of
+# the last commit, which cannot be ordered, so the HA update entity has nothing to
+# compare and never offers an upgrade. That is exactly what happened to 0.1.1.
+#
+# The glob is `v*` rather than a version shape on purpose: GitHub's filter is
+# glob, not regex, so `v[0-9]+.[0-9]+.[0-9]+` would require literal `+` characters
+# and never match v0.1.1. The shape check lives in the step below, where it can
+# distinguish "not a release tag" (skip) from "a version that disagrees with the
+# manifest" (fail).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish a release for
+        required: true
+permissions: {contents: write}
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - id: guard
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # A tag shaped like a release but disagreeing with manifest.json would
+          # make HACS advertise a version the code does not claim, and the mismatch
+          # is only visible after the upgrade. Fail here instead.
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$tag is not a release tag (expected vX.Y.Z); nothing to publish"
+            exit 0
+          fi
+          manifest="$(python3 -c "import json;print(json.load(open('custom_components/frigate_vision/manifest.json'))['version'])")"
+          if [ "${tag#v}" != "$manifest" ]; then
+            echo "::error::tag $tag does not match manifest.json version $manifest"
+            exit 1
+          fi
+          echo "manifest $manifest matches $tag"
+      # Re-pushing a tag, or dispatching by hand for one already released, must not
+      # fail the run: `gh release create` errors when the release exists.
+      - id: existing
+        if: steps.guard.outputs.skip != 'true'
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: |
+          if gh release view "${{ steps.guard.outputs.tag }}" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ steps.guard.outputs.tag }} already has a release; nothing to publish"
+          fi
+      # --notes-from-tag uses the annotated tag's message, which is where this repo
+      # writes the release notes. --verify-tag refuses to invent a missing tag.
+      - if: steps.guard.outputs.skip != 'true' && steps.existing.outputs.found != 'true'
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: |
+          gh release create "${{ steps.guard.outputs.tag }}" \
+            --verify-tag \
+            --title "${{ steps.guard.outputs.tag }}" \
+            --notes-from-tag
