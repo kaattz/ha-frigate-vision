@@ -3808,6 +3808,165 @@ async def test_metadata_that_is_a_broken_sheet_is_ignored_not_fatal(
         )
 
 
+async def test_a_sibling_file_is_not_accepted_for_a_non_replay_activity(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """非 replay 的活动不能因为 id 里**含** `_attempt_` 就认领兄弟文件。
+
+    缺陷实测：`_root_activity_id` 只按 `_attempt_` 做字符串切分，于是任何**包含**该
+    子串的 id 都被当成 replay：
+
+        "review_attempt_1"          -> root "review"
+        "front_attempt_2_attempt_3" -> root "front"
+
+    而 `SAFE_ID` **允许**这些 id，`review_activity_id` 又是
+    `_derived_id("review", entry_id, camera, review_id)` —— Frigate 的 review id 只要
+    含 `_attempt_`，切分就会指向一个**不同**的活动名，于是该记录被允许指向、并**登记**
+    一个名字属于别的活动的兄弟文件。
+
+    元数据检查也拦不住：它拿 `actual.stem` 去比，也就是拿**文件名自己的** id 去比
+    文件自己的元数据——两者自洽，检查必然通过。
+
+    范围限于 entry 目录内（`root.parent` 校验仍在），但"一条记录能指到别人的 artifact"
+    正是这个 canonical 检查存在的理由，而它的 docstring 声称这种情况会被拒绝。
+    """
+    samples = (1.0, 2.0, 3.0)
+    root = tmp_path / "media"
+    (root / "entry_1").mkdir(parents=True)
+    # The file `_root_activity_id("review_attempt_x")` resolves to: root = "review",
+    # so the accepted sibling is "review.jpg" -- a file named after a DIFFERENT
+    # activity than this record's own id.
+    sibling = root / "entry_1" / "review.jpg"
+    _write_sheet(sibling, "review", samples)
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            # Contains "_attempt_" without being a replay: its root would be "review".
+            activity_id="review_attempt_x",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.EVIDENCE_READY,
+            created_at=1,
+            updated_at=2,
+            camera="front",
+            evidence_mode="review_six",
+            evidence_revision=1,
+            evidence_path=str(sibling),
+            evidence_media_url=(
+                "media-source://frigate_vision/entry_1/review_attempt_x"
+            ),
+            sample_times=samples,
+        )
+    )
+    manager = MediaManager(
+        hass, store, object(), root,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+
+    await manager.async_restore_registry()
+
+    registry = hass.data.get(DATA_MEDIA_REGISTRY, {})
+    assert "entry_1/review_attempt_x" not in registry, (
+        "非 replay 的记录认领了别人的文件——含 `_attempt_` 不等于它是 replay"
+    )
+
+
+async def test_a_genuine_replay_still_reuses_its_roots_sheet(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """收紧判据不能把真正的 replay 一起拒掉——那正是这套逻辑存在的理由。
+
+    真 replay 的 id 由 `attempt_activity_id` 生成，形如 `<root>_attempt_<n>`，其中
+    `n` 是纯数字。收紧要按这个形状判定，而不是"包含子串"。
+    """
+    samples = (1.0, 2.0, 3.0)
+    root = tmp_path / "media"
+    (root / "entry_1").mkdir(parents=True)
+    shared = root / "entry_1" / "review_1.jpg"
+    _write_sheet(shared, "review_1", samples)
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="review_1_attempt_1",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.EVIDENCE_READY,
+            created_at=1,
+            updated_at=2,
+            camera="front",
+            evidence_mode="review_six",
+            evidence_revision=1,
+            evidence_path=str(shared),
+            evidence_media_url=(
+                "media-source://frigate_vision/entry_1/review_1_attempt_1"
+            ),
+            sample_times=samples,
+        )
+    )
+    manager = MediaManager(
+        hass, store, object(), root,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+
+    await manager.async_restore_registry()
+
+    registry = hass.data.get(DATA_MEDIA_REGISTRY, {})
+    assert "entry_1/review_1_attempt_1" in registry, (
+        "真正的 replay 指向 root 的拼图，必须仍然被接受"
+    )
+
+
+async def test_a_non_replay_activity_id_cannot_claim_a_suffix_sibling(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """"包含子串"的另一个方向：`x_attempt_1_extra` 也不是 replay。
+
+    `attempt_activity_id` 产出的 id **以** `_attempt_<数字>` **结尾**，所以 `extra`
+    结尾的 id 不是 replay，它的 root 无从谈起。
+    """
+    samples = (1.0, 2.0, 3.0)
+    root = tmp_path / "media"
+    (root / "entry_1").mkdir(parents=True)
+    sibling = root / "entry_1" / "x.jpg"
+    _write_sheet(sibling, "x", samples)
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="x_attempt_1_extra",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.EVIDENCE_READY,
+            created_at=1,
+            updated_at=2,
+            camera="front",
+            evidence_mode="review_six",
+            evidence_revision=1,
+            evidence_path=str(sibling),
+            evidence_media_url=(
+                "media-source://frigate_vision/entry_1/x_attempt_1_extra"
+            ),
+            sample_times=samples,
+        )
+    )
+    manager = MediaManager(
+        hass, store, object(), root,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+
+    await manager.async_restore_registry()
+
+    registry = hass.data.get(DATA_MEDIA_REGISTRY, {})
+    assert "entry_1/x_attempt_1_extra" not in registry, (
+        "以 `_extra` 结尾的 id 不是 replay，不该认领 root 的文件"
+    )
+
+
 async def test_a_frame_dropped_by_a_recording_hole_is_not_silently_published(
     hass: HomeAssistant, tmp_path
 ) -> None:

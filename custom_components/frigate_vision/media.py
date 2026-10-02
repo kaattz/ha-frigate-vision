@@ -2141,15 +2141,33 @@ class MediaManager:
 def _root_activity_id(activity_id: str) -> str | None:
     """The activity a replay was derived from, or None when it is not a replay.
 
-    The separator is spelled the same way `attempt_activity_id` joins it; that
-    helper is the only producer of these ids, so the two spellings are a pair and
-    are kept adjacent in spirit even though they live in different modules.
+    A replay's id is produced only by `attempt_activity_id`, which joins the root with
+    the literal `"attempt"` and the attempt NUMBER:
+
+        _derived_id(activity_id, "attempt", str(attempt))  ->  f"{root}_attempt_{n}"
+
+    So a replay id ENDS with `_attempt_<digits>`. Matching that shape matters, because
+    an activity id merely CONTAINING the substring is not a replay -- and every id here
+    is built by joining underscore-separated parts, so `_attempt_` can appear inside a
+    camera name, an entry id, or a Frigate review id (free-form, and only required to
+    satisfy `SAFE_ID`). Splitting such an id on the FIRST occurrence produced a root
+    naming a DIFFERENT activity, and `_accepted_paths` then accepted -- and the
+    registry registered -- a sibling file belonging to it. The metadata check could not
+    catch that: it validates a file's own metadata against that file's own name, so the
+    pair is self-consistent whatever the record claims.
+
+    Measured with the old implementation: `review_attempt_x` resolved to root `review`
+    and claimed `review.jpg`; `x_attempt_1_extra` resolved to root `x`. The docstring
+    of `_accepted_paths` claimed such cases were refused; with the shape match they are.
     """
-    marker = "_attempt_"
-    if marker not in activity_id:
+    root, separator, attempt = activity_id.rpartition("_attempt_")
+    if not separator or not root or not attempt.isdigit():
+        # `rpartition` on the LAST marker, with a digits-only suffix, is exactly the
+        # shape `attempt_activity_id` produces. `review_attempt_x` fails the digit test
+        # (so does a bare `..._attempt_`), and `foo_attempt_1_extra` fails it because
+        # the suffix is not all digits.
         return None
-    root = activity_id.split(marker, 1)[0]
-    return root if root and root != activity_id else None
+    return root
 
 
 def _read_existing(

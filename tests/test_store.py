@@ -410,6 +410,67 @@ async def test_complete_analysis_accepts_the_key_that_was_actually_claimed(
     assert done.classification == "visitor"
 
 
+async def test_a_rebuilt_replay_is_not_reported_as_expired(
+    hass: HomeAssistant,
+) -> None:
+    """重建好的 replay 不能被当成"证据已过期"——那会让用户看到"证据没了"。
+
+    缺陷实测：`async_complete_media` 用 `replace()` 更新记录，但**没有清掉**
+    `evidence_expired_at`；而 `async_create_retry` 又是 `replace(original, ...)`，
+    于是 replay **继承**了 root 的过期标记。一个过期过的 root，其 replay 即使在
+    `SEALED → EVIDENCE_READY` 之后拿到了**全新**的拼图，读出来仍是过期的：
+    `services.py` 报 `evidence_expired=True` 且 `evidence_url=None`。
+
+    也就是说：文件好好地在磁盘上，服务却告诉用户"证据已删除"。判据应当以**这次**
+    写入为准，而不是沿用上一次的过期时间。
+    """
+    now = 1_700_000_000.0
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    await store.async_create(
+        ActivityRecord(
+            activity_id="review_expired",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.FAILED,
+            created_at=now - 100_000,
+            updated_at=now - 100_000,
+            camera="front",
+            error_code="media_retry_exhausted",
+            # The old evidence was deleted by the retention sweep.
+            evidence_expired_at=now - 50_000,
+            sample_times=(1.0, 2.0, 3.0),
+            evidence_mode="review_six",
+            evidence_revision=1,
+            evidence_path="/media/frigate_vision/entry_1/review_expired.jpg",
+        )
+    )
+
+    retry = await store.async_create_retry("review_expired", now=now)
+    # The retry starts from scratch: the old evidence is gone, so it re-collects.
+    assert retry.stage is ActivityStage.SEALED, (
+        "过期证据不该被当成可复用的证据"
+    )
+
+    rebuilt = await store.async_complete_media(
+        retry.activity_id,
+        key=f"media:{retry.activity_id}:1",
+        evidence_mode="review_six",
+        evidence_revision=1,
+        evidence_path="/media/frigate_vision/entry_1/rebuilt.jpg",
+        evidence_media_url=(
+            f"media-source://frigate_vision/entry_1/{retry.activity_id}"
+        ),
+        sample_times=(1.0, 2.0, 3.0),
+        updated_at=now + 10,
+    )
+
+    assert rebuilt.evidence_expired_at is None, (
+        "刚写好的新拼图仍被标记为已过期——服务会告诉用户证据没了，而文件就在盘上"
+    )
+    assert rebuilt.evidence_path == "/media/frigate_vision/entry_1/rebuilt.jpg"
+
+
 async def test_a_swallowed_write_is_detected_when_a_file_exists(
     hass: HomeAssistant, tmp_path
 ) -> None:

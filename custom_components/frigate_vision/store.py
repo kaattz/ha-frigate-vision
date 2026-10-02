@@ -414,6 +414,14 @@ class ActivityStore:
                 selection_source=selection_source,
                 claimed_side_effects=(*existing.claimed_side_effects, key),
                 updated_at=max(existing.updated_at, updated_at),
+                # A newly written artifact is by definition not expired. Clearing this
+                # is not cosmetic: `replace` carried the OLD expiry forward, and
+                # `async_create_retry` copies the root record wholesale, so a replay of
+                # a previously-expired activity inherited its expiry. The rebuilt sheet
+                # then read as gone -- `services.py` reported `evidence_expired=True`
+                # and `evidence_url=None` -- while the file sat on disk, so the owner
+                # was told the evidence had been deleted when it had just been created.
+                evidence_expired_at=None,
             )
             candidate = {**self._activities, activity_id: updated}
             await self._async_save(candidate)
