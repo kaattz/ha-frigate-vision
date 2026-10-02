@@ -4202,6 +4202,70 @@ def test_a_dim_frame_is_not_overexposed(tmp_path) -> None:
     assert not frame_is_overexposed(path)
 
 
+async def test_the_close_up_degrades_when_the_face_lookup_raises(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """人脸查询抛异常时必须降级，不能把异常传出构建。
+
+    `_async_person_highlight` 的契约是"拿不到特写就返回 None"——它的 docstring 明写
+    None 是常态、而不是错误，因为"少一张特写只是少了细节，为它让整条活动失败才是
+    真的代价"。函数体里其他部分都守住了这个契约：服务调用包在 `except Exception`
+    里，逐帧读取捕 `OSError`。
+
+    但 `_async_face_alternatives` 的**调用点**不在任何 try 里（导入也不在），而它在
+    `_async_person_highlight` 的 try 之前，所以从那里逃出的异常会穿出
+    `_async_person_highlight`、再穿出 `_async_build_locked`——正是这个函数承诺不会
+    发生的事。
+
+    这条钉的是**契约**而非某个异常类型：无论人脸路径怎么坏，构建都必须继续。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _standalone_record()
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id, "camera": camera, "label": "person",
+                "start_time": 103, "end_time": 117,
+                "data": {"path_data": _motion_points(), "box": [0.3, 0.3, 0.2, 0.3]},
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            return [{"start_time": after - 20, "end_time": before + 20}]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+        async def async_get_event_snapshot(self, event_id, camera, height):
+            return _solid_jpeg((240, 240))
+
+    root = tmp_path / "media"
+    root.mkdir()
+    manager = MediaManager(
+        hass, store, Client(), root,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+        person_highlight=True,
+        target_width=_TARGET_WIDTH,
+        # A face service is configured, so the face branch runs.
+        face_service_url="http://face.invalid/face",
+    )
+
+    # Make the face lookup raise something no handler names -- the contract is that
+    # nothing from this path may escape, whatever it is.
+    async def exploding(*args: object, **kwargs: object):
+        raise RuntimeError("face service blew up in an unexpected way")
+
+    manager._async_face_alternatives = exploding  # type: ignore[method-assign]
+
+    completed = await manager.async_build(record.activity_id)
+
+    assert completed.stage is ActivityStage.EVIDENCE_READY, (
+        "人脸路径的异常让整条活动失败了——这个函数的契约是降级成没有特写"
+    )
+
+
 def test_a_nudge_does_not_push_a_required_frame_outside_the_person_window() -> None:
     """微调不能把 `first` 推到人物出现**之前**，也不能把 `last` 推过人物离开之后。
 

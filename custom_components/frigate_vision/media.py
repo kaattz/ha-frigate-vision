@@ -1078,7 +1078,30 @@ class MediaManager:
             #
             # Measured both ways: one detection snapshot gave 0 usable candidates,
             # the sheet's own frames gave 2 frontal ones out of 6.
-            alternatives = await self._async_face_alternatives(record, selected, box)
+            # Wrapped, because this is the one call in this function that sat outside
+            # the try below -- and the contract here is explicit: a missing close-up
+            # costs detail, while failing the activity over it costs the whole visit
+            # (see the docstring). Everything else in this function already degrades
+            # correctly; this call was the single hole, and an exception from it
+            # propagated out of `_async_person_highlight`, out of
+            # `_async_build_locked`, and killed the build.
+            #
+            # `except Exception` rather than a list of types: the module it calls into
+            # is a separate concern, and the whole point is that NOTHING from an
+            # optional enhancement may take the activity down. The narrow handlers
+            # elsewhere were each written after a specific failure; this one is
+            # deliberately total.
+            try:
+                alternatives = await self._async_face_alternatives(
+                    record, selected, box
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Face lookup failed for %s; building the sheet without a close-up",
+                    record.activity_id,
+                    exc_info=True,
+                )
+                alternatives = None
             if alternatives is not None:
                 chosen_bytes, chosen_box = alternatives
 
