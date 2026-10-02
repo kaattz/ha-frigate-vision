@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -3805,3 +3806,174 @@ async def test_metadata_that_is_a_broken_sheet_is_ignored_not_fatal(
         assert _read_existing(sheet, metadata, "a") is None, (
             f"metadata={payload!r} 应被当作不可读返回 None"
         )
+
+
+async def test_cleanup_keeps_a_sheet_a_live_replay_still_points_at(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """清理不能删掉**另一个记录仍在用**的拼图——replay 与它的 root 共享同一个文件。
+
+    机制：`async_create_retry` 用 `replace(original, ...)` 造出 replay，于是它
+    **继承** root 的 `evidence_path`；两个记录的 `evidence_path` 指向同一个文件。
+    而清理是按**记录**逐个判断的，只看该记录自己的 `updated_at`：
+
+        root 40 天前（过期）+ replay 刚建立（仍然有效）
+
+    于是 root 那一轮把文件删了，而**刚刚建立、仍然有效**的 replay 还指着它。实测
+    后果：下次启动 `async_restore_registry` 读不到文件；在 #2 修好之前，这会让整个
+    config entry 进入 `setup_error`——所有实体不可用。
+
+    判据是"还有别人在用吗"，不是"这条记录自己多大"。
+    """
+    now = time.time()
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+
+    root = tmp_path / "media"
+    (root / "entry_1").mkdir(parents=True)
+    shared = root / "entry_1" / "review_root.jpg"
+    _write_sheet(shared, "review_root", (1.0, 2.0, 3.0))
+
+    old = now - 40 * 86400
+    # A FAILED root is the realistic replay source: `async_create_retry` refuses a
+    # COMPLETED one (`retry_not_safe`), and a failure is exactly what an operator
+    # replays. It still carries an evidence path, which is what the replay inherits.
+    await store.async_create(
+        ActivityRecord(
+            activity_id="review_root",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.FAILED,
+            created_at=old,
+            updated_at=old,
+            camera="front",
+            error_code="media_retry_exhausted",
+            evidence_mode="review_six",
+            evidence_revision=1,
+            evidence_path=str(shared),
+            evidence_media_url="media-source://frigate_vision/entry_1/review_root",
+            sample_times=(1.0, 2.0, 3.0),
+        )
+    )
+    retry = await store.async_create_retry("review_root", now=now)
+    assert retry.evidence_path == str(shared), (
+        "precondition: 实测 replay 继承 root 的 evidence_path"
+    )
+
+    manager = MediaManager(
+        hass, store, object(), root,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+    await manager.async_cleanup(retention_days=7, now=now)
+
+    assert shared.is_file(), (
+        "刚建立的 replay 还指着这张拼图，清理却把它删了——重启后该记录读不到证据"
+    )
+
+
+async def test_cleanup_still_removes_a_sheet_nothing_points_at(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """加了「还有别人在用吗」之后，没人用的过期拼图**仍然**要删掉。
+
+    否则保留期就形同虚设——这是清理功能存在的一半理由。
+    """
+    now = time.time()
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+
+    root = tmp_path / "media"
+    (root / "entry_1").mkdir(parents=True)
+    lonely = root / "entry_1" / "review_old.jpg"
+    _write_sheet(lonely, "review_old", (1.0, 2.0, 3.0))
+    old = now - 40 * 86400
+    await store.async_create(
+        ActivityRecord(
+            activity_id="review_old",
+            entry_id="entry_1",
+            source=ActivitySource.STANDALONE_REVIEW,
+            stage=ActivityStage.COMPLETED,
+            created_at=old,
+            updated_at=old,
+            camera="front",
+            evidence_mode="review_six",
+            evidence_revision=1,
+            evidence_path=str(lonely),
+            evidence_media_url="media-source://frigate_vision/entry_1/review_old",
+            sample_times=(1.0, 2.0, 3.0),
+        )
+    )
+
+    manager = MediaManager(
+        hass, store, object(), root,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+    removed = await manager.async_cleanup(retention_days=7, now=now)
+
+    assert not lonely.is_file(), "没人引用的过期拼图必须被删掉"
+    assert "review_old" in removed
+
+
+async def test_one_unvalidatable_path_does_not_stop_the_whole_sweep(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """一条路径校验失败的记录不能让**其余**记录的保留期静默失效。
+
+    实测（两种排序）：
+
+    | 坏记录的排序 | 结果 |
+    |---|---|
+    | 在前（`a_bad`） | 排在它**之后**的过期拼图永远不被清理 |
+    | 在后（`z_bad`） | 排在它之前的正常清理 |
+
+    而那条坏记录**永远不会被移除**（抛错发生在标记过期之前），所以它**永久阻塞**：
+    定时任务每天重试、每天撞同一堵墙，`media_retention_days` 对排在它之后的记录
+    静默失效，媒体目录无限增长。
+
+    **仅靠配置就能触发**：媒体根目录来自 `hass.config.media_dirs`，用户改一下媒体
+    目录，所有旧记录的路径就都落在新根之外。
+    """
+    now = time.time()
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+
+    root = tmp_path / "media"
+    (root / "entry_1").mkdir(parents=True)
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"\xff\xd8\xff\xd9")
+    good = root / "entry_1" / "z_good.jpg"
+    _write_sheet(good, "z_good", (1.0, 2.0, 3.0))
+
+    old = now - 40 * 86400
+    # "a_bad" sorts FIRST and its path is outside the media root; "z_good" sorts after.
+    for activity_id, path in (("a_bad", outside), ("z_good", good)):
+        await store.async_create(
+            ActivityRecord(
+                activity_id=activity_id,
+                entry_id="entry_1",
+                source=ActivitySource.STANDALONE_REVIEW,
+                stage=ActivityStage.COMPLETED,
+                created_at=old,
+                updated_at=old,
+                camera="front",
+                evidence_mode="review_six",
+                evidence_revision=1,
+                evidence_path=str(path),
+                evidence_media_url=(
+                    f"media-source://frigate_vision/entry_1/{activity_id}"
+                ),
+                sample_times=(1.0, 2.0, 3.0),
+            )
+        )
+
+    manager = MediaManager(
+        hass, store, object(), root,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+    removed = await manager.async_cleanup(retention_days=7, now=now)
+
+    assert not good.is_file(), (
+        "排在一坏记录之后的好记录没被清理——扫描在坏记录处中止了"
+    )
+    assert "z_good" in removed
+    assert outside.is_file(), "根目录之外的文件永远不能被删除"

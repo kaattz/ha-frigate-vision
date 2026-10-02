@@ -1962,18 +1962,43 @@ class MediaManager:
     async def async_cleanup(
         self, *, retention_days: int, now: float | None = None
     ) -> tuple[str, ...]:
-        """Delete expired registered files one at a time within the media root."""
+        """Delete expired files within the media root, one record at a time.
+
+        A file is deleted only when NO live record still points at it. Replays share
+        their root's sheet on purpose -- `async_create_retry` builds the replay with
+        `replace(original, ...)`, so it inherits `evidence_path` -- and the sweep
+        otherwise decides per record on that record's OWN age. A forty-day-old root
+        with a replay created a minute ago therefore deleted the sheet the fresh,
+        perfectly valid replay was still pointing at, and the next restart could not
+        read it. The question is "is anyone else still using this file", not "is this
+        record old".
+
+        A record whose path cannot be validated is SKIPPED rather than raised on.
+        Raising aborted the whole sweep at the first offender, and because that record
+        is never marked expired the offender persists: every later sweep stopped at the
+        same place and every record sorting after it kept its files forever, so
+        `media_retention_days` was silently unenforced. Reachable from configuration
+        alone, since the media root comes from `hass.config.media_dirs` and moving that
+        directory makes every earlier record an offender.
+
+        The order is deliberate: mark expired BEFORE deleting is what lets the sweep
+        resume after a crash, and a record is only marked once its file is really gone.
+        """
         if retention_days < 1:
             raise MediaError("invalid_retention")
         cutoff = (time.time() if now is None else now) - retention_days * 86400
         removed: list[str] = []
         registry: dict[str, Path] = self._hass.data.setdefault(DATA_MEDIA_REGISTRY, {})
-        for record in sorted(self._store.all(), key=lambda item: item.activity_id):
+        records = list(self._store.all())
+        in_use = self._paths_still_in_use(records, cutoff)
+        for record in sorted(records, key=lambda item: item.activity_id):
             if (
                 record.stage not in {ActivityStage.COMPLETED, ActivityStage.FAILED}
                 or record.updated_at >= cutoff
                 or record.evidence_path is None
             ):
+                continue
+            if record.evidence_path in in_use:
                 continue
             try:
                 path = await self._hass.async_add_executor_job(
@@ -1981,8 +2006,16 @@ class MediaManager:
                     Path(record.evidence_path),
                     self._root,
                 )
-            except ValueError as exc:
-                raise MediaError("invalid_cleanup_path") from exc
+            except ValueError:
+                # A path outside the root cannot be deleted, and refusing to delete it
+                # must not stop the rest of the sweep.
+                _LOGGER.warning(
+                    "Evidence for %s is outside the media directory (%s); "
+                    "skipping cleanup for it",
+                    record.activity_id,
+                    record.evidence_path,
+                )
+                continue
             if record.evidence_expired_at is None:
                 await self._store.async_expire_evidence(
                     record.activity_id,
@@ -1992,6 +2025,41 @@ class MediaManager:
             await self._hass.async_add_executor_job(_delete_artifact, path, self._root)
             removed.append(record.activity_id)
         return tuple(removed)
+
+    def _paths_still_in_use(
+        self, records: Sequence[ActivityRecord], cutoff: float
+    ) -> frozenset[str]:
+        """Paths that at least one record NOT eligible for deletion still points at.
+
+        A record is eligible for deletion exactly when the main loop would take it:
+        terminal, older than the cutoff, and holding a path. Everything else is a
+        keeper, and its path must survive.
+
+        The two cases that matter, both real:
+
+        * a replay (`EVIDENCE_READY`, created a minute ago) shares its root's sheet, so
+          the root is eligible but the replay is a keeper -- the sheet must stay;
+        * a build in flight is not terminal, so its artifact must never be swept
+          whatever its `updated_at` says.
+
+        Computed in one pass before anything is deleted, so the answer cannot shift
+        part-way through as records are expired.
+
+        Compared as the stored strings, which is what the records hold: two records
+        sharing a sheet hold the identical string, because the replay was built from
+        the root by `replace`.
+        """
+        in_use: set[str] = set()
+        for record in records:
+            if record.evidence_path is None:
+                continue
+            eligible = (
+                record.stage in {ActivityStage.COMPLETED, ActivityStage.FAILED}
+                and record.updated_at < cutoff
+            )
+            if not eligible:
+                in_use.add(record.evidence_path)
+        return frozenset(in_use)
 
 
 def _root_activity_id(activity_id: str) -> str | None:
