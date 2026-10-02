@@ -4126,6 +4126,99 @@ async def test_the_provider_budget_matches_what_a_sheet_can_be(
     )
 
 
+def test_a_nudge_does_not_push_a_required_frame_outside_the_person_window() -> None:
+    """微调不能把 `first` 推到人物出现**之前**，也不能把 `last` 推过人物离开之后。
+
+    缺陷实测：`lower` 只由**上一格**决定，与人物窗口无关——`index == 0` 时甚至是
+    负无穷。而 `RECORDING_NUDGE_OFFSETS` 的后半段是负数（-0.5…-5.0），所以往前的
+    偏移会被采用：
+
+        first 计划在 12.0，人物窗口从 12.0 开始
+        -> 被推到 11.0，即**人物被检测到之前一秒的空走廊**
+
+    `first` 这一格的含义是"人物的第一帧"，画成空走廊就与含义相反。同理 `last` 会被
+    推过 `person_end`（实测 116.8 → 117.3），语义上与 postroll 重叠。
+
+    这个不对称很说明问题：`POSTROLL_FORWARD_OFFSETS` 的存在恰恰说明作者意识到过这类
+    错误，但 `first`/`last`/motion 没有同等约束。
+    """
+    from custom_components.frigate_vision.media import MediaManager
+
+    roles = ("first", "motion", "motion", "motion", "last", "postroll")
+    # first = 12.0 exactly at the window start; a hole covers (11.0, 20.0).
+    requested = (12.0, 20.0, 30.0, 40.0, 50.0, 52.8)
+    recordings = [
+        {"start_time": 0.0, "end_time": 11.0},
+        {"start_time": 20.0, "end_time": 100.0},
+    ]
+
+    times, fixed, nudges = MediaManager._nudge_uncovered_frames(
+        roles, requested, recordings, (12.0, 50.0)
+    )
+
+    # 12.0 is inside the hole, so some nudge must happen -- but not backwards past the
+    # moment the person was detected.
+    assert times[0] >= requested[0], (
+        f"first 被推到 {times[0]}，早于人物窗口起点 {requested[0]}——"
+        f"那一格会画成人物出现前的空走廊（nudges={nudges}）"
+    )
+
+
+def test_a_nudge_does_not_push_last_past_the_person_leaving() -> None:
+    """`last` 不能被推过人物离开的时刻——那是 postroll 的职责。
+
+    构造：人物窗口 1.0–10.0，`last` 计划在 10.0（实测 `plan_evidence` 让
+    `last = person_end - edge`，`edge` 至多 0.2，所以它贴着窗口末尾）。录像在
+    (8.0, 11.0) 有空洞，而 11.0 起又有覆盖——比窗口末尾**更晚**，但比 postroll 早，
+    且满足"在邻居之间"这一唯一约束，所以往前的偏移会被采用。
+
+    这就是缺陷的形状：唯一约束是"在上一格和下一格之间"，与人物窗口无关，于是
+    `last` 可以画到人物离开**之后**，与 postroll 重复。
+    """
+    from custom_components.frigate_vision.media import MediaManager
+
+    roles = ("first", "motion", "motion", "motion", "last", "postroll")
+    requested = (1.0, 2.0, 3.0, 4.0, 10.0, 16.0)
+    recordings = [
+        {"start_time": 0.0, "end_time": 8.0},
+        {"start_time": 11.0, "end_time": 100.0},
+    ]
+
+    times, fixed, nudges = MediaManager._nudge_uncovered_frames(
+        roles, requested, recordings, (1.0, 10.0)
+    )
+
+    assert times[4] <= requested[4], (
+        f"last 被推到 {times[4]}，晚于人物离开的 {requested[4]}——"
+        f"它现在画的是人物离开之后的画面，与 postroll 重合（nudges={nudges}）"
+    )
+
+
+def test_a_nudge_still_moves_a_frame_that_can_be_moved() -> None:
+    """加上窗口约束后，仍能移动的帧必须照常移动——不能把功能关掉。
+
+    这是修复的另一半：约束只应排除"移出窗口"的候选，不应让所有微调失效。
+    """
+    from custom_components.frigate_vision.media import MediaManager
+
+    roles = ("first", "motion", "motion", "motion", "last", "postroll")
+    # first = 12.0 inside a hole, and a covered instant exists FORWARD of it.
+    requested = (12.0, 20.0, 30.0, 40.0, 50.0, 52.8)
+    recordings = [
+        {"start_time": 0.0, "end_time": 11.0},
+        {"start_time": 12.5, "end_time": 100.0},
+    ]
+
+    times, fixed, nudges = MediaManager._nudge_uncovered_frames(
+        roles, requested, recordings, (12.0, 50.0)
+    )
+
+    assert times[0] > requested[0], (
+        f"向前可移动的帧没有被移动（times[0]={times[0]}，nudges={nudges}）"
+    )
+    assert times[0] >= requested[0]
+
+
 async def test_a_frame_dropped_by_a_recording_hole_is_not_silently_published(
     hass: HomeAssistant, tmp_path
 ) -> None:

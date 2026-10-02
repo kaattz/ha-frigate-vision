@@ -1309,8 +1309,15 @@ class MediaManager:
         # A required frame inside a recording hole cannot be discarded the way a
         # change candidate can, so it is nudged to the nearest covered instant
         # first. Coverage is then checked on what actually must be present.
+        #
+        # The person window is passed so `first` cannot be nudged back to before the
+        # person arrived and `last` cannot be pushed past their departure; see
+        # `_nudge_uncovered_frames`.
         requested, fixed, nudges = self._nudge_uncovered_frames(
-            roles, requested, recordings
+            roles,
+            requested,
+            recordings,
+            (plan.first_time, plan.last_time),
         )
         if not recordings_cover(tuple(fixed.values()), recordings):
             raise MediaError("recording_gap")
@@ -1488,6 +1495,7 @@ class MediaManager:
         roles: Sequence[str],
         requested: Sequence[float],
         recordings: Sequence[Mapping[str, Any]],
+        window: tuple[float, float] | None = None,
     ) -> tuple[tuple[float, ...], dict[str, float], list[dict[str, Any]]]:
         """Move frames that fall in a recording hole to a covered instant.
 
@@ -1500,6 +1508,24 @@ class MediaManager:
         The postroll frame means "the scene after the person left", so moving it
         later is always safe; moving it earlier could cross back to before the
         departure, so it is only ever pushed forward.
+
+        `window` is the person's own span, and it bounds the frames whose MEANING is a
+        position within it:
+
+        * `first` must not move earlier than the window start -- that cell means "the
+          person's first frame", and moving it back draws the empty scene from before
+          the person was detected. Measured: `first` planned at 12.0 with the window
+          starting at 12.0 was nudged to 11.0 by the -1.0 offset, because `lower` is
+          only the previous CELL and for index 0 that is negative infinity.
+        * `last` must not move later than the window end -- that is the postroll's job,
+          and past it the two cells show the same thing.
+
+        `postroll` is deliberately NOT bounded by the window: sitting beyond the person
+        leaving is exactly what it is for. Motion picks are not bounded either; they
+        carry no positional meaning, only "a moment during the visit".
+
+        A frame with no candidate inside the bound is simply left where it is, which is
+        the pre-existing behaviour and feeds the coverage check that follows.
         """
         intervals = MediaManager._coverage_intervals(recordings)
 
@@ -1511,13 +1537,20 @@ class MediaManager:
         for index, timestamp in enumerate(result):
             if covered(timestamp):
                 continue
+            role = roles[index]
             offsets = (
                 POSTROLL_FORWARD_OFFSETS
-                if roles[index] == "postroll"
+                if role == "postroll"
                 else RECORDING_NUDGE_OFFSETS
             )
             lower = result[index - 1] if index > 0 else float("-inf")
             upper = result[index + 1] if index + 1 < len(result) else float("inf")
+            if window is not None:
+                start, end = window
+                if role == "first":
+                    lower = max(lower, start)
+                elif role == "last":
+                    upper = min(upper, end)
             for offset in offsets:
                 candidate = timestamp + offset
                 if not lower < candidate < upper or not covered(candidate):
