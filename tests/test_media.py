@@ -4126,6 +4126,82 @@ async def test_the_provider_budget_matches_what_a_sheet_can_be(
     )
 
 
+def test_overexposure_is_not_reported_for_a_frame_with_no_saturated_pixel(
+    tmp_path,
+) -> None:
+    """一帧里**没有任何**像素三通道同时饱和时，不能判成"过曝"。
+
+    缺陷实测：`frame_is_overexposed` 取的是**各通道边缘计数的最小值**：
+
+        darkest = min(#{R>=235}, #{G>=235}, #{B>=235})
+        return darkest / pixels >= 0.30
+
+    而"三通道同时饱和"的像素集合是每个边缘集合的**子集**，所以这个最小值是联合计数的
+    **上界**，不是它本身。构造反例（50% 纯红 + 50% 纯青）：
+
+        marginals = [115200, 230400, 115200] -> min = 50.0%
+        pixels saturated on ALL THREE       = 0      (0.000%)
+        frame_is_overexposed                -> True
+
+    两种光温的场景（暖灯 + 冷窗、亮黄物体挨着亮蓝屏幕）会被误判成过曝。docstring 却
+    写着"只有三通道同时饱和才算饱和，所以取最暗的那个通道"——那句话描述的算法不是这段
+    代码。
+
+    影响有界但真实：被判过曝的帧会送去 `_async_replace_overexposed`，而它的
+    `acceptable` 会拒绝同样被误判的邻居，于是整条 46 个偏移的阶梯走完、一个都不接受
+    ——真实延迟与 Frigate 负载，零收益。
+    """
+    from custom_components.frigate_vision.media import frame_is_overexposed
+
+    width, height = 640, 360
+    half = (width * height) // 2
+    image = Image.new("RGB", (width, height))
+    # Warm-bright and cool-bright: each channel reaches the white level in half the
+    # pixels, but no single pixel has all three clipped.
+    image.putdata([(255, 0, 0)] * half + [(0, 255, 255)] * (width * height - half))
+    path = tmp_path / "two_tone.jpg"
+    image.save(path, "JPEG", quality=95)
+
+    assert not frame_is_overexposed(path), (
+        "没有任何像素三通道同时饱和，却被判成过曝——两种光温的正常画面会走完"
+        "整条重试阶梯且一个都不接受"
+    )
+
+
+def test_overexposure_is_still_reported_for_a_genuinely_blown_frame(tmp_path) -> None:
+    """收紧判据不能放过**真正**过曝的帧——那是这个检查存在的理由。
+
+    相机对着电梯门，门开时轿厢灯直射镜头、传感器削顶，画面近白且细节烧毁。这条必须
+    继续被判成过曝。
+    """
+    from custom_components.frigate_vision.media import frame_is_overexposed
+
+    image = Image.new("RGB", (640, 360), (255, 255, 255))
+    path = tmp_path / "blown.jpg"
+    image.save(path, "JPEG", quality=95)
+    assert frame_is_overexposed(path), "整帧全白的画面必须仍被判成过曝"
+
+    # And the mixed case the docstring describes: mostly saturated with dark edges,
+    # which must still count because every channel is clipped there.
+    image = Image.new("RGB", (640, 360), (40, 40, 40))
+    for y in range(0, 300):
+        for x in range(0, 640):
+            image.putpixel((x, y), (255, 255, 255))
+    path = tmp_path / "mostly_blown.jpg"
+    image.save(path, "JPEG", quality=95)
+    assert frame_is_overexposed(path), "83% 三通道全白的画面必须仍被判成过曝"
+
+
+def test_a_dim_frame_is_not_overexposed(tmp_path) -> None:
+    """昏暗的走廊不是过曝——这是最常见的正常情况。"""
+    from custom_components.frigate_vision.media import frame_is_overexposed
+
+    image = Image.new("RGB", (640, 360), (120, 120, 120))
+    path = tmp_path / "dim.jpg"
+    image.save(path, "JPEG", quality=95)
+    assert not frame_is_overexposed(path)
+
+
 def test_a_nudge_does_not_push_a_required_frame_outside_the_person_window() -> None:
     """微调不能把 `first` 推到人物出现**之前**，也不能把 `last` 推过人物离开之后。
 

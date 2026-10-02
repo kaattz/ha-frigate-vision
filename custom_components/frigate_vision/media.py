@@ -963,16 +963,31 @@ def frame_is_overexposed(path: Path) -> bool:
             sample.load()
     except (OSError, UnidentifiedImageError) as exc:
         raise MediaError("frame_decode_failed") from exc
-    histogram = sample.histogram()
     pixels = sample.width * sample.height
-    # A pixel is saturated only when all three channels are; the darkest channel
-    # therefore decides, and it is the one whose histogram to read. Summing the
-    # three would count a single saturated channel as a saturated pixel.
-    darkest = min(
-        sum(histogram[channel * 256 + OVEREXPOSED_WHITE_LEVEL : (channel + 1) * 256])
-        for channel in range(3)
+    # A pixel is saturated only when ALL THREE channels are, so the count is of pixels
+    # whose DARKEST channel is still at the white level. That is not the same as taking
+    # the smallest of the three per-channel counts: the jointly-saturated set is a
+    # SUBSET of each channel's set, so the minimum of the marginals is an UPPER BOUND on
+    # it. Measured on a frame split half warm-bright (255,0,0) and half cool-bright
+    # (0,255,255): each channel reaches the white level in 50% of pixels, so the old
+    # `min(...)` reported 50% -- while the number of pixels saturated on all three was
+    # ZERO. The frame was declared blown.
+    #
+    # Two light temperatures in one scene (a warm lamp beside a cool window, a bright
+    # yellow object next to a bright screen) are ordinary, and the cost of the false
+    # positive is not free: the frame is handed to `_async_replace_overexposed`, whose
+    # `acceptable` refuses equally-flagged neighbours, so the whole 46-offset ladder is
+    # walked with nothing accepted -- real latency and Frigate load for no benefit.
+    #
+    # `ImageChops.darker` gives the per-pixel minimum in C, and the darkest channel's
+    # histogram then counts exactly the pixels where every channel is clipped.
+    darkest_channel = ImageChops.darker(
+        ImageChops.darker(sample.getchannel("R"), sample.getchannel("G")),
+        sample.getchannel("B"),
     )
-    return (darkest / pixels) >= OVEREXPOSED_WHITE_FRACTION
+    histogram = darkest_channel.histogram()
+    white = sum(histogram[OVEREXPOSED_WHITE_LEVEL:])
+    return (white / pixels) >= OVEREXPOSED_WHITE_FRACTION
 
 
 class MediaManager:
