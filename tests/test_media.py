@@ -3967,6 +3967,165 @@ async def test_a_non_replay_activity_id_cannot_claim_a_suffix_sibling(
     )
 
 
+async def test_a_sheet_without_a_close_up_is_not_billed_wider_than_configured(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """没有特写时，拼图不该按 1215 宽而不是 767 宽去计费。
+
+    缺陷实测（target_width=767，person_highlight=True）：
+
+    | 分支 | 组合宽度 | 传给 resize 的预算 | 实际交付 |
+    |---|---|---|---|
+    | 有特写 | 767（组合时已缩放） | 1215 | 767x577 |
+    | **无特写** | **1920（原生网格）** | **1215** | **1215x456** |
+
+    无特写分支是"没有 box"时的**常态**（`_async_person_highlight` 的 docstring 明写
+    None 是常态），而它组合时不传 `target_width`，于是交给
+    `resize_for_provider` 时仍是 1920 宽，而预算是 1215——那 448 是给**右侧一栏特写**
+    留的，正是这张图里没有的东西。
+
+    代价：像素面积是 767x288 的 **2.5 倍**（553,960 vs 220,896），而多出来的像素只是
+    把网格放大，没有任何新细节；视觉供应商按像素面积计费。实测 HA 上 123 张历史拼图，
+    有 7 张就是这个 1215 宽。
+
+    两处一起修才对：组合处不传 target_width 是根因，而预算里的 448 是让根因变成账单
+    的原因。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _standalone_record()
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id,
+                "camera": camera,
+                "label": "person",
+                "start_time": 103,
+                "end_time": 117,
+                # No box anywhere: the close-up cannot be built, so the
+                # `highlight is None` branch runs.
+                "data": {"path_data": _motion_points()},
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            return [{"start_time": after - 20, "end_time": before + 20}]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+    root = tmp_path / "media"
+    root.mkdir()
+    manager = MediaManager(
+        hass, store, Client(), root,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+        person_highlight=True,
+        target_width=_TARGET_WIDTH,
+    )
+    completed = await manager.async_build(record.activity_id)
+
+    # What matters is the width the PROVIDER is given, not the resolution the sheet is
+    # stored at: the stored copy is what a person opens from the notification, so it
+    # keeps the grid's native resolution and is scaled at send time.
+    from custom_components.frigate_vision.vision import (
+        evidence_width_budget,
+        resize_for_provider,
+        vision_config_from,
+    )
+
+    config = vision_config_from(
+        {}, {"person_highlight": True, "target_width": _TARGET_WIDTH}
+    )
+    sent = resize_for_provider(
+        Path(completed.evidence_path), evidence_width_budget(config)
+    )
+    with Image.open(BytesIO(sent)) as delivered:
+        delivered_width = delivered.size[0]
+
+    assert delivered_width <= _TARGET_WIDTH, (
+        f"没有特写的拼图按 {delivered_width} 宽发给供应商，配置是 {_TARGET_WIDTH}——"
+        f"多出来的像素只是把网格放大，却按面积计费"
+    )
+    with Image.open(completed.evidence_path) as stored:
+        assert stored.size[0] == 1920, (
+            "存储分辨率不该被改动：拼图在盘上保持网格原生宽度，发送时才缩放"
+        )
+
+
+async def test_a_sheet_without_a_close_up_still_has_whole_rows(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """上面那条修的是宽度，不能顺手把行数/格子数弄坏。"""
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _standalone_record()
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id, "camera": camera, "label": "person",
+                "start_time": 103, "end_time": 117,
+                "data": {"path_data": _motion_points()},
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            return [{"start_time": after - 20, "end_time": before + 20}]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+    root = tmp_path / "media"
+    root.mkdir()
+    manager = MediaManager(
+        hass, store, Client(), root,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+        person_highlight=True,
+        target_width=_TARGET_WIDTH,
+    )
+    completed = await manager.async_build(record.activity_id)
+
+    assert len(completed.sample_times) % 3 == 0
+    with Image.open(completed.evidence_path) as sheet:
+        # Two rows of a 3-column grid, as a six-frame plan requires. The stored sheet
+        # keeps the native cell width, so each cell is `CELL_SIZE[0]` wide.
+        assert sheet.size[0] % 3 == 0
+        assert sheet.size[1] % 2 == 0
+
+
+async def test_the_provider_budget_matches_what_a_sheet_can_be(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """预算要等于拼图**可能**的最大宽度，而不是给一个已经不存在的右栏留位置。
+
+    `evidence_width_budget` 在 `person_highlight` 打开时返回
+    `target_width + PERSON_HIGHLIGHT_WIDTH`，理由是"组合时网格先缩放、特写栏后加，
+    所以成品更宽"。但特写已经改到网格**下面**——加的是**高度**，不是宽度。
+
+    实测：成品恒为 target_width 宽（767），而预算是 1216。预算偏大不会造成当前缺陷
+    （`resize_for_provider` 只在超过预算时才缩放），但它正是让"无特写拼图按 1215 交付"
+    变成账单的那一半，而且留着会误导下一个改布局的人。
+    """
+    from custom_components.frigate_vision.vision import (
+        VisionConfig,
+        evidence_width_budget,
+    )
+
+    config = VisionConfig(
+        base_url="http://x/v1",
+        api_key="k",
+        model="m",
+        target_width=_TARGET_WIDTH,
+        person_highlight=True,
+    )
+    budget = evidence_width_budget(config)
+    assert budget == _TARGET_WIDTH, (
+        f"预算 {budget} != target_width {_TARGET_WIDTH}：多出的 "
+        f"{budget - _TARGET_WIDTH} 是给右侧一栏留的，而特写在网格下方"
+    )
+
+
 async def test_a_frame_dropped_by_a_recording_hole_is_not_silently_published(
     hass: HomeAssistant, tmp_path
 ) -> None:

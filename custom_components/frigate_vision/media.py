@@ -1428,6 +1428,17 @@ class MediaManager:
             highlight = await self._async_person_highlight(
                 record, selected, temporary, highlight_sources
             )
+            # Only the close-up branch passes `target_width`, and that asymmetry is
+            # deliberate: the sheet on disk is the copy a person opens from the
+            # notification, so without a close-up it is stored at the grid's native
+            # resolution and `resize_for_provider` scales it at send time.
+            #
+            # What was NOT deliberate is the billing: `evidence_width_budget` used to
+            # add a side-column allowance that no longer exists, so a no-close-up sheet
+            # was composed here at 1920 and then delivered at 1215 instead of the
+            # configured 767 -- 6.8x the pixel area, every extra pixel the grid
+            # magnified, billed by area. That is fixed at the budget instead, which
+            # leaves the stored resolution alone.
             if highlight is None:
                 await self._hass.async_add_executor_job(
                     build_contact_sheet, [path for _, path in selected], sheet

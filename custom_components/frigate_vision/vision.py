@@ -57,7 +57,6 @@ from .const import (
     CONF_SCENE_LABELS,
     MAX_PROMPT_OVERRIDE_LENGTH,
     MAX_SCENE_DESCRIPTION_LENGTH,
-    PERSON_HIGHLIGHT_WIDTH,
     THINKING_UNSUPPORTED_PROVIDERS,
     provider_for_url,
 )
@@ -212,9 +211,16 @@ def evidence_width_budget(config: VisionConfig) -> int:
     6.3x the pixels, billed, for a close-up that is not in the image. A budget
     stays correct for both: a fresh composed sheet equals it and is left alone,
     while a stale grid-only one exceeds it and is still shrunk.
+
+    The budget is `target_width` whether or not the close-up is on, because the
+    close-up adds HEIGHT, not width: it is drawn as a strip under the grid, so a
+    composed sheet is always exactly `target_width` wide. This used to add
+    `PERSON_HIGHLIGHT_WIDTH` when the option was on, left over from when the close-up
+    was a column beside the grid. Measured: the sheet is 767 wide while the budget said
+    1215, and that 448 slack is what let a sheet with no close-up (composed at the
+    native 1920) be delivered over-wide instead of being scaled to the configured
+    width. A stale grid-only sheet is still caught by `target_width`.
     """
-    if config.person_highlight:
-        return config.target_width + PERSON_HIGHLIGHT_WIDTH
     return config.target_width
 
 
