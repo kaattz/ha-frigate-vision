@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import math
 import os
 import shutil
@@ -40,6 +41,8 @@ from .pathing import (
     select_motion_times,
 )
 from .store import ActivityStore
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class MediaError(RuntimeError):
@@ -598,20 +601,104 @@ def _mean_difference(left: Image.Image, right: Image.Image) -> float:
     return float(ImageStat.Stat(ImageChops.difference(left, right)).mean[0])
 
 
+# The smallest per-pixel difference counted as a real change, and how many such pixels
+# make two frames different moments.
+#
+# Both are measured, not chosen. The floor: re-encoding the SAME image at wildly
+# different JPEG qualities (95/95, 60/95, 50/98, 40/100, 30/95) across 12 real frames
+# moved **zero** signature pixels past a difference of 2, so anything above that is
+# signal. The signal: the smallest real change measured -- a 20x20 px box appearing on
+# a real frame -- moves 4 px past this level, and a 48x48 px one moves 13.
+#
+# Two pixels is the threshold: above the zero-pixel floor, and below the smallest real
+# signal, so the two classes do not overlap.
+#
+# Why not a higher level: a uniform brightness change moves every pixel a LITTLE, so a
+# high level makes a genuinely different exposure look identical. At 24, a whole-frame
+# shift of 13 levels -- the step this deployment's own fixtures use for a new moment --
+# reads as zero changed pixels and the frame is declared a duplicate.
+#
+# Defined before the functions that use them as default arguments, which is why they
+# sit here rather than beside `validate_unique_frames`.
+CHANGE_LEVEL = 2
+UNIQUE_FRAME_THRESHOLD = 2 / (64 * 36)
+
+# The mean-difference half of the same decision, unchanged from the original guard: a
+# change spread thinly across the whole frame (a one-level step everywhere) is still a
+# different picture even though it moves no single pixel far.
+MEAN_DUPLICATE_THRESHOLD = 1.0
+
+
+def change_fraction(
+    left: Image.Image, right: Image.Image, *, level: int = CHANGE_LEVEL
+) -> float:
+    """The share of signature pixels that differ by more than `level`.
+
+    Used instead of a mean because a mean is diluted by AREA, and the two things this
+    has to tell apart differ exactly in area.
+
+    Measured on 640x360 frames reduced to the 64x36 signature (2304 px), against the
+    old `_mean_difference`:
+
+    | pair | mean | changed px (>8) |
+    |---|---|---|
+    | identical, re-encoded at quality 30 vs 95 | 0.193 | 0 |
+    | whole frame +1 level | 1.108 | 0 |
+    | whole frame +13 levels | 13.1 | 2303 |
+    | a 20x20 px object appearing (0.17%) | 0.049 | 4 |
+    | a 48x48 px object appearing (1.0%) | 0.227 | 13 |
+
+    The mean ranks those backwards: a 20x20 px object appearing scored 0.049 (declared
+    "duplicate") while re-encoding the same frame scored 0.193 (declared "different"),
+    because a mean is dominated by how MUCH of the frame moved rather than by HOW FAR.
+
+    Counting only pixels that differ a lot separates them: JPEG noise never moves a
+    pixel past the level, an object moves a few pixels well past it.
+    """
+    histogram = ImageChops.difference(left, right).histogram()
+    total = sum(histogram)
+    if not total:
+        return 0.0
+    return sum(histogram[level + 1 :]) / total
+
+
+def frames_are_duplicates(left: Image.Image, right: Image.Image) -> bool:
+    """Whether two signature frames show the same moment.
+
+    Two measures, and both must say "nothing happened" before this answers yes:
+
+    * the MEAN difference, which catches a change spread thinly over the whole frame;
+    * the CHANGED-PIXEL count, which catches a change concentrated in a small area
+      (an object appearing) that the mean dilutes away.
+
+    Requiring both is what makes this strictly more permissive than the mean alone: it
+    can only ever refuse FEWER pairs, never more. That direction matters, because the
+    cost of the two mistakes is not symmetric. Calling a real change a duplicate fails
+    the whole activity, and `duplicate_evidence_frame` is neither retryable nor
+    replayable -- it has already cost this deployment three activities. Calling a
+    duplicate a real change merely shows the model one picture twice.
+
+    Using the changed-pixel count ALONE was tried and rejected: it made a one-level
+    brightness step between two frames count as "the same picture", which moved frames
+    that the sheet deliberately keeps apart. The mean is the right measure for a
+    widespread change and the wrong one for a localized change; neither alone is right.
+    """
+    return (
+        _mean_difference(left, right) < MEAN_DUPLICATE_THRESHOLD
+        and change_fraction(left, right) < UNIQUE_FRAME_THRESHOLD
+    )
+
+
 def validate_unique_frames(frame_paths: Sequence[Path]) -> None:
     """Reject exact and near-duplicate frames across the final artifact."""
     images: list[Image.Image] = []
     for path in frame_paths:
         current = _grayscale_signature(path)
         for previous in images:
-            if _mean_difference(previous, current) < UNIQUE_FRAME_THRESHOLD:
+            if frames_are_duplicates(previous, current):
                 raise MediaError("duplicate_evidence_frame")
         images.append(current)
 
-
-# Two frames closer than this mean greyscale distance would tell the vision
-# model it saw two moments when it saw one.
-UNIQUE_FRAME_THRESHOLD = 1.0
 
 # The widest unobserved stretch the sheet will tolerate before probing it.
 #
@@ -1581,25 +1668,39 @@ class MediaManager:
     def _collides_with_neighbours(
         index: int, trial: Path, result: Sequence[tuple[float, Path]]
     ) -> bool:
-        """Report whether a candidate repeats a neighbour's picture.
+        """Report whether a candidate repeats ANY frame already in the sheet.
 
-        Uses the same measure as the uniqueness guard, so a candidate this
-        accepts cannot later be rejected by it. Only the immediate neighbours are
-        compared: the sheet is sorted by time, so a candidate can only collide
-        with what sits next to it.
+        Every other frame is compared, not just the adjacent ones. The old version
+        compared only `index - 1` and `index + 1` and justified it with "the sheet is
+        sorted by time, so a candidate can only collide with what sits next to it" --
+        which does not follow. Sorting makes an adjacent collision the most LIKELY,
+        not the only possible one, and `validate_unique_frames` compares every pair.
+        So a candidate duplicating a non-adjacent frame passed here and was then
+        rejected by the guard, which is exactly the "a candidate this accepts cannot
+        later be rejected by it" property the docstring claims.
+
+        The cost is bounded and small: the sheet is at most twelve cells, so this is
+        at most eleven `_grayscale_signature` reads, and the candidate is read once.
         """
         try:
             candidate = _grayscale_signature(trial)
         except MediaError:
+            # An unreadable candidate cannot be shown to be distinct, so it is
+            # refused. This matches the old behaviour and is the safe direction.
             return True
-        for neighbour in (index - 1, index + 1):
-            if not 0 <= neighbour < len(result):
+        for other_index, (_, other_path) in enumerate(result):
+            if other_index == index:
                 continue
             try:
-                other = _grayscale_signature(result[neighbour][1])
+                other = _grayscale_signature(other_path)
             except MediaError:
+                # Asymmetric on purpose, and the opposite call from the candidate
+                # above: a neighbour that cannot be read is not evidence that this
+                # candidate duplicates it, so it does not veto the replacement. The
+                # guard will read the same file itself and fail the activity if the
+                # file is genuinely broken.
                 continue
-            if _mean_difference(other, candidate) < UNIQUE_FRAME_THRESHOLD:
+            if frames_are_duplicates(other, candidate):
                 return True
         return False
 
@@ -1689,25 +1790,21 @@ class MediaManager:
             for other, (_, other_path) in enumerate(result):
                 if other == index:
                     continue
-                if (
-                    _mean_difference(signature_of(other, other_path), current)
-                    < UNIQUE_FRAME_THRESHOLD
-                ):
+                if frames_are_duplicates(signature_of(other, other_path), current):
                     return True
             return False
 
         def acceptable(
             path: Path, index: int, result: list[tuple[float, Path]]
         ) -> bool:
-            # Distinct from every other frame (the collision the guard measures).
+            # Distinct from every other frame (the collision the guard measures), using
+            # the guard's own predicate so the two cannot disagree about what
+            # "duplicate" means.
             current = _grayscale_signature(path)
             for other, (_, other_path) in enumerate(result):
                 if other == index:
                     continue
-                if (
-                    _mean_difference(_grayscale_signature(other_path), current)
-                    < UNIQUE_FRAME_THRESHOLD
-                ):
+                if frames_are_duplicates(_grayscale_signature(other_path), current):
                     return False
             # Do not undo the night-vision repair. This runs after it, and a
             # pure uniqueness test will happily step backwards into the IR
@@ -1771,7 +1868,26 @@ class MediaManager:
         return (own, root)
 
     async def async_restore_registry(self) -> None:
-        """Rebuild the in-memory registry from validated persisted artifacts."""
+        """Rebuild the in-memory registry from validated persisted artifacts.
+
+        A record whose artifact cannot be verified is SKIPPED, not raised on. The
+        registry is a cache of artifact locations, and a cache miss must not be fatal:
+        raising here reaches `async_setup_entry`, which converts only
+        `ModelValidationError`/`FrigateApiError`/`OSError` into a repair card --
+        `MediaError` is a plain `RuntimeError`, so it propagates and Home Assistant
+        puts the whole entry into `setup_error`. Every entity goes unavailable, no
+        card explains it, and the value lives in `.storage` where the options form
+        cannot reach it. It then recurs on every restart. The docstring above
+        `_accepted_paths` records that exact outcome from 2026-09-28.
+
+        Skipping also keeps the sweep from stopping at the first offender: raising
+        abandoned every record that sorted after it, so a single bad path could hide
+        artifacts that were perfectly usable.
+
+        This is a soft failure by design, so it is logged at WARNING with the reason.
+        The record itself is left untouched -- it is still whatever stage it was, and
+        the cleanup sweep will expire it on the retention schedule.
+        """
         for record in self._store.all():
             if record.evidence_path is None or record.evidence_expired_at is not None:
                 continue
@@ -1780,7 +1896,13 @@ class MediaManager:
                 Path(record.evidence_path).resolve
             )
             if actual not in accepted:
-                raise MediaError("invalid_output_path")
+                _LOGGER.warning(
+                    "Evidence for %s points outside the media directory (%s); "
+                    "leaving it unregistered",
+                    record.activity_id,
+                    record.evidence_path,
+                )
+                continue
             # `actual.stem`, not `record.activity_id`: a replay's sheet belongs to
             # its root, and the artifact's own metadata records that root's id.
             # The pair is self-consistent -- a file named after X carries X's
@@ -1797,7 +1919,16 @@ class MediaManager:
                 record.evidence_mode,
                 record.sample_times,
             ):
-                raise MediaError("artifact_missing")
+                # Same soft failure as the path check: the file is missing, unreadable,
+                # or describes a different sheet than the record claims. Report it and
+                # move on rather than taking the config entry down.
+                _LOGGER.warning(
+                    "Evidence for %s is missing or does not match the record (%s); "
+                    "leaving it unregistered",
+                    record.activity_id,
+                    expected,
+                )
+                continue
             self._register(record, expected)
 
     async def _complete(
@@ -1880,6 +2011,21 @@ def _root_activity_id(activity_id: str) -> str | None:
 def _read_existing(
     final: Path, metadata: Path, activity_id: str
 ) -> tuple[str, tuple[float, ...], str | None] | None:
+    """Read a persisted artifact's description, or None when it cannot be trusted.
+
+    None means "unreadable", never an exception. The `.json` this reads lives in the
+    user's Home Assistant media directory, so its bytes are user-editable and can also
+    be left half-written by a crash -- and this runs during `async_setup_entry`, where
+    anything raised takes the WHOLE config entry to `setup_error`: every entity
+    unavailable, no repair card, and the offending value in `.storage` where the
+    options form cannot reach it.
+
+    The decoded payload must therefore be checked for being a JSON object before it is
+    used as one. Measured: `null`, `[]`, `"text"`, `123`, `true` and `3.5` all parsed
+    as valid JSON and then raised `AttributeError` from `.get()`, which is not in the
+    `except` list below -- so a hand-edited or truncated metadata file was enough to
+    strand the integration.
+    """
     if not final.is_file() or not metadata.is_file():
         return None
     try:
@@ -1888,6 +2034,10 @@ def _read_existing(
                 return None
             image.load()
         payload = json.loads(metadata.read_text("utf-8"))
+        # `isinstance`, not a truthiness test: every non-object JSON value is a valid
+        # parse and none of them can be indexed by key.
+        if not isinstance(payload, dict):
+            return None
         if payload.get("activity_id") != activity_id or payload.get(
             "plan_version"
         ) not in {1, 2, 3, 4}:
@@ -1895,8 +2045,39 @@ def _read_existing(
         mode = str(payload["mode"])
         source_value = payload.get("selection_source")
         source = str(source_value) if source_value is not None else None
-        samples = tuple(float(value) for value in payload["sample_times"])
-    except OSError, ValueError, KeyError, TypeError, json.JSONDecodeError:
+        raw_samples = payload["sample_times"]
+        if not isinstance(raw_samples, (list, tuple)):
+            return None
+        samples = tuple(float(value) for value in raw_samples)
+        # The same count rule the model enforces on an activity: a sheet is built from
+        # a whole number of 3-column rows. Without this a metadata file claiming one
+        # sample would be accepted and registered as usable evidence, and the media
+        # source would serve a one-cell "sheet".
+        if len(samples) not in {3, 6, 9, 12}:
+            return None
+        # Sheet cells must be strictly increasing in time: the prompt tells the model
+        # that cell order is chronological, and a non-monotonic list would make that
+        # a lie. `ActivityRecord` already guarantees this for stored records; this is
+        # the file-on-disk equivalent, and the file is the untrusted copy.
+        if tuple(sorted(set(samples))) != samples:
+            return None
+        if any(not math.isfinite(value) or value < 0 for value in samples):
+            return None
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        json.JSONDecodeError,
+    ):
+        # `isinstance(payload, dict)` above is what actually handles a non-object
+        # payload -- verified by narrowing this clause and watching that case still
+        # pass. `AttributeError` is kept anyway as a second line of defence, because
+        # this function's failure mode is unusually expensive: anything raised here
+        # reaches `async_setup_entry` and takes the whole config entry down. Verified
+        # that removing BOTH does fail the guarding test, so the pair is load-bearing
+        # even though either one alone would do.
         return None
     return mode, samples, source
 

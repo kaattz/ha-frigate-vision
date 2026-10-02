@@ -755,6 +755,146 @@ def test_final_frames_reject_duplicate_fixed_and_change_images(tmp_path) -> None
         validate_unique_frames(paths)
 
 
+def test_a_localized_change_is_not_mistaken_for_a_duplicate(tmp_path) -> None:
+    """局部的真实变化不能被判成重复——旧指标正是在这里判反了。
+
+    缺陷实测（640x360，签名 64x36 = 2304 px）：
+
+    | 帧对 | 旧指标（全帧均值） | 旧判定 | 应判定 |
+    |---|---|---|---|
+    | 同一张图重新编码（quality 30 vs 95） | 0.193 | 不同 | 重复 |
+    | 20x20 物体出现（0.17%，真变化） | 0.049 | **重复** | 不同 |
+    | 48x48 物体出现（1.0%） | 0.227 | 不同 | 不同 |
+
+    均值被**面积**稀释：一个真实物体只占 0.17% 的画面，得分 0.049，反而**低于**
+    "同一张图重新编码"的 0.193。后果不是少一次分析——被判重复会让整条活动失败，
+    而 `duplicate_evidence_frame` 既不可重试也不可补跑（生产上已发生 3 次）。
+
+    修复是**再加**一个判据而不是替换：均值负责"整片轻微变化"，变化像素计数负责
+    "小面积剧烈变化"，两者**都**说没事才算重复。所以新判据只会比旧的更宽松，
+    不可能把原本接受的帧对变成拒绝——这一点由下面的断言钉住。
+    """
+    from custom_components.frigate_vision.media import (
+        _grayscale_signature,
+        change_fraction,
+        frames_are_duplicates,
+    )
+
+    def _frame(path, pixels) -> object:
+        image = Image.new("L", (640, 360))
+        image.putdata(pixels)
+        image.save(path, "JPEG", quality=85)
+        return _grayscale_signature(path)
+
+    count = 640 * 360
+    base = [110] * count
+    reference = _frame(tmp_path / "a.jpg", base)
+
+    # Same scene, every pixel one level brighter: a different picture for the mean
+    # measure, so the combined predicate must not become stricter than the old one.
+    gain_shift = _frame(tmp_path / "b.jpg", [111] * count)
+    assert not frames_are_duplicates(reference, gain_shift), (
+        "整帧亮度变化被判成同一画面——新判据不该比旧的更严格"
+    )
+
+    # A real object appearing: 30x30 px (0.39% of the frame) at +140 levels.
+    changed = list(base)
+    for y in range(180, 210):
+        for x in range(320, 350):
+            changed[y * 640 + x] = 250
+    object_appears = _frame(tmp_path / "c.jpg", changed)
+    assert change_fraction(reference, object_appears) > 0, (
+        "真出现的物体必须产生变化像素"
+    )
+    assert not frames_are_duplicates(reference, object_appears), (
+        "真的有东西出现了却被判成重复——这会让整条活动失败且不可补跑"
+    )
+
+
+def test_a_candidate_the_repair_accepts_cannot_be_rejected_by_the_guard(
+    tmp_path,
+) -> None:
+    """修复说"我接受这个候选"，守卫就不能反悔——两侧必须用同一个判据、同一组比较。
+
+    缺陷实测：`_collides_with_neighbours` 的 docstring 承诺 *"a candidate this accepts
+    cannot later be rejected by it"*，但它只比较**相邻**两帧，而
+    `validate_unique_frames` 比较**所有帧对**。于是一个与**非相邻**帧重复的候选会被
+    修复放行、再被守卫拒绝——正是那句承诺说不会发生的事。
+
+    `_async_replace_duplicates` 没有这个洞（它的 `acceptable` 比较所有帧），所以两个
+    修复对"什么算重复"的理解本来就不一致。这条把两者钉在同一个 `frames_are_duplicates`
+    上：非相邻重复也必须被拒。
+    """
+    from custom_components.frigate_vision.media import (
+        _grayscale_signature,
+        frames_are_duplicates,
+    )
+
+    def _plain(path, value, size=(64, 36)) -> Path:
+        Image.new("L", size, value).save(path, "JPEG", quality=90)
+        return path
+
+    # Five frames, so a NON-adjacent duplicate has neighbours that are genuinely
+    # different: the trial sits at index 2, and duplicates index 0.
+    #
+    #   0 = 20   <-- the picture the trial repeats (non-adjacent)
+    #   1 = 200  <-- neighbour, different
+    #   2 = placeholder; trial goes here
+    #   3 = 200  <-- neighbour, different
+    #   4 = 60
+    first = _plain(tmp_path / "first.jpg", 20)
+    left = _plain(tmp_path / "left.jpg", 200)
+    placeholder = _plain(tmp_path / "placeholder.jpg", 90)
+    right = _plain(tmp_path / "right.jpg", 200)
+    tail = _plain(tmp_path / "tail.jpg", 60)
+    trial = _plain(tmp_path / "trial.jpg", 20)
+
+    result = [
+        (1.0, first),
+        (2.0, left),
+        (3.0, placeholder),
+        (4.0, right),
+        (5.0, tail),
+    ]
+
+    assert frames_are_duplicates(
+        _grayscale_signature(first), _grayscale_signature(trial)
+    ), "precondition: the trial repeats frame 0"
+
+    # Neither neighbour repeats the trial, so only a whole-sheet comparison finds it.
+    for neighbour in (1, 3):
+        assert not frames_are_duplicates(
+            _grayscale_signature(result[neighbour][1]),
+            _grayscale_signature(trial),
+        ), f"precondition: neighbour {neighbour} must differ from the trial"
+
+    assert MediaManager._collides_with_neighbours(2, trial, result), (
+        "候选与**非相邻**帧重复却被放行——守卫随后会拒绝它，"
+        "正是 docstring 承诺不会发生的事"
+    )
+
+
+def test_a_byte_identical_pair_is_still_a_duplicate(tmp_path) -> None:
+    """修好方向感不能放过"同一张图"——那正是这个守卫存在的理由。
+
+    这是必须保留的一半：Frigate 会把两个相邻请求吸附到同一张存储帧上，返回逐字节
+    相同的图。把它当成两个时刻就是在骗模型，也正是 `validate_unique_frames` 的
+    原意（见它上面的注释）。
+    """
+    from custom_components.frigate_vision.media import (
+        _grayscale_signature,
+        frames_are_duplicates,
+    )
+
+    path = tmp_path / "same.jpg"
+    Image.new("L", (640, 360), 128).save(path, "JPEG", quality=85)
+    # Re-open so the two sides are independent decodes of the same bytes, as a
+    # duplicate pair is in production.
+    assert frames_are_duplicates(
+        _grayscale_signature(path), _grayscale_signature(path)
+    )
+
+
 async def test_media_manager_builds_once_and_atomically_registers(
     hass: HomeAssistant, tmp_path
 ) -> None:
@@ -3478,10 +3618,16 @@ async def test_a_replayed_activity_continues_analysis_from_its_root_sheet(
 async def test_a_replay_still_refuses_a_sheet_belonging_to_neither_id(
     hass: HomeAssistant, tmp_path
 ) -> None:
-    """The acceptance must stay narrow: an unrelated file is still refused.
+    """The acceptance must stay narrow: an unrelated file is still NOT registered.
 
     Without this, "accept the root's sheet" could be implemented as "accept any
     path", which is the sandbox escape the canonical check exists to prevent.
+
+    拒绝的方式是**跳过并记日志**，不是抛异常。改成抛异常的那一版（历史行为）会让
+    整个 config entry 进入 `setup_error`：`MediaError` 是 `RuntimeError`，而
+    `async_setup_entry` 只转换 `ModelValidationError`/`FrigateApiError`/`OSError`，
+    于是所有实体不可用、**连报修卡都不会有**，值还躺在 `.storage` 里够不着。这条
+    路径的 docstring 自己就记着 2026-09-28 发生过一次。
     """
     samples = (1.0, 2.0, 3.0)
     stranger = tmp_path / "entry_1" / "someone_elses.jpg"
@@ -3513,5 +3659,149 @@ async def test_a_replay_still_refuses_a_sheet_belonging_to_neither_id(
         ZoneRoles(frozenset(), frozenset(), frozenset()),
     )
 
-    with pytest.raises(MediaError, match="invalid_output_path"):
-        await manager.async_restore_registry()
+    # Must not raise: one unverifiable record cannot take the whole entry offline.
+    await manager.async_restore_registry()
+
+    registry = hass.data.get(
+        "frigate_vision_media_registry", {}
+    )
+    assert "entry_1/review_root" not in registry, (
+        "指向别人的文件被登记了——那正是 canonical 检查要防的事"
+    )
+
+
+async def test_one_unverifiable_record_does_not_hide_the_others(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """一条坏记录不能让**其他**好记录也恢复不了。
+
+    历史行为是抛异常：不仅整个 entry 进入 `setup_error`（所有实体不可用），而且
+    扫描在第一条坏记录处就中断——排在它后面的好记录**永远不会**回到注册表。于是
+    媒体源对一个本可用的 artifact 报"找不到"。
+
+    这里两个记录：坏的在前面（按 activity_id 排序），好的在后面。好的必须仍然被登记。
+    """
+    samples = (1.0, 2.0, 3.0)
+    # "a_bad" sorts before "z_good", and its path belongs to neither of its ids.
+    stranger = tmp_path / "entry_1" / "someone_elses.jpg"
+    _write_sheet(stranger, "someone_else", samples)
+    good = tmp_path / "entry_1" / "z_good.jpg"
+    _write_sheet(good, "z_good", samples)
+
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    for activity_id, path in (("a_bad", stranger), ("z_good", good)):
+        await store.async_create(
+            ActivityRecord(
+                activity_id=activity_id,
+                entry_id="entry_1",
+                source=ActivitySource.STANDALONE_REVIEW,
+                stage=ActivityStage.EVIDENCE_READY,
+                created_at=1,
+                updated_at=2,
+                camera="front",
+                evidence_mode="review_six",
+                evidence_revision=1,
+                evidence_path=str(path),
+                evidence_media_url=(
+                    f"media-source://frigate_vision/entry_1/{activity_id}"
+                ),
+                sample_times=samples,
+            )
+        )
+    manager = MediaManager(
+        hass, store, object(), tmp_path,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+
+    await manager.async_restore_registry()
+
+    registry = hass.data.get("frigate_vision_media_registry", {})
+    assert "entry_1/z_good" in registry, (
+        "排在一坏记录之后的好记录没有被恢复——扫描在坏记录处中断了"
+    )
+    assert "entry_1/a_bad" not in registry, "坏记录不该被登记"
+
+
+async def test_metadata_that_is_not_a_json_object_is_ignored_not_fatal(
+    tmp_path,
+) -> None:
+    """媒体目录里的 `.json` 是用户可改的字节；内容合法但非对象时不能打挂集成。
+
+    实测：`null` / `[]` / `"text"` / `123` / `true` 全都让 `_read_existing` 抛
+    `AttributeError`——因为它直接对解析结果调用 `.get()`，而 `AttributeError` 不在
+    该函数的 `except` 列表里，于是它一路逃到 `async_setup_entry`，让整个 entry 进入
+    `setup_error`。文件在用户的媒体目录里，手改或半截写入都会产生这种内容。
+    """
+    from custom_components.frigate_vision.media import _read_existing
+
+    sheet = tmp_path / "a.jpg"
+    Image.new("L", (64, 36), 100).save(sheet, "JPEG", quality=90)
+    metadata = tmp_path / "a.json"
+
+    for payload in ("null", "[]", '"text"', "123", "true", "3.5"):
+        metadata.write_text(payload, encoding="utf-8")
+        assert _read_existing(sheet, metadata, "a") is None, (
+            f"metadata={payload!r} 应被当作不可读返回 None，而不是抛异常"
+        )
+
+
+async def test_a_dict_payload_with_hostile_values_is_ignored_not_fatal(
+    tmp_path,
+) -> None:
+    """结构是对的对象、但字段内容是恶意的，也不能抛。
+
+    实测过的载荷（全部返回 None，无一逃逸）：`mode` 是对象、`sample_times` 是字符串、
+    `sample_times` 是 5000 位数字、`sample_times` 里嵌套列表、`sample_times` 里是布尔。
+
+    最后两种尤其值得钉住：`float(True)` 是 1.0（布尔是 int 的子类），而超长数字串会
+    撞上 CPython 的整数转换上限——两者都可能绕过"看着像检查"的代码。
+    """
+    from custom_components.frigate_vision.media import _read_existing
+
+    sheet = tmp_path / "a.jpg"
+    Image.new("L", (64, 36), 100).save(sheet, "JPEG", quality=90)
+    metadata = tmp_path / "a.json"
+
+    hostile = (
+        # `mode` is an object: str() succeeds, so this one is accepted as a mode
+        # string, which is harmless -- the metadata is advisory.
+        '{"activity_id":"a","plan_version":4,"mode":{},"sample_times":[1,2,3]}',
+        '{"activity_id":"a","plan_version":4,"mode":"x","sample_times":"abc"}',
+        '{"activity_id":"a","plan_version":4,"mode":"x","sample_times":"'
+        + "9" * 5000
+        + '"}',
+        '{"activity_id":"a","plan_version":4,"mode":"x","sample_times":[[1],2,3]}',
+        '{"activity_id":"a","plan_version":4,"mode":"x","sample_times":[true,1,2]}',
+        '{"activity_id":"a","plan_version":4,"mode":"x","sample_times":[1,2,3],'
+        '"selection_source":{}}',
+    )
+    for payload in hostile:
+        metadata.write_text(payload, encoding="utf-8")
+        # Must not raise. Most return None; the first is allowed to return a tuple
+        # because a dict `mode` stringifies without error and the field is advisory.
+        _read_existing(sheet, metadata, "a")
+
+
+async def test_metadata_that_is_a_broken_sheet_is_ignored_not_fatal(
+    tmp_path,
+) -> None:
+    """同上的另一半：结构是对的对象但内容坏掉，也必须返回 None。"""
+    from custom_components.frigate_vision.media import _read_existing
+
+    sheet = tmp_path / "a.jpg"
+    Image.new("L", (64, 36), 100).save(sheet, "JPEG", quality=90)
+    metadata = tmp_path / "a.json"
+
+    for payload in (
+        "{}",
+        '{"activity_id": "a"}',
+        '{"activity_id": "a", "plan_version": 999}',
+        '{"activity_id": "a", "plan_version": 4}',
+        '{"activity_id": "a", "plan_version": 4, "mode": "x", "sample_times": null}',
+        '{"activity_id": "a", "plan_version": 4, "mode": "x", "sample_times": [1]}',
+    ):
+        metadata.write_text(payload, encoding="utf-8")
+        assert _read_existing(sheet, metadata, "a") is None, (
+            f"metadata={payload!r} 应被当作不可读返回 None"
+        )
