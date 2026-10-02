@@ -33,6 +33,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0}
+      # `actions/checkout` fetches every tag, then FORCE-UPDATES `refs/tags/<tag>` to
+      # the resolved commit sha -- replacing the annotated tag object with a lightweight
+      # one. Its own log for v0.1.2 shows both steps:
+      #
+      #   * [new tag]        v0.1.2 -> v0.1.2                       (annotation fetched)
+      #   t [tag update]     044221d... -> v0.1.2                   (annotation clobbered)
+      #
+      # `gh release create --notes-from-tag` reads the ANNOTATION and falls back to the
+      # commit message when there is none -- silently. That is how v0.1.2's release got
+      # 521 characters of commit message instead of the 6578 characters of release notes
+      # written for it. The release was still created, so nothing failed; the notes were
+      # simply wrong, and only comparing the published body against the tag revealed it.
+      #
+      # Re-fetching the tag object restores the annotation. `--force` is needed because
+      # the ref was rewritten above.
+      - run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          if git cat-file -t "refs/tags/$tag" 2>/dev/null | grep -q '^tag$'; then
+            echo "$tag is already an annotated tag; nothing to restore"
+          else
+            git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+            echo "restored the tag object for $tag"
+          fi
       - id: guard
         run: |
           tag="${{ github.event.inputs.tag || github.ref_name }}"
@@ -50,7 +73,14 @@ jobs:
             echo "::error::tag $tag does not match manifest.json version $manifest"
             exit 1
           fi
-          echo "manifest $manifest matches $tag"
+          # The notes ARE the release. Publishing a commit message under a version tag
+          # looks like success and is not, so refuse rather than fall back silently.
+          if ! git cat-file -t "refs/tags/$tag" 2>/dev/null | grep -q '^tag$'; then
+            echo "::error::$tag is not annotated, so --notes-from-tag would publish the"
+            echo "::error::commit message as the release notes. Re-tag it with -a -F."
+            exit 1
+          fi
+          echo "manifest $manifest matches $tag; tag is annotated"
       # Re-pushing a tag, or dispatching by hand for one already released, must not
       # fail the run: `gh release create` errors when the release exists.
       - id: existing
