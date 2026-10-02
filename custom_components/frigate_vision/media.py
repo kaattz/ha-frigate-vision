@@ -22,7 +22,6 @@ from PIL import Image, ImageChops, ImageOps, ImageStat, UnidentifiedImageError
 
 from .const import (
     HIGHLIGHT_SEAM,
-    PERSON_HIGHLIGHT_WIDTH,
 )
 from .correlation import ZoneRoles
 from .frigate import FrigateApiError, event_box
@@ -464,46 +463,50 @@ def build_contact_sheet(
     columns: int = 3,
     cell_size: tuple[int, int] = (640, 360),
     highlight: Path | None = None,
-    highlight_width: int = PERSON_HIGHLIGHT_WIDTH,
     target_width: int | None = None,
 ) -> None:
-    """Compose the evidence sheet, optionally with a person close-up column.
+    """Compose the evidence sheet, optionally with a person close-up.
 
-    `highlight` appends a column of `highlight_width` pixels on the right,
-    holding one crop taken from the original frame rather than from a grid cell.
-    The person in a cell is roughly 59x74 pixels; the same box cropped from the
-    640x360 frame and placed here is several times larger, because the crop is
-    not shrunk along with the grid.
+    `highlight` is a crop taken from the original frame rather than from a grid
+    cell, and it is drawn as a STRIP UNDER the grid at the sheet's full width,
+    capped at the grid's own height. The person in a cell is roughly 59x74 pixels;
+    the same box cropped from the 640x360 frame and placed here is several times
+    larger, because the crop is not shrunk along with the grid.
 
-    `highlight_width` is the column's width and the close-up's ceiling, not a
-    size every crop reaches. The crop is fitted proportionally, so whichever side
-    binds first decides: a crop at least as wide as it is tall -- a wide box, or
-    one with generous padding -- comes out the full width, while the reference
-    person box (147x185 in the frame) is taller than the column and fills the
-    height instead, at about 342x431. Both are far past the 59x74 the grid offers,
-    and the smaller one is the honest ceiling of a 640x360 source: the extra
-    pixels are not invented, only made readable.
+    It used to be a column on the right, and the difference is measured rather
+    than preferred: beside the grid the cells render 154x87, under it 243x137 --
+    and the close-up itself goes from 192x202 to 261x274. Beside the grid every
+    pixel the close-up takes is a pixel the cells lose, and the cells carry the
+    time axis, which is the sheet's whole purpose. So the close-up adds HEIGHT,
+    never width, and a composed sheet is exactly `target_width` wide.
 
-    That gain is fragile in one specific way, so the order of operations is fixed
-    here rather than left to the caller:
+    That is why there is no width parameter for it. There used to be one
+    (`highlight_width`, defaulted from `PERSON_HIGHLIGHT_WIDTH`), documented as
+    "the column's width and the close-up's ceiling", and it was still accepted and
+    documented after the layout moved -- while never being read. Measured: 64, 448
+    and 4000 all produced a byte-identical 768x577 sheet. It is gone rather than
+    left in place, because its name and its documentation claimed to control the
+    layout, so the next person to change the layout would have "fixed" it.
+
+    The order of operations is fixed here rather than left to the caller:
 
     1. the grid is built at `cell_size`,
     2. it is scaled down to `target_width` -- the width the provider will be
        given anyway,
-    3. the close-up is fitted into the column at its own fixed width,
-    4. the two are pasted side by side and saved.
+    3. the close-up is fitted to the grid's width and height,
+    4. the two are stacked with a one-pixel seam and saved.
 
     Composing first and scaling afterwards is the trap. `resize_for_provider`
-    shrinks any image wider than `target_width`, so a sheet composed at the
-    grid's full 1920 plus 448 would be scaled as a whole and the close-up would
-    land at about 145 pixels wide -- roughly the grid's own 59, making the whole
-    column pointless. Passing `target_width` is what makes the result final, and
-    `highlight` without it is refused instead of silently producing that loss.
+    shrinks any image wider than `target_width`, so a sheet composed at the grid's
+    full 1920 and scaled as a whole would take the close-up down with it -- the
+    close-up would land at roughly the grid's own 59 pixels, making it pointless.
+    Passing `target_width` is what makes the result final, and `highlight` without
+    it is refused instead of silently producing that loss.
 
     The grid keeps its pixels and is never scaled to make room: it carries the
-    time axis, and shrinking it would cost the very legibility the extra column
-    is meant to add. With `highlight` left out the sheet is byte-for-byte what it
-    has always been, so a deployment that never asks for a close-up is untouched.
+    time axis, and shrinking it would cost the very legibility the close-up is
+    meant to add. With `highlight` left out the sheet is byte-for-byte what it has
+    always been, so a deployment that never asks for a close-up is untouched.
     """
     if columns <= 0:
         raise MediaError("invalid_frame_count")

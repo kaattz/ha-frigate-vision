@@ -198,7 +198,6 @@ def test_contact_sheet_validates_frames_and_dimensions(tmp_path) -> None:
 # a 767-wide provider target scales 1920x1080 to 767x431 (1080 * 767 / 1920).
 _GRID_WIDTH = 3 * 640
 _GRID_HEIGHT = 3 * 360
-_HIGHLIGHT_WIDTH = 448
 _TARGET_WIDTH = 767
 _SCALED_HEIGHT = 431
 # JPEG encodes luma in 8x8 blocks but chroma at half resolution, so the chroma
@@ -2911,24 +2910,29 @@ def test_largest_person_box_returns_none_when_nothing_is_usable() -> None:
     assert largest_person_box(((100.0, (0.1, 0.1, 0.0, 0.0)),)) is None
 
 
-def test_the_sheet_and_the_budget_agree_on_the_column_width() -> None:
-    """拼图用的栏宽与预算用的栏宽必须是同一个数字。
+def test_the_sheet_has_no_dead_highlight_width_parameter() -> None:
+    """`build_contact_sheet` 不该再接受一个不读的参数。
 
-    这是实测出来的一个真实隐患：`PERSON_HIGHLIGHT_WIDTH`（const.py）与
-    `build_contact_sheet` 的默认参数曾是同一个 448 的两份独立拷贝。若把常量下调
-    （例如改成 256）而忘了改另一边，预算变成 767+256=1023 而拼图实际 1216 ——
-    预算**小于**实际宽度，于是整张图被缩放，**特写被摧毁**，正是这功能要防的事。
-    现在 media.py 直接引用该常量，这条测试把两者钉在一起。
+    这条测试替换了原先那条"栏宽与预算常量一致"的断言。那条钉的是
+    `highlight_width` 的默认值，理由是"两份 448 不同步会让整张图被缩放"——这个理由
+    在当前布局下**已经不成立**：特写从右侧一栏改到了网格**下方**，`highlight_width`
+    在函数体里从未被读取（实测：传 64 / 448 / 4000 得到**逐字节相同**的 768x577 拼图），
+    而 `PERSON_HIGHLIGHT_WIDTH` 也不再参与预算。
+
+    留着那个参数比去掉更糟：它的名字与 docstring 都声称它决定栏宽，下一个改布局的人
+    会照着那句文档去"修好"它。断言"不存在"是为了让重新引入它必须先想清楚。
     """
     import inspect
 
-    from custom_components.frigate_vision.const import PERSON_HIGHLIGHT_WIDTH
     from custom_components.frigate_vision.media import build_contact_sheet
 
-    default = inspect.signature(build_contact_sheet).parameters["highlight_width"]
-    assert default.default == PERSON_HIGHLIGHT_WIDTH, (
-        "拼图的默认栏宽与预算用的常量不同步，会让整张图被缩放"
+    parameters = inspect.signature(build_contact_sheet).parameters
+    assert "highlight_width" not in parameters, (
+        "highlight_width 又回来了——它不被读取，留着只会误导"
     )
+    # The pieces that DO decide the layout must still be there.
+    assert "highlight" in parameters
+    assert "target_width" in parameters
 
 
 def test_crop_person_from_frame_uses_the_configured_padding(tmp_path) -> None:

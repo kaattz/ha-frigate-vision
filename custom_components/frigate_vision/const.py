@@ -50,24 +50,18 @@ CONF_LLM_PROVIDER_DEFAULT = "deepseek"
 CONF_PERSON_HIGHLIGHT = "person_highlight"
 CONF_PERSON_HIGHLIGHT_DEFAULT = False
 
-# Width of the person close-up column appended to the evidence sheet.
+# There is deliberately no width constant for the person close-up.
 #
-# It is a width rather than a flag, and the provider path spends it as a budget
-# (`target_width + this` when the option is on). That matters for artifacts built
-# before the option was switched on: those are grid-only and up to 1920 wide, and
-# a boolean "already sized" would have been computed from the *current* setting
-# and passed them through unscaled. Measured, that is 1,382,400 pixels sent where
-# 554,496 would do -- 2.5x the bill -- for a close-up the image does not contain.
-# (The figure is 2.5x, not the 6.3x an earlier comment claimed: the option is on
-# in that scenario, so the honest comparison is against the composed sheet, not
-# against the grid-only one.) A budget is safe by construction: a composed sheet
-# equals it and is left alone, a stale grid-only one exceeds it and is shrunk.
+# There used to be (`PERSON_HIGHLIGHT_WIDTH = 448`), from when the close-up was a
+# COLUMN beside the grid and the provider budget had to add its width. The close-up is
+# now a strip UNDER the grid, so it adds height and never width: a composed sheet is
+# exactly `target_width` wide, `evidence_width_budget` returns `target_width`, and
+# `build_contact_sheet` takes no width for it.
 #
-# `build_contact_sheet` defaults to this value rather than repeating the number,
-# and a test pins the two together: if they diverged downwards the budget would
-# fall below the sheet's real width and the whole image would be scaled, taking
-# the close-up with it -- the exact failure this column exists to avoid.
-PERSON_HIGHLIGHT_WIDTH = 448
+# The constant was removed rather than left unused because the provider budget spent it
+# (`target_width + this`), which is what let a sheet with no close-up be delivered 448
+# pixels wider than configured -- 2.5x the pixel area, billed, for a strip that was not
+# in the image. See `evidence_width_budget` and the test that pins it.
 
 # Blank pixels between the frame grid and the close-up strip below it. The two are
 # different scenes, and a model reading straight down across the boundary would
