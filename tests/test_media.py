@@ -3808,6 +3808,227 @@ async def test_metadata_that_is_a_broken_sheet_is_ignored_not_fatal(
         )
 
 
+async def test_a_frame_dropped_by_a_recording_hole_is_not_silently_published(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """录像空洞吞掉一帧时，不能**静默**发布一张缺了中间的拼图。
+
+    缺陷实测：`_nudge_uncovered_frames` 只能在**邻居之间**找覆盖点，找不到就留着
+    该帧不动；而 `recordings_cover(tuple(fixed.values()))` 仍然通过——因为 `fixed`
+    只装 `first`/`last`/`postroll`，motion 帧从来不进去。于是守卫**对 motion 帧完全
+    失效**，未覆盖的帧在 `is_covered` 跳过处被静默丢弃。
+
+    两种结果（都已复现）：
+
+    | 计划 | 丢弃后 | 结果 |
+    |---|---|---|
+    | 6 帧 → 5 帧 | 行数不合法 | `invalid_frame_count`，不可重试 → 活动丢失 |
+    | 6 帧 → 3 帧 | 3 是合法行数 | **静默发布单行拼图**，只有 first/last/postroll |
+
+    第二种更坏：模型拿到一张标着 `review_six` 的单行图，中间什么都没有，而元数据
+    记成正常成功——`_read_existing` 还会在每次重启时**复用它**，永远不会重建。
+
+    正确行为：丢帧导致行数不合法时，报**可重试**的 `recording_gap`，而不是让
+    `build_contact_sheet` 报不可重试的 `invalid_frame_count`，也不是静默降级。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _standalone_record()
+    await store.async_create(record)
+
+    # The person window is 103..117 and the fixture's motion picks land inside it.
+    # A hole over the whole motion span leaves the motion picks uncovered while
+    # first/last/postroll remain covered, so only the middle frames are dropped.
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id,
+                "camera": camera,
+                "label": "person",
+                "start_time": 103,
+                "end_time": 117,
+                "data": {"path_data": _motion_points()},
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            # Everything except a hole spanning the middle of the activity.
+            return [
+                {"start_time": after - 20, "end_time": 104.0},
+                {"start_time": 116.0, "end_time": before + 20},
+            ]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+    root = tmp_path / "media"
+    root.mkdir()
+    manager = MediaManager(
+        hass, store, Client(), root,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+
+    with pytest.raises(MediaError) as caught:
+        await manager.async_build(record.activity_id)
+
+    code = str(caught.value)
+    assert code != "invalid_frame_count", (
+        "丢帧被报成不可重试的 invalid_frame_count——活动永久丢失，"
+        "而这是录像覆盖问题，重试是诚实且安全的"
+    )
+    assert code == "recording_gap", f"应报 recording_gap，实际 {code!r}"
+
+
+def test_a_pathological_person_box_does_not_escape_as_an_arithmetic_error() -> None:
+    """畸形到离谱的 box 必须报"box 不可用"，不能抛 `OverflowError`。
+
+    缺陷实测：
+
+        crop_person_box((1e307, 0.1, 0.2, 0.2), frame_size=(640, 360), padding=0.40)
+        -> OverflowError: cannot convert float infinity to integer
+
+    `math.isfinite` 对 `1e307` 是 True，所以它过了校验；但 `math.floor(1e307 * 640)`
+    要把它转成整数，超出可表示范围。
+
+    后果比"少一次分析"重得多：`OverflowError` 是 `ArithmeticError`，**不是**
+    `ValueError`，所以 `_async_person_highlight` 的
+    `except (FrigateApiError, MediaError, OSError, ValueError)` 接不住，`runtime.py`
+    的 `except (OSError, FrigateApiError, MediaError)` 也接不住。它从重试循环里逃出去，
+    **杀掉后台任务**：活动永远停在 `SEALED`，不重试、不标记 FAILED、传感器上没有
+    `last_error`——完全静默。
+
+    而校验闸门拦不住它：`person_box([1e308, ...])` 原样放行。
+    """
+    from custom_components.frigate_vision.media import crop_person_box
+
+    for box in (
+        (1e307, 0.1, 0.2, 0.2),
+        (0.1, 1e307, 0.2, 0.2),
+        (0.1, 0.1, 1e307, 0.2),
+        (0.1, 0.1, 0.2, 1e307),
+        (1e308, 1e308, 1e308, 1e308),
+    ):
+        try:
+            crop_person_box(box, frame_size=(640, 360), padding=0.40)
+        except ValueError:
+            # The documented answer for an unusable box: callers already catch this
+            # and degrade to "no close-up", which is the correct outcome.
+            pass
+        except ArithmeticError as exc:
+            raise AssertionError(
+                f"box={box} 抛出了 {type(exc).__name__}，它绕过所有 handler "
+                f"并让活动永久卡死"
+            ) from exc
+
+
+async def test_a_pathological_box_does_not_strand_the_build(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """端到端：一个畸形 box 不能把活动卡死——分析必须照常完成，只是没有特写。
+
+    这条断言的是用户可见的后果，而不是异常类型：`_async_person_highlight` 的契约是
+    "拿不到特写就降级"（它的 docstring 明写 None 是常态而非错误），所以任何从它逃出去
+    的异常都会破坏这个契约。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _standalone_record()
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id,
+                "camera": camera,
+                "label": "person",
+                "start_time": 103,
+                "end_time": 117,
+                # A finite-but-absurd box, which the validation gate admits.
+                "data": {
+                    "path_data": _motion_points(),
+                    "box": [1e307, 0.1, 0.2, 0.2],
+                },
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            return [{"start_time": after - 20, "end_time": before + 20}]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+        async def async_get_event_snapshot(self, event_id, camera, height):
+            return _solid_jpeg((240, 240))
+
+    root = tmp_path / "media"
+    root.mkdir()
+    manager = MediaManager(
+        hass, store, Client(), root,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+        person_highlight=True,
+        target_width=_TARGET_WIDTH,
+    )
+
+    completed = await manager.async_build(record.activity_id)
+
+    assert completed.stage is ActivityStage.EVIDENCE_READY, (
+        "畸形 box 把活动卡死了——正确行为是降级成没有特写的拼图"
+    )
+
+
+async def test_a_build_succeeds_when_the_media_root_does_not_exist_yet(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """全新安装时媒体根目录还不存在，构建必须照样成功。
+
+    缺陷实测：探针目录用 `tempfile.mkdtemp(dir=self._root)` 创建，而
+    `self._root` 直到后面才 `mkdir`——顺序反了。根目录不存在时 `mkdtemp` 抛
+    `FileNotFoundError`：
+
+        build RAISED FileNotFoundError: [Errno 2] No such file or directory:
+          .../frigate_vision/tmpy_jtfd3p
+        is OSError? True
+
+    它是 `OSError`，所以 `runtime.py` 把它当作**可重试**：重试 3 次、每次隔 5 秒，
+    然后记为 `media_retry_exhausted`。**永远不可能成功**——目录不会因为重试而出现。
+    这台部署上每条活动都带 path data（即都走这条分支），所以是首次运行的死局。
+
+    另外，任何外部清理（用户整理、恢复备份、HA 的 media 清理）都会让这个状态重现。
+    """
+    store = ActivityStore(hass, "entry_1")
+    await store.async_load()
+    record = _standalone_record()
+    await store.async_create(record)
+
+    class Client:
+        async def async_get_event(self, event_id: str, camera: str):
+            return {
+                "id": event_id,
+                "camera": camera,
+                "label": "person",
+                "start_time": 103,
+                "end_time": 117,
+                "data": {"path_data": _motion_points()},
+            }
+
+        async def async_get_recordings(self, camera, after, before):
+            return [{"start_time": after - 20, "end_time": before + 20}]
+
+        async def async_get_snapshot(self, camera, timestamp, height):
+            return _changing_jpeg(timestamp)
+
+    # The fresh-install condition: this directory does NOT exist yet.
+    root = tmp_path / "media" / "frigate_vision"
+    assert not root.exists(), "precondition: the media root must not exist"
+
+    manager = MediaManager(
+        hass, store, Client(), root,
+        ZoneRoles(frozenset(), frozenset(), frozenset()),
+    )
+    completed = await manager.async_build(record.activity_id)
+
+    assert completed.stage is ActivityStage.EVIDENCE_READY
+    assert root.is_dir(), "构建完成后媒体根目录应当已被创建"
+
+
 async def test_cleanup_keeps_a_sheet_a_live_replay_still_points_at(
     hass: HomeAssistant, tmp_path
 ) -> None:

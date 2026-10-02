@@ -294,6 +294,27 @@ def crop_person_box(
         raise ValueError("invalid_person_box")
     if width <= 0 or height <= 0:
         raise ValueError("invalid_person_box")
+    # `isfinite` is not enough on its own: `1e307` is finite, but `floor(1e307 * 640)`
+    # has to convert it to an integer and that overflows:
+    #
+    #   crop_person_box((1e307, 0.1, 0.2, 0.2), frame_size=(640, 360))
+    #   -> OverflowError: cannot convert float infinity to integer
+    #
+    # `OverflowError` is an `ArithmeticError`, NOT a `ValueError`, so every handler on
+    # the path misses it: `_async_person_highlight` catches
+    # `(FrigateApiError, MediaError, OSError, ValueError)` and `runtime.py` catches
+    # `(OSError, FrigateApiError, MediaError)`. It escapes the retry loop and kills the
+    # background task, leaving the activity stuck at SEALED forever -- no retry, no
+    # FAILED, no `last_error`. The validation gate does not help either:
+    # `person_box([1e308, ...])` returns the tuple unchanged.
+    #
+    # Bounded at the input rather than by widening the handlers, because the honest
+    # answer is "this box is unusable" and the callers already degrade correctly on
+    # `ValueError`. Normalised coordinates are fractions of the frame, so any magnitude
+    # beyond a small multiple of 1 is already meaningless; `1e6` is far past anything
+    # a detector can emit and far below the overflow point.
+    if any(abs(value) > _MAX_BOX_MAGNITUDE for value in (x, y, width, height)):
+        raise ValueError("invalid_person_box")
     frame_width, frame_height = frame_size
     pad_x = width * padding * frame_width
     pad_y = height * padding * frame_height
@@ -622,6 +643,15 @@ def _mean_difference(left: Image.Image, right: Image.Image) -> float:
 # sit here rather than beside `validate_unique_frames`.
 CHANGE_LEVEL = 2
 UNIQUE_FRAME_THRESHOLD = 2 / (64 * 36)
+
+# The largest magnitude accepted in a person box, in normalised frame coordinates.
+#
+# A box is a fraction of the frame, so anything past a small multiple of 1 is already
+# meaningless -- but it must be REJECTED rather than passed on, because `math.floor` on
+# a huge float raises `OverflowError`, which is an `ArithmeticError` and therefore
+# escapes every handler on the path (see `crop_person_box`). The value is far above any
+# real detector output and far below the overflow point.
+_MAX_BOX_MAGNITUDE = 1e6
 
 # The mean-difference half of the same decision, unchanged from the original guard: a
 # change spread thinly across the whole frame (a one-level step everywhere) is still a
@@ -1230,6 +1260,19 @@ class MediaManager:
             min(requested) - MAX_RECORDING_NUDGE,
             max(requested) + MAX_RECORDING_NUDGE,
         )
+        # The media root must exist before ANY temporary directory is created inside
+        # it, and the probe directory below is the first one. Creating the root here
+        # rather than further down is the whole fix: `tempfile.mkdtemp(dir=...)` raises
+        # `FileNotFoundError` when `...` does not exist, and that is an `OSError`, so
+        # the caller treats it as transient -- three attempts five seconds apart, then
+        # `media_retry_exhausted`. Retrying can never succeed, because the directory
+        # does not appear on its own, so a first run against a fresh install failed
+        # every activity that carried path data (which on this deployment is all of
+        # them). Reachable again at any time by an external cleanup of the media
+        # directory: a user tidying up, a backup restore, or HA's own media prune.
+        await self._hass.async_add_executor_job(
+            partial(self._root.mkdir, parents=True, exist_ok=True)
+        )
         # Look for evidence the path data cannot see, before anything is built.
         #
         # The detector reports where the *person* moved, and the middle cells are
@@ -1271,9 +1314,9 @@ class MediaManager:
         )
         if not recordings_cover(tuple(fixed.values()), recordings):
             raise MediaError("recording_gap")
-        await self._hass.async_add_executor_job(
-            partial(self._root.mkdir, parents=True, exist_ok=True)
-        )
+        # No `mkdir` here: the root was created before the probe directory, which is
+        # the first temporary directory this build makes. Creating it twice would hide
+        # a regression in the earlier call rather than catch it.
         directory = await self._hass.async_add_executor_job(
             partial(tempfile.mkdtemp, dir=self._root)
         )
@@ -1302,6 +1345,39 @@ class MediaManager:
                 candidate_roles.append(roles[index])
             if plan.sample_times or plan.motion_times:
                 selected = candidates
+                # A frame the sheet cannot do without was dropped by a recording hole.
+                #
+                # `_nudge_uncovered_frames` moves a frame only to a covered instant
+                # strictly between its neighbours; when no offset fits it leaves the
+                # frame exactly where it was, and the coverage guard above cannot catch
+                # that -- `fixed` holds only first/last/postroll, so it is vacuous for
+                # every motion, probe and change role. Until now the dropped frames
+                # simply vanished here, and two outcomes followed:
+                #
+                #   six signals -> five frames -> `invalid_frame_count` from
+                #   `build_contact_sheet`, which is NOT transient, so the activity was
+                #   lost outright while still holding five perfectly good frames;
+                #
+                #   or, with a wider hole, six -> three frames -> three IS a whole
+                #   number of rows, so a single-row sheet containing only
+                #   first/last/postroll was published as a SUCCESS, labelled
+                #   `review_six`, and `_read_existing` then re-adopted it on every
+                #   restart so it was never rebuilt.
+                #
+                # Both are wrong for a recording-coverage problem. A hole is a
+                # property of Frigate's segment layout, not of the request, and the
+                # segment that is missing now can be written a moment later -- so this
+                # is `recording_gap`, which the runtime retries. Reporting it here also
+                # keeps the reason honest: `invalid_frame_count` would blame the sheet
+                # geometry for what is really missing footage.
+                #
+                # The comparison is against the planned count rather than a `% 3` test,
+                # because every frame in this branch is required: the motion plan is
+                # first + three motion + last + postroll, and `pair_times_with_roles`
+                # only adds probes on top. A `% 3` test would still admit the
+                # six-frames-to-three degradation, which is the silent half of the bug.
+                if len(selected) != len(requested):
+                    raise MediaError("recording_gap")
             else:
                 # The search space is the change candidates only. Slicing by
                 # position would let a dropped candidate pull `last` into the
