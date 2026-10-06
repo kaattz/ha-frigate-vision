@@ -16,6 +16,7 @@ from PIL import Image
 from custom_components.frigate_vision.frigate import (
     FrigateApiError,
     FrigateClient,
+    _parse_zone_polygon,
 )
 
 
@@ -510,14 +511,17 @@ async def test_preview_frames_rejects_an_inverted_range(
 # The two zones this deployment actually has, copied from `GET /api/config`.
 # They are polygons with diagonal edges, not rectangles, which is the property
 # the parser has to preserve.
-_REAL_HOME_DOOR = [
-    0.181, 0.175, 0.407, 0.125, 0.442, 0.677,
-    0.456, 0.738, 0.533, 0.981, 0.286, 1.0,
-]
-_REAL_ELEVATOR = [
-    0.411, 0.083, 0.68, 0.048, 0.662, 0.553, 0.713, 0.768,
-    0.516, 0.909, 0.471, 0.766, 0.445, 0.672,
-]
+# The shape Frigate 0.17.2 ACTUALLY sends: a comma-separated string, not a list.
+# Measured against the live deployment. The fixture was a list, which is why the
+# parser rejecting the real shape went unnoticed -- the whole point of these
+# constants is to be what the camera reports.
+_REAL_HOME_DOOR = (
+    "0.181,0.175,0.407,0.125,0.442,0.677,0.456,0.738,0.533,0.981,0.286,1"
+)
+_REAL_ELEVATOR = (
+    "0.411,0.083,0.68,0.048,0.662,0.553,0.713,0.768,0.516,0.909,0.471,0.766,"
+    "0.445,0.672"
+)
 
 
 async def test_camera_zones_parses_real_frigate_polygons(
@@ -629,3 +633,107 @@ async def test_camera_zones_raises_for_an_unknown_camera(
 
     with pytest.raises(FrigateApiError, match="unknown_camera"):
         await client.async_get_camera_zones("front")
+
+
+class TestZoneCoordinatesInTheShapeFrigateActuallySends:
+    """The parser must accept the string form, not only the list form.
+
+    Measured against the live deployment: Frigate 0.17.2 reports
+    coordinates as a comma-separated STRING. The parser used to require a
+    list, so every zone was dropped -- sync_get_camera_zones returned nothing,
+    and the focus-region feature silently did nothing on real hardware. The test
+    fixture was a list, which is why nothing caught it.
+
+    These cases exist so the shape cannot drift back to the convenient one.
+    """
+
+    def test_the_real_string_form_is_accepted(self) -> None:
+        parsed = _parse_zone_polygon(
+            "0.181,0.175,0.407,0.125,0.442,0.677,0.456,0.738,0.533,0.981,0.286,1"
+        )
+        assert parsed is not None, "Frigate sends this exact shape"
+        assert len(parsed) == 6
+        assert parsed[0] == (0.181, 0.175)
+        assert parsed[-1] == (0.286, 1.0)
+
+    def test_whitespace_around_values_is_tolerated(self) -> None:
+        parsed = _parse_zone_polygon("0.1, 0.2, 0.3, 0.4, 0.5, 0.6")
+        assert parsed == ((0.1, 0.2), (0.3, 0.4), (0.5, 0.6))
+
+    def test_the_list_form_still_works(self) -> None:
+        """Older versions and hand-written payloads use it."""
+        parsed = _parse_zone_polygon([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+        assert parsed == ((0.1, 0.2), (0.3, 0.4), (0.5, 0.6))
+
+    def test_an_empty_string_is_refused(self) -> None:
+        """"".split(",") is [""], so this needs its own guard."""
+        assert _parse_zone_polygon("") is None
+        assert _parse_zone_polygon("   ") is None
+
+    def test_a_malformed_string_is_refused(self) -> None:
+        assert _parse_zone_polygon("0.1,abc,0.3,0.4,0.5,0.6") is None
+
+    def test_a_string_with_an_odd_count_is_refused(self) -> None:
+        assert _parse_zone_polygon("0.1,0.2,0.3,0.4,0.5") is None
+
+    def test_a_string_outside_the_frame_is_refused(self) -> None:
+        assert _parse_zone_polygon("0.1,0.2,0.3,0.4,2.0,0.6") is None
+
+    def test_a_list_of_strings_is_refused(self) -> None:
+        """A list carrying strings is malformed, not an alternative form.
+
+        Frigate uses one representation at a time: a comma-separated string. A list
+        of numeric strings is neither, and accepting it would mean guessing at a
+        payload nothing produces.
+        """
+        assert (
+            _parse_zone_polygon(["0.1", "0.2", "0.3", "0.4", "0.5", "0.6"]) is None
+        )
+
+    def test_a_two_vertex_string_is_refused(self) -> None:
+        assert _parse_zone_polygon("0.1,0.2,0.3,0.4") is None
+
+    def test_the_client_returns_zones_from_a_string_payload(self) -> None:
+        """End to end: the shape Frigate sends must reach the caller."""
+        import asyncio
+
+        class FakeResponse:
+            """The interface the client's _request_json actually touches."""
+
+            status = 200
+            content_type = "application/json"
+
+            async def read(self) -> bytes:
+                import json as _json
+
+                return _json.dumps(await self.json()).encode()
+
+            async def json(self):
+                return {
+                    "cameras": {
+                        "cam": {
+                            "zones": {
+                                "home_door": {"coordinates": _REAL_HOME_DOOR},
+                                "elevator": {"coordinates": _REAL_ELEVATOR},
+                            }
+                        }
+                    }
+                }
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class FakeSession:
+            """Faithful to the one call the client makes: session.request(...)."""
+
+            def request(self, method, url, **kwargs):
+                return FakeResponse()
+
+        client = FrigateClient(FakeSession(), "http://frigate")
+        zones = asyncio.run(client.async_get_camera_zones("cam"))
+        assert set(zones) == {"home_door", "elevator"}, zones
+        assert len(zones["home_door"]) == 6
+        assert len(zones["elevator"]) == 7

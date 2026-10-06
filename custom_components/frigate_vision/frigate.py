@@ -473,12 +473,22 @@ def _load_payload(payload: str) -> Mapping[str, Any]:
 def _parse_zone_polygon(
     coordinates: object,
 ) -> tuple[tuple[float, float], ...] | None:
-    """Parse Frigate's flat coordinate list into normalized (x, y) vertices.
+    """Parse Frigate's zone coordinates into normalized (x, y) vertices.
 
-    Accepts the flat `[x1, y1, x2, y2, ...]` form Frigate writes. Returns None for
-    anything that is not a usable polygon -- odd length, fewer than three
-    vertices, non-finite values, or coordinates outside the frame -- so the caller
-    can skip one bad zone instead of losing the camera's whole set.
+    Frigate 0.17.2 sends these as a COMMA-SEPARATED STRING, not a list:
+
+        "0.181,0.175,0.407,0.125,0.442,0.677,0.456,0.738,0.533,0.981,0.286,1"
+
+    Measured against the live deployment. The list form `[0.181, 0.175, ...]` is
+    also accepted, because older versions and hand-written fixtures use it -- but
+    treating the list as the only shape was a real defect: the string failed the
+    `isinstance(..., (list, tuple))` check, every zone was dropped, and the focus
+    region silently did nothing on real hardware while unit tests passed. The test
+    fixture fed a list, so nothing ever exercised the shape Frigate actually sends.
+
+    Returns None for anything that is not a usable polygon -- odd length, fewer than
+    three vertices, non-finite values, or coordinates outside the frame -- so the
+    caller can skip one bad zone instead of losing the camera's whole set.
 
     Three vertices is the minimum that encloses any area, and the bounds check
     catches the units mistake that would otherwise be silent: Frigate stores
@@ -486,13 +496,34 @@ def _parse_zone_polygon(
     land far outside, drawing an empty mask for a region the user believes is
     configured.
     """
-    if not isinstance(coordinates, (list, tuple)) or len(coordinates) % 2:
+    if isinstance(coordinates, str):
+        # `.split(",")` never yields an empty list, so an empty string has to be
+        # rejected explicitly or it becomes a one-element list of "".
+        if not coordinates.strip():
+            return None
+        # The string form is the shape Frigate sends, so its values are strings.
+        parts: list[float] = []
+        for piece in coordinates.split(","):
+            try:
+                parts.append(float(piece.strip()))
+            except ValueError:
+                return None
+    elif isinstance(coordinates, (list, tuple)):
+        # The list form comes from older versions and hand-written payloads, where
+        # the values are already numbers. A list of numeric STRINGS is neither
+        # shape, and coercing it would mean guessing at a payload nothing produces.
+        parts = []
+        for raw in coordinates:
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                return None
+            parts.append(float(raw))
+    else:
+        return None
+
+    if len(parts) % 2:
         return None
     values: list[float] = []
-    for raw in coordinates:
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-            return None
-        value = float(raw)
+    for value in parts:
         if not math.isfinite(value) or value < 0.0 or value > 1.0:
             return None
         values.append(value)

@@ -20,6 +20,9 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 # needs network access, credentials and a running Home Assistant. Its helpers
 # are deliberately plain rather than async-aware.
 "tests/e2e_llm_live.py" = ["E501", "ASYNC221", "ASYNC240"]
+# Same shape: an opt-in live harness that talks to the real deployment. Not named
+# test_*.py, so the default run skips it. Blocking path calls are its whole job.
+"tools/collect_live_sheets.py" = ["ASYNC240"]
 
 [tool.mypy]
 python_version = "3.14"
