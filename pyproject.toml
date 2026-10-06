@@ -23,6 +23,7 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 # Same shape: an opt-in live harness that talks to the real deployment. Not named
 # test_*.py, so the default run skips it. Blocking path calls are its whole job.
 "tools/collect_live_sheets.py" = ["ASYNC240"]
+"tools/verify_deployed_code.py" = ["ASYNC240"]
 
 [tool.mypy]
 python_version = "3.14"
