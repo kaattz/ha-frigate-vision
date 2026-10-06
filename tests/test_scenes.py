@@ -9,6 +9,8 @@ context.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from custom_components.frigate_vision.scenes import (
@@ -18,12 +20,10 @@ from custom_components.frigate_vision.scenes import (
     scene_prompt_version,
 )
 
-# Digest of the review_six prompt body as of PROMPT_VERSION = "prompt_4".
-#
-# Pinned so an edit to the wording cannot ride along on an unchanged version:
-# `prompt_version` is half the analysis cache key, so leaving it alone after a
-# text change makes the deployment keep serving the old answers. Bump the version
-# and this digest in the same commit.
+# The review_six prompt body's digest, kept only as a change detector for the
+# *wording*: `PROMPT_VERSION` is derived from that same text now, so a mismatch
+# here is not a broken cache key -- it is a reminder that the prompt changed and
+# anyone comparing sheets across the change should know. Nothing reads it.
 REVIEW_SIX_PROMPT_DIGEST = "e6c70a758822"
 
 
@@ -187,16 +187,20 @@ def test_changing_the_prompt_body_changes_the_cache_key() -> None:
     """The version must move whenever the wording does.
 
     `prompt_version` is half of the analysis cache key, and the other half is the
-    activity. So an edit to `template` that leaves the version alone makes every
+    activity. So an edit to the prompt that leaves the version alone makes every
     already-analysed activity keep its old answer -- the change ships, the cache
     hides it, and the deployment looks unchanged.
 
-    This cannot detect the edit by itself: the version is a hand-written string
-    and nothing ties it to the text. What it can do is fail loudly when the two
-    are known to disagree, by pinning the digest the version was last bumped
-    against. Update the digest *and* bump the version together, or this fails.
+    This used to be enforced by pinning a digest of the rendered prompt and
+    telling the next person to bump a hand-written version constant *and* update
+    that digest. Deriving the version from the rendered text makes the property
+    structural instead: there is no constant to forget. What is left to test is
+    that the derivation really is content-addressed, which is what this does by
+    changing the text and checking the version follows.
     """
     import hashlib
+
+    from custom_components.frigate_vision.scenes import prompt_version_for
 
     scene = scene_for("review_six")
     assert scene is not None
@@ -210,15 +214,47 @@ def test_changing_the_prompt_body_changes_the_cache_key() -> None:
             scene_description="",
         )
     )
-    digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:12]
-    assert digest == REVIEW_SIX_PROMPT_DIGEST, (
-        "the review_six prompt body changed:\n"
-        f"  version  : {scene.prompt_version}\n"
-        f"  digest   : {digest} (expected {REVIEW_SIX_PROMPT_DIGEST})\n"
-        "Bump PROMPT_VERSION, then update REVIEW_SIX_PROMPT_DIGEST to match. "
-        "Leaving the version alone would let the cache serve answers produced by "
-        "the old wording."
+
+    # The derived version must be a function of exactly that text.
+    expected = "p" + hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:12]
+    assert scene.prompt_version == expected, (
+        "版本必须由提示词正文派生：\n"
+        f"  version : {scene.prompt_version}\n"
+        f"  expected: {expected}\n"
+        "手改版本号的老办法已被取代；如果这条失败，说明派生逻辑与 render() 不同源。"
     )
+    assert prompt_version_for("review_six") == scene.prompt_version
+
+
+def test_editing_a_prompt_file_moves_the_version() -> None:
+    """A one-character edit to the rules text must move the cache key.
+
+    This is the property the derived version exists for, and the one a
+    hand-written constant could not provide. The check is done against the
+    derivation directly rather than by editing the file on disk, so a failure
+    cannot leave the repository dirty.
+    """
+    import hashlib
+
+    from custom_components.frigate_vision import scenes as scenes_module
+
+    scene = scene_for("review_six")
+    assert scene is not None
+    original = scene.template
+
+    def version_of(text: str) -> str:
+        edited = replace(scene, template=text)
+        rendered = edited.render(
+            SceneRequest(language="zh-CN", allowed=set(edited.classifications))
+        )
+        return "p" + hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:12]
+
+    # The formula the module uses must respond to a one-character edit.
+    assert version_of(original) == scene.prompt_version
+    assert version_of(original + "。") != scene.prompt_version, (
+        "改一个字符后版本键必须变化，否则编辑了提示词却仍会命中旧答案的缓存"
+    )
+    assert scenes_module.prompt_version_for("review_six") == scene.prompt_version
 
 
 def test_every_glossary_definition_is_offered_by_a_scene() -> None:
@@ -920,7 +956,10 @@ def test_changing_the_labels_changes_the_cache_key() -> None:
         "review_six", "", scene_labels=(("宠物", "画面中只有宠物"),)
     )
     assert with_labels != base
-    assert with_labels.startswith("prompt_6")
+    # The base version is derived now, so assert the *shape* rather than a
+    # literal: the configured key must be the base key plus digests.
+    assert with_labels.startswith(base)
+    assert with_labels != base
 
 
 def test_changing_the_prompt_override_changes_the_cache_key() -> None:
@@ -948,15 +987,22 @@ def test_changing_only_a_label_definition_changes_the_cache_key() -> None:
 
 def test_all_three_inputs_compose_into_the_key() -> None:
     """三个输入各自贡献一段摘要，任一改变都改变整个键。"""
-    from custom_components.frigate_vision.scenes import effective_prompt_version
+    from custom_components.frigate_vision.scenes import (
+        effective_prompt_version,
+        scene_prompt_version,
+    )
 
+    base = scene_prompt_version("review_six")
+    assert base is not None
     combined = effective_prompt_version(
         "review_six",
         "布局",
         scene_labels=(("宠物", "只有宠物"),),
         prompt_override="规则甲",
     )
-    assert combined.startswith("prompt_6-")
+    # The base is derived now, so the shape is what matters: base + one digest
+    # per configured input.
+    assert combined.startswith(base + "-")
     assert combined.count("-") == 3, f"三段摘要应各自出现：{combined}"
 
 
@@ -976,14 +1022,23 @@ def test_the_key_stays_a_safe_id() -> None:
 
 
 def test_nothing_configured_keeps_the_bare_base_version() -> None:
-    """什么都没配时必须返回裸的基础版本，既有部署的缓存与行为完全不变。"""
-    from custom_components.frigate_vision.scenes import effective_prompt_version
+    """什么都没配时必须返回裸的基础版本，既有部署的缓存与行为完全不变。
 
-    assert effective_prompt_version("review_six", "") == "prompt_6"
-    assert effective_prompt_version("review_six", "", scene_labels=()) == "prompt_6"
-    assert effective_prompt_version("review_six", "", prompt_override="") == "prompt_6"
+    基础版本现在是内容派生的，所以这里断言的是「等于 scene 自己的版本」而不是
+    某个字面量——字面量会随提示词正文变化，而这正是派生要消除的维护负担。
+    """
+    from custom_components.frigate_vision.scenes import (
+        effective_prompt_version,
+        scene_prompt_version,
+    )
+
+    base = scene_prompt_version("review_six")
+    assert base is not None
+    assert effective_prompt_version("review_six", "") == base
+    assert effective_prompt_version("review_six", "", scene_labels=()) == base
+    assert effective_prompt_version("review_six", "", prompt_override="") == base
     blank = effective_prompt_version("review_six", "", prompt_override="   ")
-    assert blank == "prompt_6"
+    assert blank == base
 
 
 def _review_prompt(*, highlight: bool, description: str = "") -> str:

@@ -1,0 +1,11 @@
+cleaning: 指连续清楚出现清扫、扫地、拖地或擦拭动作；
+elevator_activity: 指人物在电梯间内活动但没有跨越入户门；
+food_delivery: 指放下餐饮外卖且离开后餐食仍留在原处；
+home_arrival: 指人物从门外走近入户门并进入门内；
+home_departure: 指人物从入户门内走出并远离该门；
+maintenance: 指维修人员对楼道设施进行作业；
+package_delivery: 指放下快递包裹且离开后包裹仍留在原处；
+suspicious_activity: 指试探门锁、反复徘徊或窥探等可疑行为；
+unable_to_confirm: 指证据不足或画面质量导致无法判断；
+unknown_activity: 指画面确实无法支持任何其他判断；
+visitor: 指访客到访，例如敲门、在门外等候或被迎入；

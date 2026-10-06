@@ -24,19 +24,107 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import cache
+from pathlib import Path
 
 from .const import MAX_LABEL_DEFINITION_LENGTH, MAX_SCENE_LABELS
 from .models import MAX_CLASSIFICATION_LENGTH, SAFE_CLASSIFICATION
 
-# Bumped whenever any scene's wording changes in a way that could alter its
-# answer. It is part of the analysis cache key, so a stale result is never
-# reused after the prompt that produced it has changed.
+# Where the built-in prompt text lives.
+#
+# It used to be a Python string literal, and it had to be kept in step with a
+# second literal in `const.py` (`DEFAULT_PROMPT_OVERRIDE`) by a test that
+# asserted the two were equal. That test was the only thing holding them
+# together: nothing stopped an edit to one, and the failure it produced said
+# "the prefill disagrees with the built-in rules" rather than "you edited one of
+# two copies". Reading one file from both places removes the second copy, so the
+# property is now structural rather than asserted.
+#
+# Data, not code, because the wording is something the household tunes: it names
+# the doors this camera sees and the words its answers are allowed to use.
+PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+
+class PromptDataError(RuntimeError):
+    """A built-in prompt file is missing or unreadable.
+
+    Raised rather than falling back to an empty prompt: a scene with no rules
+    would still call the model, still be billed, and answer from the contract
+    alone -- which is exactly the failure that looks like "the model got worse".
+    """
+
+
+@cache
+def load_prompt_text(mode: str, name: str) -> str:
+    """Return one built-in prompt file's contents, cached per process.
+
+    Cached because `Scene.render` runs per analysis and the files cannot change
+    while the integration is loaded; re-reading them would put disk I/O on the
+    request path for no benefit. A restart picks up an edit, which is the same
+    contract the rest of the integration's configuration has.
+    """
+    path = PROMPTS_DIR / mode / name
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PromptDataError(f"prompt_file_unreadable:{mode}/{name}") from exc
+    if not text.strip():
+        raise PromptDataError(f"prompt_file_empty:{mode}/{name}")
+    return text
+
+
+def load_scene_labels(mode: str) -> Mapping[str, str]:
+    """Return the built-in label definitions for a scene, parsed from its file.
+
+    Reuses `parse_scene_labels` so the file format is the same one the options
+    field accepts -- a user can copy a line out of `labels.txt` into their own
+    configuration and it means the same thing.
+    """
+    text = load_prompt_text(mode, "labels.txt")
+    try:
+        return dict(parse_scene_labels(text))
+    except ValueError as exc:
+        raise PromptDataError(f"prompt_labels_invalid:{mode}:{exc}") from exc
+
+
+def load_prefill_labels(mode: str) -> tuple[tuple[str, str], ...]:
+    """Return the ordered label set the options form prefills.
+
+    Deliberately separate from `load_scene_labels`, and not derivable from it.
+    The glossary explains only the labels the rules leave undefined; the form
+    prefill has to carry *every* answer the scene can give, including the three
+    whose conditions are stated in `rules.txt` instead. Measured on this
+    deployment: the glossary holds 8, the prefill needs 11, and `scene_labels`
+    replaces the allowed set wholesale -- so a prefill missing one label makes
+    that answer permanently unreachable, with no error to notice it by.
+
+    Order is the file's, which is alphabetical, matching `_glossary`'s `sorted()`.
+    """
+    text = load_prompt_text(mode, "prefill_labels.txt")
+    try:
+        return parse_scene_labels(text)
+    except ValueError as exc:
+        raise PromptDataError(f"prompt_prefill_labels_invalid:{mode}:{exc}") from exc
+
+
+BUILTIN_SCENE_LABELS: tuple[tuple[str, str], ...] = ()
+
+
+# The base prompt version is DERIVED from the rendered prompt rather than typed,
+# and is computed at the bottom of this module (`PROMPT_VERSION`) because the
+# digest needs the scene to exist.
+#
+# It is part of the analysis cache key, so a stale result is never reused after
+# the prompt that produced it has changed. It used to be a hand-written string
+# ("prompt_6") guarded by a test that pinned the digest of the rendered prompt --
+# a test whose failure message had to tell the next person to bump the version
+# *and* update the digest. Deriving it removes that ritual: edit the wording and
+# the key moves by construction.
 #
 # A deployment-supplied scene description changes the prompt without changing
-# this constant -- see `effective_prompt_version`, which folds that description
-# into the key so a user editing it is not silently served a cached answer.
-PROMPT_VERSION = "prompt_6"
+# this value -- see `effective_prompt_version`, which folds that description into
+# the key so a user editing it is not silently served a cached answer.
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,24 +259,19 @@ class Scene:
         )
 
 
-# One sentence per label the template's rules leave undefined. Kept as data
-# rather than prose inside `template` because the definitions must follow the
-# per-call `allowed` set: teaching a label the caller disallowed would invite an
-# out-of-contract answer.
+# One sentence per label the template's rules leave undefined. Loaded from
+# `prompts/review_six/labels.txt` rather than written here, so the wording lives
+# with the rules it complements and a household can read both in one place.
+#
+# Kept as data rather than prose inside the template because the definitions must
+# follow the per-call `allowed` set: teaching a label the caller disallowed would
+# invite an out-of-contract answer.
 #
 # `cleaning`, `home_arrival` and `home_departure` are absent deliberately -- the
-# template already states their conditions, and repeating them here would show
-# the model two versions of the same rule.
-CLASSIFICATION_GLOSSARY: Mapping[str, str] = {
-    "elevator_activity": "指人物在电梯间内活动但没有跨越入户门；",
-    "package_delivery": "指放下快递包裹且离开后包裹仍留在原处；",
-    "food_delivery": "指放下餐饮外卖且离开后餐食仍留在原处；",
-    "visitor": "指访客到访，例如敲门、在门外等候或被迎入；",
-    "maintenance": "指维修人员对楼道设施进行作业；",
-    "suspicious_activity": "指试探门锁、反复徘徊或窥探等可疑行为；",
-    "unknown_activity": "指画面确实无法支持任何其他判断；",
-    "unable_to_confirm": "指证据不足或画面质量导致无法判断。",
-}
+# template already states their conditions, and repeating them here would show the
+# model two versions of the same rule. The form prefill is a *different* set and
+# does include them; see `load_prefill_labels`.
+CLASSIFICATION_GLOSSARY: Mapping[str, str] = {}
 
 
 def parse_scene_labels(text: str) -> tuple[tuple[str, str], ...]:
@@ -326,7 +409,9 @@ _REVIEW_SIX = Scene(
         }
     ),
     signals=frozenset(),
-    prompt_version=PROMPT_VERSION,
+    # Filled in below, once the scene's own text is available to hash. A scene
+    # cannot hash itself while it is being constructed.
+    prompt_version="",
     # Measured on this deployment: without a layout description the model read a
     # person stepping out of a lift and walking away down the corridor as
     # `home_departure`, because the prompt told it to judge movement relative to
@@ -334,36 +419,20 @@ _REVIEW_SIX = Scene(
     # the front door is off-camera. The rule was right; the missing context was
     # the door's identity.
     accepts_scene_description=True,
-    template=(
-        # Structure, not a count. The sheet is 2x3 when no hole is wide enough to
-        # probe and 3x3 when one is, so naming a number would be wrong half the
-        # time -- and wrong in the direction that matters, since it would place the
-        # emptied scene three cells early.
-        "图按时间顺序排列，从左到右、再从上到下读取。"
-        "第一格是人物首帧，最后一格是人物离开后的后置现场，倒数第二格是人物末帧，"
-        "中间各格是这段时间内的变化候选。"
-        "只有连续清楚出现清扫、扫地、拖地或擦拭动作才可判断cleaning。"
-        "只有清楚看到放下包裹或外卖且离开后物品仍留下，才可判断配送。"
-        "不能根据制服、携带物或停留时间猜测职业。"
-        "关于回家与离家：只有画面中能看出人物相对入户门的移动方向时才可判断——"
-        "人物从门内走出并远离该门，判为home_departure；"
-        "人物从门外走近该门并进入门内，判为home_arrival。"
-        "无法看出门的开合或人物的进出方向时，不得据停留时长、出现顺序或"
-        "是否携带物品推断方向，应选择unknown_activity或unable_to_confirm。"
-        "若人物只是经过、在门前停留或整理物品而未跨越门，也不要判断回家或离家。"
-        # Guidance on writing the `description` field, which is the notification
-        # body the household reads. Placed after the classification rules and
-        # before the glossary so it cannot be read as one of them: it constrains
-        # prose, not conclusions. The "write that you cannot tell" clause matters
-        # because most of this deployment's night evidence is infrared and a
-        # distant figure has no visible clothing -- without it, "must describe the
-        # appearance" invites a fabricated outfit.
-        "描述人物时须写明可辨认的外貌（性别、发型、上下身衣着的颜色与款式）；"
-        "看不清就写明看不清，不得补足。"
-        "画面中没有清晰正面面部时，不得推断年龄，改用中性说法"
-        "（一名男子、一名女士或一名人员）。"
-        "描述须交代人物从何处来、往何处去，以及门与电梯的状态变化，动作要连贯。"
-    ),
+    # Read from `prompts/review_six/rules.txt`. The structure-not-a-count rule
+    # that used to be a comment here still holds and is worth keeping in mind
+    # when editing that file: the sheet is 2x3 when no hole is wide enough to
+    # probe and 3x3 when one is, so naming a cell count would be wrong half the
+    # time -- and wrong in the direction that matters, since it would place the
+    # emptied scene three cells early.
+    #
+    # The description-field guidance stays in the same file, after the
+    # classification rules so it cannot be read as one of them: it constrains
+    # prose, not conclusions. The "write that you cannot tell" clause matters
+    # because most of this deployment's night evidence is infrared and a distant
+    # figure has no visible clothing -- without it, "must describe the
+    # appearance" invites a fabricated outfit.
+    template=load_prompt_text("review_six", "rules.txt"),
 )
 
 SCENES: dict[str, Scene] = {scene.mode: scene for scene in (_REVIEW_SIX,)}
@@ -441,3 +510,55 @@ def effective_prompt_version(
         hashlib.sha256(part.encode("utf-8")).hexdigest()[:8] for part in parts
     ]
     return base + "".join(f"-{digest}" for digest in digests)
+
+
+def prompt_version_for(mode: str) -> str:
+    """Return the cache-key version for a scene, derived from its prompt body.
+
+    The digest covers what actually reaches the model for a representative call:
+    the template, the contract and the glossary, in their rendered order. Hashing
+    the rendered text rather than the template alone means a change to any of the
+    three moves the key, which is the property the key exists for.
+
+    Twelve hex characters, prefixed with `p`: long enough that two prompt
+    revisions cannot collide in practice, and inside the `SAFE_ID` alphabet
+    `analysis_key` validates. The prefix keeps a derived version recognisable
+    beside the hand-written ones already stored on existing records -- those are
+    `prompt_6`, and `SafeId` accepts both, so no migration is needed.
+
+    Raises `PromptDataError` for an unregistered mode rather than inventing a
+    version, matching `scene_prompt_version` returning None.
+    """
+    scene = SCENES.get(mode)
+    if scene is None:
+        raise PromptDataError(f"prompt_scene_unregistered:{mode}")
+    rendered = scene.render(
+        SceneRequest(language="zh-CN", allowed=set(scene.classifications))
+    )
+    digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:12]
+    return f"p{digest}"
+
+
+# Populate the glossary first: `Scene.render` reads it through the module global
+# and `_glossary` looks it up at call time, so deriving the version before this
+# line would hash a prompt that has no label definitions in it -- a real ordering
+# bug, caught by the derived version disagreeing with a fresh render.
+#
+# Reuses the same helper the options field uses, so a line copied out of
+# `labels.txt` into a user's own configuration still means the same thing.
+CLASSIFICATION_GLOSSARY = load_scene_labels("review_six")
+
+# The form's prefilled label set: every answer the scene can give, which is a
+# superset of the glossary -- `cleaning`, `home_arrival` and `home_departure`
+# have their conditions in `rules.txt`, so they carry no glossary entry.
+BUILTIN_SCENE_LABELS = load_prefill_labels("review_six")
+
+# The derived base version, bound now that the scene, its glossary and
+# `prompt_version_for` all exist. Every scene shares it because the registry
+# holds one scene; a second scene would need its own derived value on its
+# `Scene`.
+PROMPT_VERSION = prompt_version_for("review_six")
+
+# Bind the derived version onto the registered scene, replacing the placeholder
+# that had to stand in while the scene was being built.
+SCENES["review_six"] = replace(_REVIEW_SIX, prompt_version=PROMPT_VERSION)
