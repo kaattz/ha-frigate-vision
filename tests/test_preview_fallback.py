@@ -395,3 +395,71 @@ class TestOnlyTheMeasuredFailureIsRetried:
             f"recording_gap 不该重试；实际查询了 {client.recording_calls} 次录像，"
             "说明重试范围超过了已测量的那一种失败"
         )
+
+
+class TestAFallbackSaysSoInTheArtifact:
+    """A sheet built by the retry must be identifiable as one.
+
+    Without this, a retried activity is indistinguishable from one where preview was
+    never tried: both record `path_motion` and `recordings`. The fallback would then
+    be unverifiable in production -- which is exactly the position the first version
+    left it in, and the reason this field exists.
+    """
+
+    async def test_the_artifact_records_that_preview_was_retried(
+        self, hass: HomeAssistant, tmp_path: Path
+    ) -> None:
+        client = _preview_client(_hour(), snapshots_collide=True)
+        manager, record = await _build(
+            hass, tmp_path, "review_entry_1_front_retry_flag", client
+        )
+        built = await manager.async_build(record.activity_id)
+        payload = json.loads(
+            Path(built.evidence_path).with_suffix(".json").read_text("utf-8")
+        )
+        assert payload["preview_retry"] is True, (
+            "回退构建必须留下标记，否则无法与「从未尝试预览」区分"
+        )
+
+    async def test_a_direct_preview_build_is_not_marked_as_a_retry(
+        self, hass: HomeAssistant, tmp_path: Path
+    ) -> None:
+        """The flag must mean "the retry ran", not merely "a sheet exists"."""
+        client = _preview_client(_hour(), snapshots_collide=False)
+        manager, record = await _build(
+            hass, tmp_path, "review_entry_1_front_retry_flag_false", client
+        )
+        built = await manager.async_build(record.activity_id)
+        payload = json.loads(
+            Path(built.evidence_path).with_suffix(".json").read_text("utf-8")
+        )
+        assert payload["preview_retry"] is False
+
+    async def test_a_recordings_only_build_is_not_marked_as_a_retry(
+        self, hass: HomeAssistant, tmp_path: Path
+    ) -> None:
+        """Zero regression: a deployment with preview off never sets the flag.
+
+        `preview_candidates=False` is the pre-preview behaviour, so an artifact from
+        it must be byte-comparable to what it produced before -- including this
+        field being False rather than absent.
+        """
+        client = _preview_client(_hour(), snapshots_collide=False)
+        store = ActivityStore(hass, "entry_1")
+        await store.async_load()
+        record = _record("review_entry_1_front_no_preview")
+        await store.async_create(record)
+        manager = MediaManager(
+            hass,
+            store,
+            client,
+            tmp_path,
+            ZoneRoles(frozenset(), frozenset(), frozenset()),
+            preview_candidates=False,
+        )
+        built = await manager.async_build(record.activity_id)
+        payload = json.loads(
+            Path(built.evidence_path).with_suffix(".json").read_text("utf-8")
+        )
+        assert payload["preview_retry"] is False
+        assert payload["candidate_source"] == "recordings"

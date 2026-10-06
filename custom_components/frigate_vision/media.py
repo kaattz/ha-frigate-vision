@@ -1468,6 +1468,10 @@ class MediaManager:
         # `_last_cross_segment_rejected` below and those must belong to exactly one
         # activity at a time. See `async_build`.
         self._build_lock = asyncio.Lock()
+        # Whether the build in progress is the recordings retry that follows a
+        # preview collision. Read when the artifact metadata is written, and reset
+        # at the start of every build -- see `async_build`.
+        self._preview_retry = False
         # The change segments the repairs must stay inside, set per build. Empty
         # means no segment structure is available -- a plan built without the
         # preview analysis -- and the repairs then apply only the neighbour and
@@ -1655,6 +1659,11 @@ class MediaManager:
         lost to a route the code itself calls "an economy, not a dependency".
         """
         async with self._build_lock:
+            # Set before the attempt, so the artifact records which build wrote it.
+            # Reset per build for the same reason `_segments` is: the manager serves
+            # many activities, and a flag left over from one would be attributed to
+            # the next.
+            self._preview_retry = False
             try:
                 return await self._async_build_locked(activity_id)
             except MediaError as exc:
@@ -1677,6 +1686,7 @@ class MediaManager:
                     "rebuilding it from recordings",
                     activity_id,
                 )
+                self._preview_retry = True
                 return await self._async_build_locked(
                     activity_id, allow_preview=False
                 )
@@ -2152,6 +2162,13 @@ class MediaManager:
                         ),
                         "planned_times": list(requested),
                         "sample_times": samples,
+                        # Whether this build is the retry that ran after the preview
+                        # selection produced a duplicate frame. Without it a retried
+                        # activity is indistinguishable from one where preview was
+                        # never tried -- both record `path_motion`/`recordings` -- so
+                        # the fallback could not be confirmed to work in production.
+                        # That is not hypothetical: it is why this field was added.
+                        "preview_retry": self._preview_retry,
                         "infrared_replacements": replacements,
                         "overexposure_replacements": exposure_replacements,
                         "uniqueness_replacements": unique_replacements,
