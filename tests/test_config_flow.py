@@ -2107,3 +2107,73 @@ def test_the_fallback_error_is_translated_where_each_flow_reads_it() -> None:
             missing = sorted(set(_FALLBACK_FIELDS) - set(block))
             assert not missing, f"{name} 的 {path} 缺少标签：{missing}"
 
+
+
+class TestFocusZoneChoicesKeepAStoredSelection:
+    """The focus-zone dropdown must offer Frigate's zones WITHOUT losing saved ones.
+
+    The choices come from a live Frigate query, so they can legitimately be
+    missing: the service is down, the camera was renamed, or a zone was deleted
+    after the user selected it. Dropping a stored name from the choices would make
+    opening the form discard that configuration as a side effect -- the user would
+    see their selection disappear and have no way to know why.
+    """
+
+    def test_frigates_zones_are_offered(self) -> None:
+        from custom_components.frigate_vision.config_flow import _focus_zone_options
+
+        assert _focus_zone_options({}, ["elevator", "home_door"]) == [
+            "elevator",
+            "home_door",
+        ]
+
+    def test_a_saved_zone_is_kept_even_when_frigate_no_longer_lists_it(self) -> None:
+        """The rename/delete case: the stored value survives the form."""
+        from custom_components.frigate_vision.config_flow import _focus_zone_options
+
+        options = _focus_zone_options({"focus_zones": ["old_name"]}, ["home_door"])
+        assert "old_name" in options, "已保存的 zone 名不能因为 Frigate 不再列出就消失"
+        assert "home_door" in options
+
+    def test_a_saved_zone_is_not_duplicated(self) -> None:
+        from custom_components.frigate_vision.config_flow import _focus_zone_options
+
+        options = _focus_zone_options({"focus_zones": ["home_door"]}, ["home_door"])
+        assert options.count("home_door") == 1
+
+    def test_no_zones_anywhere_is_an_empty_choice_list(self) -> None:
+        from custom_components.frigate_vision.config_flow import _focus_zone_options
+
+        assert _focus_zone_options({}, []) == []
+
+    def test_malformed_saved_entries_are_ignored(self) -> None:
+        """A stored value that is not a non-empty string cannot be a zone name."""
+        from custom_components.frigate_vision.config_flow import _focus_zone_options
+
+        options = _focus_zone_options(
+            {"focus_zones": ["home_door", "", None, 7]}, ["elevator"]
+        )
+        assert options == ["home_door", "elevator"]
+
+
+def test_the_focus_zone_field_accepts_many_and_allows_none() -> None:
+    """The selector must be multi-select, or "多个区域" is impossible.
+
+    Checked structurally because the failure is silent: a single-select dropdown
+    would accept the first zone and drop the rest, and every other test here would
+    still pass.
+    """
+    from custom_components.frigate_vision import config_flow
+
+    schema = config_flow._options_schema(focus_zones=["home_door", "elevator"])
+    found = None
+    for marker, value in schema.schema.items():
+        if getattr(marker, "schema", None) == "focus_zones":
+            found = value
+    assert found is not None, "focus_zones 字段必须存在于选项表单"
+    config = found.config
+    assert config["multiple"] is True, "必须可多选，否则只能选一个区域"
+    assert config["options"] == ["home_door", "elevator"]
+    assert config["custom_value"] is True, (
+        "必须允许自定义值，否则 Frigate 里已删除的 zone 会从已保存配置中消失"
+    )

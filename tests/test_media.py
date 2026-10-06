@@ -1762,7 +1762,7 @@ async def test_legacy_image_change_artifact_is_not_kept_as_path_motion(
     assert completed.selection_source == "path_motion"
     assert client.snapshot_calls == 6
     payload = final.with_suffix(".json").read_text()
-    assert '"plan_version": 4' in payload
+    assert '"plan_version": 5' in payload
     assert '"selection_source": "path_motion"' in payload
 
 
@@ -2155,7 +2155,7 @@ async def test_evidence_metadata_records_infrared_replacements(
     )
     completed = await manager.async_build(record.activity_id)
     metadata = (tmp_path / "entry_1" / f"{record.activity_id}.json").read_text()
-    assert '"plan_version": 4' in metadata
+    assert '"plan_version": 5' in metadata
     assert "infrared_replacements" in metadata
     assert "103.2" in metadata
     assert completed.evidence_path is not None
@@ -2260,7 +2260,7 @@ async def test_review_records_uniqueness_replacements(
     completed = await manager.async_build(record.activity_id)
     assert completed.evidence_path is not None
     metadata = (tmp_path / "entry_1" / f"{record.activity_id}.json").read_text()
-    assert '"plan_version": 4' in metadata
+    assert '"plan_version": 5' in metadata
     assert "uniqueness_replacements" in metadata
 
 

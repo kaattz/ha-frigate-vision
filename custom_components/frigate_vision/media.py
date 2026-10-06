@@ -82,6 +82,53 @@ class FrigateMediaClient(Protocol):
         self, event_id: str, camera: str, height: int
     ) -> bytes: ...
 
+    # The preview pair is optional rather than required. A test double that only
+    # implements the four calls above must keep working, and a deployment whose
+    # Frigate predates these routes must keep working too -- so the manager asks
+    # whether the methods exist rather than assuming them, and falls back to the
+    # recording-snapshot path when they do not.
+    async def async_get_preview_frames(
+        self, camera: str, start: float, end: float
+    ) -> tuple[str, ...]: ...
+
+    async def async_get_preview_thumbnail(self, file_name: str) -> bytes: ...
+
+
+# Seconds either side of the person's window that the candidate search may look
+# at. The detector reports a person some way into their approach, so the moment
+# the door opened can sit just before `person_start`; widening the *candidate*
+# window finds it without forcing an extra cell.
+CANDIDATE_PRE_ROLL = 3.0
+CANDIDATE_POST_ROLL = 2.0
+
+# How many preview frames one activity may analyse. Bounds the decode cost: at
+# 320x180 each frame is a few milliseconds in an executor, so 120 is a fraction
+# of a second, and a longer activity is SAMPLED across its window rather than
+# truncated -- see `allocate_budget`.
+PREVIEW_FRAME_BUDGET = 120
+
+# Thresholds the segmenter uses on a preview frame's change score. A proportion
+# of a block's pixels, so the units are comparable across activities and sizes.
+# Calibrated against this deployment's preview frames: a still corridor sits at
+# 0.0 while a moving person reaches 0.4-1.0.
+CHANGE_THRESHOLD = 0.25
+ANCHOR_RESET_THRESHOLD = 0.5
+
+# How many cells a sheet may hold. Six is the layout the prompt describes; nine
+# is used only when the activity genuinely has more distinct change segments than
+# six cells can represent.
+DEFAULT_CELLS = 6
+MAX_CELLS = 9
+
+
+# Seconds between the last tracked person sample and the postroll frame. It has to
+# stay after the person leaves to keep showing the emptied scene, and it is a named
+# constant because `plan_evidence` builds the postroll time in TWO places -- the
+# motion plan and the image-change plan. Written as a literal in both, the two
+# could drift, and a drift would mean the same activity produced a different
+# postroll depending on which selector ran.
+POSTROLL_OFFSET_SECONDS = 2.8
+
 
 def plan_evidence(
     record: ActivityRecord,
@@ -133,7 +180,7 @@ def plan_evidence(
                 mode="review_six",
                 first_time=first,
                 last_time=last,
-                postroll_time=person_end + 2.8,
+                postroll_time=person_end + POSTROLL_OFFSET_SECONDS,
                 selection_source="path_motion",
                 motion_times=selected,
             )
@@ -142,7 +189,7 @@ def plan_evidence(
         first_time=first,
         change_candidates=candidates,
         last_time=last,
-        postroll_time=person_end + 2.8,
+        postroll_time=person_end + POSTROLL_OFFSET_SECONDS,
         selection_source="image_change",
     )
 
@@ -160,6 +207,428 @@ def recordings_cover(
         any(start <= timestamp <= end for start, end in intervals)
         for timestamp in sample_times
     )
+
+
+def select_required_representatives(
+    timestamps: Sequence[float],
+    *,
+    person_start: float,
+    person_end: float,
+) -> tuple[float, ...]:
+    """Return the timestamps a sheet cannot be built without, never empty.
+
+    The coverage guard used to be fed a set filtered by the role names
+    `first`/`last`/`postroll`:
+
+        fixed = {role: result[i] for i, role in enumerate(roles) if role in {...}}
+        if not recordings_cover(tuple(fixed.values()), recordings):
+
+    That filter can produce nothing, and `recordings_cover` is built on `all()`,
+    which is **vacuously true over an empty sequence** -- so the guard silently
+    stopped guarding. Measured directly: `recordings_cover((103.2, 116.8), [...])`
+    is False while `recordings_cover((), [...])` is True.
+
+    Deriving the requirement from the frames themselves instead of from role names
+    makes the empty case unreachable by construction. Two facts fix what is
+    required:
+
+    * The sheet's own extremes are its boundaries -- the latest is the emptied
+      scene, the earliest is where the person appears -- so they must be covered
+      whatever the roles were called.
+    * The extremes *inside the person's window* carry the direction evidence the
+      scene rules rest on, so they are required too when any exist.
+
+    Both together are strictly stronger than the old three-name filter and never
+    empty for a non-empty sequence.
+
+    An empty input is refused rather than answered with an empty tuple. That is
+    the whole point: the defect was an empty requirement being read as "covered",
+    because `all()` over nothing is true. Returning `()` here would leave that
+    trap in place one call away, and a caller-side check cannot be reached from
+    the build path (the plan always mints at least three frames), so it would be
+    untestable dead code. Refusing at the producer makes the trap unreachable and
+    the behaviour directly testable.
+    """
+    if not timestamps:
+        raise MediaError("no_required_frame")
+    ordered = sorted(timestamps)
+    required = {ordered[0], ordered[-1]}
+    inside = [value for value in ordered if person_start <= value <= person_end]
+    if inside:
+        required.add(inside[0])
+        required.add(inside[-1])
+    return tuple(sorted(required))
+
+
+def _required_role(
+    by_role: Mapping[str, tuple[float, Path]], role: str
+) -> tuple[float, Path]:
+    """Return one role's frame, or fail with the vocabulary the runtime knows.
+
+    Indexing `by_role` directly raises `KeyError` when the planner stops minting a
+    role. `runtime.py` catches only `(OSError, FrigateApiError, MediaError)`, so a
+    bare `KeyError` escapes the retry loop and strands the activity at SEALED: no
+    `error_code`, nothing in `ISSUES`, no `last_error`, and the identical failure
+    on every restart. Turning it into a `MediaError` keeps the outcome visible and
+    retryable instead of silent.
+
+    The message names the missing role rather than a number, so a future reader of
+    the error can tell which anchor the sheet needed.
+    """
+    found = by_role.get(role)
+    if found is None:
+        raise MediaError(f"missing_required_role:{role}")
+    return found
+
+
+def allocate_budget(total: int, limit: int) -> tuple[int, ...]:
+    """Choose at most `limit` indices out of `total`, spread across the range.
+
+    Evenly spaced rather than the first N, and that is the whole point of having a
+    budget at all. A long activity whose preview frames are truncated to the first
+    120 would have its evidence drawn entirely from its opening, so the departure
+    -- the moment the scene rules rest on -- would be invisible. Spacing keeps the
+    sampling representative of the whole window.
+
+    Returns every index when the budget is not exceeded, so an activity that fits
+    is analysed at full resolution rather than resampled.
+    """
+    if limit <= 0:
+        return ()
+    if total <= limit:
+        return tuple(range(total))
+    # `limit` points including both ends. Integer arithmetic keeps the spacing
+    # exact, and the last index is pinned so the final frame is never dropped.
+    step = (total - 1) / (limit - 1) if limit > 1 else 0
+    indices = {min(total - 1, round(index * step)) for index in range(limit)}
+    return tuple(sorted(indices))
+
+
+def _preview_frame_time(file_name: str) -> float | None:
+    """Parse the timestamp out of a Frigate preview filename, or None.
+
+    The name is `preview_<camera>-<ts>.webp`, and the camera may itself contain a
+    dash -- this deployment's is `aqara_g5_pro`, but `front-door` is a legal
+    Frigate camera name. So the split is on the LAST dash before the extension
+    rather than the first, and the number is re-parsed rather than trusted as text.
+    """
+    stem = file_name.rsplit("/", 1)[-1]
+    if not stem.startswith("preview_") or "." not in stem:
+        return None
+    body = stem[len("preview_") :].rsplit(".", 1)[0]
+    if "-" not in body:
+        return None
+    _camera, _, raw = body.rpartition("-")
+    try:
+        moment = float(raw)
+    except ValueError:
+        return None
+    return moment if math.isfinite(moment) and moment >= 0 else None
+
+
+def _analyse_preview_frames(
+    frames: Sequence[tuple[float, bytes]],
+    zones: Mapping[str, Sequence[tuple[float, float]]],
+    change_threshold: float,
+    anchor_reset_threshold: float,
+) -> tuple[list[Any], list[Any]] | None:
+    """Decode preview bytes to grayscale and score them. Runs in an executor.
+
+    Deliberately synchronous and free of Home Assistant so it can be handed to
+    `async_add_executor_job`: decoding up to 120 WebP frames is a fraction of a
+    second of CPU that must not happen on the event loop.
+
+    Returns None when too few frames decode to say anything, which the caller
+    reads as "preview could not answer" rather than as "nothing changed".
+    """
+    from .changes import (
+        WHOLE_HEIGHT,
+        WHOLE_WIDTH,
+        analyze_sequence,
+        segment_scored_frames,
+    )
+
+    decoded: list[tuple[float, Any]] = []
+    for moment, data in frames:
+        try:
+            with Image.open(io.BytesIO(data)) as source:
+                source.load()
+                grey = source.convert("L").resize((WHOLE_WIDTH, WHOLE_HEIGHT))
+        except (OSError, UnidentifiedImageError):
+            continue
+        decoded.append((moment, _as_array(grey)))
+    if len(decoded) < 3:
+        return None
+    scored = analyze_sequence(
+        decoded,
+        zones=zones,
+        anchor_reset_threshold=anchor_reset_threshold,
+    )
+    segments = segment_scored_frames(scored, change_threshold=change_threshold)
+    return scored, segments
+
+
+def _as_array(image: Image.Image) -> Any:
+    """Return a Pillow greyscale image as a numpy array.
+
+    Imported here rather than at module scope so this module still imports when
+    numpy is missing: it is declared in `manifest.json`, but a partially installed
+    environment should fail on the one path that needs it rather than at import
+    time for every path.
+    """
+    import numpy as np
+
+    return np.asarray(image, dtype=np.uint8)
+
+
+def choose_cells(
+    scored: Sequence[Any],
+    segments: Sequence[Any],
+    *,
+    plan: EvidencePlan,
+    cells: int,
+    max_cells: int,
+) -> tuple[float, ...]:
+    """Pick the instants the sheet will show, in time order.
+
+    Segment-aware rather than score-ranked. Taking the highest scores would fill
+    the sheet with six consecutive frames of the same opening door, because one
+    event produces a run of high scores. The unit of selection is therefore the
+    segment, and each change segment contributes up to two cells -- where it began
+    and where it was most pronounced -- which is what shows a door both closed and
+    open rather than twice open.
+
+    Priority is not by score alone: a change inside a region the household drew
+    outranks the same amount of change on a blank wall, because that is what
+    configuring a region is for. Remaining cells go to the person's own window,
+    then to the longest still stretches, so a sheet is not all events when the
+    activity had quiet passages worth showing.
+
+    Returns at most `max_cells` timestamps, ascending, trimmed to a whole number of
+    3-column rows. The middle is trimmed rather than either end, because the first
+    cell is where the person appears and the last is the emptied scene -- both are
+    what the prompt's rules read.
+    """
+    if not scored:
+        return ()
+    by_time = {item.timestamp: item for item in scored}
+    change_segments = [segment for segment in segments if segment.kind == "change"]
+    stable_segments = [segment for segment in segments if segment.kind == "stable"]
+
+    def priority(segment: Any) -> tuple[float, float]:
+        members = [
+            by_time[scored[index].timestamp] for index in segment.indices
+        ]
+        best_zone = max((item.best_zone for item in members), default=0.0)
+        best_score = max((item.score for item in members), default=0.0)
+        return (best_zone, best_score)
+
+    chosen: list[float] = []
+
+    def add(moment: float | None) -> None:
+        if moment is not None and moment not in chosen:
+            chosen.append(moment)
+
+    # The two cells the prompt's rules read by name: "第一格是人物首帧，最后一格是
+    # 人物离开后的后置现场". They are reserved BEFORE any change segment is
+    # considered, and that ordering is the fix for a real violation rather than a
+    # tidy-up: a busy activity produces more change segments than cells, the loop
+    # below filled all nine, and the two anchors were then never added at all --
+    # so the sheet the model read had no first frame and no emptied scene, while
+    # the prompt still told it to expect both.
+    #
+    # Reserving them costs nothing on a quiet activity: with fewer events than
+    # cells the anchors were going to be added anyway.
+    anchors: set[float] = {plan.first_time, plan.postroll_time}
+    add(plan.first_time)
+    add(plan.postroll_time)
+    # `last` is not reserved: it sits inside the person's window and a change
+    # segment usually covers it, so reserving it too would spend a cell on a
+    # moment already represented.
+
+    # Change segments may fill the sheet up to `max_cells`; the two anchors above
+    # are already counted in `chosen`, so the room left is simply what remains.
+    # An earlier version also carried a `room_for_changes` term in the loop
+    # condition, computed as `max_cells - len(chosen)` and then added to `cells`
+    # -- which made the bound `len(chosen) >= 13` and therefore dead. It read as
+    # though it limited the segments; it did nothing, and the bound that actually
+    # applied was `max_cells` all along.
+    for segment in sorted(change_segments, key=priority, reverse=True):
+        if len(chosen) >= max_cells:
+            break
+        members = [scored[index] for index in segment.indices]
+        # Where it began...
+        add(min(item.timestamp for item in members))
+        # ...and where it was most pronounced. Which frame that is has to account
+        # for the configured regions, or a change inside a region the household
+        # drew would rank no higher than the same change on a blank wall: the
+        # region ordering above only sorts whole segments, and with one event
+        # there is only one segment to sort. Measured on this deployment's own
+        # zones at preview resolution -- door x 58..170, lift x 132..227 -- a
+        # patch inside one of them scores above 0.4 there and below 0.05 in the
+        # other, so this is the number that distinguishes "the door moved" from
+        # "the lift moved" within one segment.
+        add(max(members, key=lambda item: (item.best_zone, item.score)).timestamp)
+
+    if len(chosen) < cells:
+        add(plan.last_time)
+
+    if len(chosen) < cells:
+        for segment in sorted(stable_segments, key=lambda s: s.span, reverse=True):
+            if len(chosen) >= cells:
+                break
+            add(_segment_middle(scored, segment))
+
+    # Still short of a whole row? Spread the remaining cells evenly across the
+    # analysed frames. A quiet activity can legitimately contain no change segment
+    # at all -- measured on a still corridor, every frame scores 0 -- and the
+    # alternative to filling those cells is a three-cell sheet, which is not a
+    # layout this integration builds. The frames chosen this way are the ones the
+    # preview analysis already decoded, so they cost nothing extra.
+    if len(chosen) < cells and len(scored) > len(chosen):
+        times = [item.timestamp for item in scored]
+        for index in allocate_budget(len(times), cells):
+            if len(chosen) >= cells:
+                break
+            add(times[index])
+
+    # Trim by PRIORITY, not by position. `chosen` is in the order the rules added
+    # it: the strongest change segment first, then weaker ones, then the person's
+    # window, then the still stretches. Dropping from the middle of a
+    # time-sorted list -- which is what this used to do -- discards an arbitrary
+    # cell and can keep a weak segment while removing a strong one, making the
+    # region ordering above decorative. Measured: with five change segments and
+    # nine cells, the region-weighted segment ranked first yet the selection was
+    # byte-identical with and without the region configured.
+    limit = max_cells if len(chosen) > cells else cells
+    if len(chosen) > limit:
+        # Walk the weakest-first and drop until it fits, never touching an anchor.
+        for moment in reversed([item for item in chosen if item not in anchors]):
+            if len(chosen) <= limit:
+                break
+            chosen.remove(moment)
+
+    ordered = sorted(chosen)
+    # A sheet must hold a whole number of 3-column rows. The anchors are protected
+    # above, so this only ever removes a middle cell.
+    while len(ordered) > 3 and len(ordered) % 3:
+        removable = [
+            value for value in ordered[len(ordered) // 2 :] if value not in anchors
+        ]
+        if not removable:
+            removable = [
+                value for value in ordered if value not in anchors
+            ]
+        if not removable:
+            break
+        ordered.remove(removable[0])
+    return tuple(ordered)
+
+
+def assert_cells_describe_the_person(
+    cells: Sequence[float],
+    *,
+    person_start: float,
+    person_end: float,
+    departure: float,
+) -> None:
+    """Refuse a sheet that cannot support the scene rules, with a stable code.
+
+    The prompt tells the model what the ends of the sheet are, and the arrival and
+    departure rules are read from them. Two properties therefore have to hold for
+    ANY selection, and neither is guaranteed by construction:
+
+    * at least one cell inside the person's window -- without it the sheet shows
+      no person at all, so "did they come or go" has no evidence in the image;
+    * at least one cell at or after the departure -- the emptied scene, which is
+      what distinguishes "left" from "still here".
+
+    A selection that violates either would still be a valid JPEG of six real
+    frames, so nothing downstream would complain: the model would simply be asked
+    a question its evidence cannot answer, and the answer would be a guess that
+    looks like every other result. Failing here keeps that visible as a stable
+    error code rather than as a confident wrong answer.
+
+    The departure test is against `departure` ALONE. An earlier version read
+    `value >= departure or value >= person_end`, and since every planner sets
+    `departure = person_end + 2.8`, the second clause was always true whenever the
+    first was -- so the check could never fire. Measured: three selections with
+    departures 2.8 s apart all produced the same verdict. That is the shape of a
+    guard that looks present and does nothing.
+    """
+    if not cells:
+        raise MediaError("no_person_frame")
+    inside = [value for value in cells if person_start <= value <= person_end]
+    if not inside:
+        raise MediaError("no_person_frame")
+    if not any(value >= departure for value in cells):
+        raise MediaError("no_departure_frame")
+
+
+def _segment_middle(scored: Sequence[Any], segment: Any) -> float | None:
+    """The middle frame of a segment, or None when it holds none."""
+    members = [scored[index] for index in segment.indices if index < len(scored)]
+    if not members:
+        return None
+    return float(members[len(members) // 2].timestamp)
+
+
+def segment_bounds_for(
+    segments: Sequence[Any], moment: float
+) -> tuple[float, float] | None:
+    """The time bounds of the segment containing `moment`, or None.
+
+    Used to keep a repair inside the moment it was chosen for. A replacement that
+    moves a frame into a different segment is not a repair at all: it changes what
+    the cell depicts. Measured on this deployment, the night-vision ladder walks up
+    to five seconds and accepts the first frame that is not infrared -- so a cell
+    showing a door opening could be replaced by one showing the person crouching
+    five seconds later, and every downstream check would still pass.
+    """
+    for segment in segments:
+        if segment.start <= moment <= segment.end:
+            return (float(segment.start), float(segment.end))
+    return None
+
+
+def within_segment(
+    candidate: float, original: float, segments: Sequence[Any]
+) -> bool:
+    """Whether `candidate` stays inside the segment that contains `original`.
+
+    Returns True when no segment structure is available, which is the case for a
+    plan built without the preview analysis. That keeps the constraint from
+    becoming a silent no-op that also blocks repairs: with nothing to compare
+    against, the existing neighbour and coverage rules are all that can be
+    applied, and those are what ran before this existed.
+    """
+    bounds = segment_bounds_for(segments, original)
+    if bounds is None:
+        return True
+    return bounds[0] <= candidate <= bounds[1]
+
+
+def _roles_for_preview(times: Sequence[float]) -> tuple[str, ...]:
+    """Name the preview selection's cells by the two anchors, then `change`.
+
+    The role names survive only for the frames whose MEANING is positional: the
+    opener is where the person appears and the last is the emptied scene, and the
+    prompt's rules read both. Everything between is a change cell, which is what
+    the sheet's middle has always been called.
+
+    This narrows the old three-name scheme rather than extending it. Those names
+    described a *plan* -- first, three motions, last, postroll -- and this one
+    describes a *selection*, so it only labels the two ends it can guarantee.
+    """
+    ordered = sorted(times)
+    if not ordered:
+        return ()
+    if len(ordered) == 1:
+        return ("first",)
+    roles = ["change"] * len(ordered)
+    roles[0] = "first"
+    roles[-1] = "postroll"
+    return tuple(roles)
 
 
 def select_review_change_frames(
@@ -201,36 +670,6 @@ def select_review_change_frames(
         # change to build evidence from. Distinct from having too few frames.
         raise MediaError("insufficient_visible_change")
     return [(timestamp, path) for _, timestamp, path, _ in selected]
-
-
-def _change_scores(
-    frames: Sequence[tuple[float, Path]],
-) -> list[tuple[float, float]]:
-    """Score each frame by how much it differs from its predecessor.
-
-    The same measure the fallback selector uses, applied to a probed stretch
-    rather than to a whole review: a probe is worth taking where the picture
-    changed, and that is what this reports. The first frame has no predecessor
-    and is scored against the second, so every probe carries a number and none
-    is silently dropped for being first.
-
-    Returns (timestamp, score) in the order given. An unreadable frame is
-    skipped rather than failing the activity -- probing is an improvement
-    attempt, and the caller keeps its original picks if this yields nothing.
-    """
-    scored: list[tuple[float, float]] = []
-    previous: Image.Image | None = None
-    try:
-        for timestamp, path in frames:
-            current = _grayscale_signature(path)
-            if previous is None:
-                previous = current
-                continue
-            scored.append((timestamp, _mean_difference(previous, current)))
-            previous = current
-    except MediaError:
-        return []
-    return scored
 
 
 def pair_times_with_roles(
@@ -751,10 +1190,6 @@ MAX_SAMPLE_GAP = 12.0
 # selector uses, and only the best-scoring ones can displace a motion pick.
 GAP_PROBE_COUNT = 3
 
-# Seconds between the last tracked person sample and the postroll frame. The
-# postroll frame must stay after this point to keep showing the emptied scene.
-POSTROLL_OFFSET_SECONDS = 2.8
-
 # Padding added around the person box when cropping a close-up, as a fraction of
 # the box's own width and height. A tight box cuts off heads, hands and carried
 # objects -- the very things the close-up exists to show -- so the crop reaches
@@ -1007,6 +1442,8 @@ class MediaManager:
         person_highlight: bool = False,
         target_width: int = 768,
         face_service_url: str = "",
+        focus_zones: Mapping[str, Sequence[tuple[float, float]]] = {},
+        preview_candidates: bool = True,
     ) -> None:
         self._hass = hass
         self._store = store
@@ -1018,7 +1455,26 @@ class MediaManager:
         # Empty by default, and empty keeps the close-up on the largest-box rule
         # alone -- the behaviour that exists today.
         self._face_service_url = face_service_url
-        self._locks: dict[str, asyncio.Lock] = {}
+        # Frigate zone polygons, keyed by name. Empty means the change analysis
+        # runs on the whole frame alone, which is the behaviour that exists before
+        # anyone configures a region -- so the default changes nothing.
+        self._focus_zones = dict(focus_zones)
+        # Whether to filter candidates through Frigate's cached preview frames.
+        # On by default, and it degrades rather than failing: every path that
+        # cannot use preview falls back to the recording-snapshot plan, which is
+        # the only behaviour that existed before.
+        self._preview_candidates = preview_candidates
+        # One lock for the whole manager, because a build mutates `_segments` and
+        # `_last_cross_segment_rejected` below and those must belong to exactly one
+        # activity at a time. See `async_build`.
+        self._build_lock = asyncio.Lock()
+        # The change segments the repairs must stay inside, set per build. Empty
+        # means no segment structure is available -- a plan built without the
+        # preview analysis -- and the repairs then apply only the neighbour and
+        # coverage rules that existed before.
+        self._segments: list[Any] = []
+        # Refusals collected by the most recent repair pass, for the metadata.
+        self._last_cross_segment_rejected: list[dict[str, Any]] = []
 
     async def _async_person_highlight(
         self,
@@ -1171,11 +1627,37 @@ class MediaManager:
         return None
 
     async def async_build(self, activity_id: str) -> ActivityRecord:
-        lock = self._locks.setdefault(activity_id, asyncio.Lock())
-        async with lock:
+        """Build one activity's evidence, one activity at a time.
+
+        The lock is GLOBAL, not per activity, and that is a correctness
+        requirement rather than a simplicity preference. `_segments` and
+        `_last_cross_segment_rejected` are instance state: the first constrains
+        which repairs are allowed, the second records what was refused. Both are
+        set while one activity is being built and read by the repair passes of
+        that same build.
+
+        `_schedule_media` gives every activity its own background task, so two
+        builds really do overlap -- verified: `media_tasks[activity_id] = task`
+        per record, and the per-activity lock it used to take only serialized
+        repeats of the SAME activity. Under the old per-activity lock, activity B
+        could set `_segments` for its own moments while activity A was midway
+        through its repairs, and A would then refuse a legitimate replacement (or
+        accept a wrong one) with nothing in the logs to explain it.
+
+        Serializing costs nothing measurable here: builds are dominated by HTTP
+        round trips to Frigate, the queue in front of them is already bounded, and
+        a single household camera produces activities minutes apart.
+        """
+        async with self._build_lock:
             return await self._async_build_locked(activity_id)
 
     async def _async_build_locked(self, activity_id: str) -> ActivityRecord:
+        # Reset per build, before any guard can return early. A structure left
+        # over from the previous activity would constrain this one's repairs to
+        # the wrong moments -- a silent corruption that no single-activity test
+        # could see.
+        self._segments = []
+        self._last_cross_segment_rejected = []
         record = self._store.get(activity_id)
         if record is None:
             raise MediaError("activity_missing")
@@ -1249,16 +1731,49 @@ class MediaManager:
         )
         if recovered is not None:
             mode, samples, stored_source = recovered
-            if plan.motion_times:
+            if stored_source == "preview_change":
+                # An artifact this integration built from the preview route. Its
+                # stored times are the RESULT of a change analysis, so they cannot
+                # be re-derived by comparing against a freshly planned set -- and
+                # they must not be, or every restart would discard a perfectly good
+                # sheet. What identifies it as usable is that it is ours, holds a
+                # whole number of 3-column rows, and is strictly increasing.
+                #
+                # Measured before this branch existed: the motion test below
+                # required `stored_source == "path_motion"`, which a preview
+                # artifact never satisfies, so `valid` was always False and every
+                # restart deleted and rebuilt every preview sheet. That cost one
+                # HTTP round trip per analysed frame on every restart, and it
+                # failed outright once Frigate had purged the recordings the
+                # rebuild needs -- the default media retention is 7 days, longer
+                # than many deployments keep recordings.
+                valid = (
+                    mode == plan.mode
+                    and len(samples) > 0
+                    and len(samples) % 3 == 0
+                    and tuple(sorted(set(samples))) == samples
+                )
+            elif plan.motion_times:
                 # A plan_version 3 artifact may have substituted an IR frame for
                 # a neighbouring colour one, so the stored times can legitimately
                 # differ from the freshly planned ones. Accept any set that keeps
-                # the mode, source, frame count and ordering intact; otherwise
-                # every restart would rebuild identical evidence.
+                # the mode, source, ordering and a whole number of rows intact;
+                # otherwise every restart would rebuild identical evidence.
+                #
+                # The count is `% 3`, not `== 6`. The motion plan produces six
+                # cells, but the same build ADDS three probes when it finds a hole
+                # wide enough (`pair_times_with_roles`), and the artifact records
+                # all nine. Pinning six meant a probed artifact was judged invalid
+                # and deleted on every restart -- one HTTP round trip per frame,
+                # again, and a hard failure once Frigate had purged the recordings
+                # the rebuild needs. That is the same defect the preview branch
+                # above had, from the same cause: a reuse test that pins a shape
+                # only one of the two builds produces.
                 valid = (
                     mode == plan.mode
                     and stored_source == "path_motion"
-                    and len(samples) == 6
+                    and len(samples) > 0
+                    and len(samples) % 3 == 0
                     and tuple(sorted(set(samples))) == samples
                 )
             else:
@@ -1271,7 +1786,38 @@ class MediaManager:
 
         times: tuple[float, ...]
         roles: tuple[str, ...]
-        if plan.motion_times:
+        preview_meta: dict[str, Any] = {}
+        # Whether the timestamps came from the preview analysis rather than from a
+        # plan. The difference matters downstream: a plan's frames are split into
+        # required anchors and droppable change candidates, while a preview
+        # selection has already been chosen and every one of its frames is wanted.
+        # An explicit flag rather than a truthiness test on `preview_meta`, so a
+        # future caller cannot flip the branch by passing an empty dict.
+        from_preview = False
+        # Try the preview route first. It reads cached 320x180 frames instead of
+        # making Frigate seek a recording and run ffmpeg per instant, and it sees
+        # the whole activity rather than the three motion peaks the path data
+        # yields -- so a door opening while the person stands still can be found.
+        #
+        # It returns None for every reason it cannot answer, and the plan below is
+        # what runs then, unchanged. That is deliberate: preview is an economy,
+        # not a dependency, and a deployment without it must behave exactly as it
+        # did before.
+        preview = await self._async_preview_timestamps(
+            record,
+            plan,
+            (plan.first_time, plan.postroll_time),
+        )
+        if preview is not None:
+            preview_times, preview_meta = preview
+            times = preview_times
+            from_preview = True
+            # The role names keep the two anchors the prompt's rules read: the
+            # first cell is where the person appears and the last is the emptied
+            # scene. Everything between them is a change cell, which is what the
+            # sheet's middle has always been.
+            roles = _roles_for_preview(preview_times)
+        elif plan.motion_times:
             times = (
                 plan.first_time,
                 *plan.motion_times,
@@ -1327,7 +1873,12 @@ class MediaManager:
         # motion picks measured 16.4s worst gap against 11.5s for probed ones.
         # The probes are fetched into their own directory because the main
         # temporary directory is created further down.
-        if plan.motion_times:
+        #
+        # Skipped when the preview route already chose the cells: that selection
+        # was made from actual pixel change across the whole activity, so probing
+        # for gaps in a plan is both unnecessary and would push the sheet past the
+        # cell count the preview analysis decided on.
+        if plan.motion_times and not from_preview:
             probe_dir = Path(
                 await self._hass.async_add_executor_job(
                     partial(tempfile.mkdtemp, dir=self._root)
@@ -1354,13 +1905,24 @@ class MediaManager:
         # The person window is passed so `first` cannot be nudged back to before the
         # person arrived and `last` cannot be pushed past their departure; see
         # `_nudge_uncovered_frames`.
-        requested, fixed, nudges = self._nudge_uncovered_frames(
+        requested, _fixed, nudges = self._nudge_uncovered_frames(
             roles,
             requested,
             recordings,
             (plan.first_time, plan.last_time),
         )
-        if not recordings_cover(tuple(fixed.values()), recordings):
+        # The required set is derived from the frames themselves, NOT from the role
+        # names. `_nudge_uncovered_frames` still returns `fixed` keyed by role, but
+        # feeding that to `recordings_cover` is the defect this replaces: the filter
+        # can yield nothing, and `all()` over nothing is true, so the guard would
+        # stop guarding in silence. See `select_required_representatives`, which
+        # refuses an empty input rather than handing back an empty requirement.
+        required = select_required_representatives(
+            requested,
+            person_start=plan.first_time,
+            person_end=plan.last_time,
+        )
+        if not recordings_cover(required, recordings):
             raise MediaError("recording_gap")
         # No `mkdir` here: the root was created before the probe directory, which is
         # the first temporary directory this build makes. Creating it twice would hide
@@ -1391,7 +1953,7 @@ class MediaManager:
                 await self._hass.async_add_executor_job(path.write_bytes, data)
                 candidates.append((timestamp, path))
                 candidate_roles.append(roles[index])
-            if plan.sample_times or plan.motion_times:
+            if from_preview or plan.sample_times or plan.motion_times:
                 selected = candidates
                 # A frame the sheet cannot do without was dropped by a recording hole.
                 #
@@ -1441,7 +2003,17 @@ class MediaManager:
                     for item, role in zip(candidates, candidate_roles, strict=True)
                     if role != "change"
                 }
-                anchor = by_role["first"]
+                # `by_role[...]` used to be indexed by the literal role names, which
+                # made the sheet depend on the planner continuing to mint them. When
+                # one is absent the lookup raises `KeyError`, and the runtime catches
+                # only `(OSError, FrigateApiError, MediaError)` -- so the activity
+                # would stop at SEALED with no error code, no Repair and no
+                # `last_error`, and the same build would fail again after every
+                # restart. A missing anchor is a planner problem, so it is reported
+                # as one, in the vocabulary the runtime already understands.
+                anchor = _required_role(by_role, "first")
+                last_frame = _required_role(by_role, "last")
+                postroll_frame = _required_role(by_role, "postroll")
                 changes = await self._hass.async_add_executor_job(
                     select_review_change_frames,
                     [anchor, *change_space],
@@ -1449,20 +2021,26 @@ class MediaManager:
                 selected = [
                     anchor,
                     *changes,
-                    by_role["last"],
-                    by_role["postroll"],
+                    last_frame,
+                    postroll_frame,
                 ]
+            # Each repair pass resets the refusal list, so it is collected after
+            # every one of them: a frame the IR ladder refused and then the
+            # uniqueness ladder refused as well is two facts, not one.
             selected, replacements = await self._async_replace_infrared(
                 record.camera, temporary, selected, recordings
             )
+            cross_segment_rejected = list(self._last_cross_segment_rejected)
             # After the night-vision repair, so a frame that is both IR and blown
             # is judged on its final form rather than repaired twice.
             selected, exposure_replacements = await self._async_replace_overexposed(
                 record.camera, temporary, selected, recordings
             )
+            cross_segment_rejected += self._last_cross_segment_rejected
             selected, unique_replacements = await self._async_replace_duplicates(
                 record.camera, temporary, selected, recordings
             )
+            cross_segment_rejected += self._last_cross_segment_rejected
             samples = tuple(timestamp for timestamp, _ in selected)
             if tuple(sorted(set(samples))) != samples:
                 raise MediaError("invalid_sample_order")
@@ -1475,6 +2053,19 @@ class MediaManager:
             # cropping there would re-shrink the very pixels this exists to keep.
             highlight = await self._async_person_highlight(
                 record, selected, temporary, highlight_sources
+            )
+            # One value, used for BOTH the artifact and the record. They must not
+            # be computed separately: an earlier version wrote `preview_change`
+            # into the artifact while handing `_complete` the plan's own
+            # `path_motion`, and the whitelist in `models.py` did not accept
+            # `preview_change` yet. The stored string came back on the next
+            # restart, `dataclasses.replace` rejected it, and the
+            # `ModelValidationError` -- a `ValueError`, which the runtime does not
+            # catch -- escaped as an unhandled task error with no FAILED stage and
+            # no Repair card. Deriving both from this one binding makes the two
+            # impossible to disagree.
+            selection_source = (
+                "preview_change" if from_preview else plan.selection_source
             )
             # Only the close-up branch passes `target_width`, and that asymmetry is
             # deliberate: the sheet on disk is the copy a person opens from the
@@ -1507,15 +2098,31 @@ class MediaManager:
                 json.dumps(
                     {
                         "activity_id": record.activity_id,
-                        "plan_version": 4,
+                        # 5: the candidate source, the segment structure and the
+                        # cross-segment refusals are recorded. Bumped rather than
+                        # added silently so a reader can tell which fields to
+                        # expect -- and `_read_existing` accepts 1 through 5, so
+                        # artifacts written before this still restore.
+                        "plan_version": 5,
                         "mode": plan.mode,
-                        "selection_source": plan.selection_source,
+                        "selection_source": selection_source,
+                        "candidate_source": (
+                            "preview" if from_preview else "recordings"
+                        ),
                         "planned_times": list(requested),
                         "sample_times": samples,
                         "infrared_replacements": replacements,
                         "overexposure_replacements": exposure_replacements,
                         "uniqueness_replacements": unique_replacements,
                         "recording_nudges": nudges,
+                        # Why a repair left an unusable frame alone although a
+                        # better-looking neighbour existed. Without this the
+                        # record looks like the ladder found nothing, which is a
+                        # different fact.
+                        "cross_segment_rejected": cross_segment_rejected,
+                        # How the preview route was used, when it was. Empty
+                        # object means the recording plan ran instead.
+                        **preview_meta,
                     }
                 ),
                 "utf-8",
@@ -1528,7 +2135,7 @@ class MediaManager:
         finally:
             await self._hass.async_add_executor_job(shutil.rmtree, temporary, True)
         return await self._complete(
-            record, final, plan.mode, samples, plan.selection_source
+            record, final, plan.mode, samples, selection_source
         )
 
     @staticmethod
@@ -1615,6 +2222,130 @@ class MediaManager:
         }
         return tuple(result), fixed, nudges
 
+    async def _async_preview_timestamps(
+        self,
+        record: ActivityRecord,
+        plan: EvidencePlan,
+        window: tuple[float, float],
+    ) -> tuple[tuple[float, ...], dict[str, Any]] | None:
+        """Pick cell timestamps from Frigate's cached preview frames, or None.
+
+        The economy this exists for: a preview frame is a 320x180 WebP read off
+        disk, while a recording snapshot makes Frigate seek a recording and run
+        ffmpeg for one frame. Measured on this deployment, the thumbnail answers in
+        43 ms against 190 ms for the same-size recording frame -- 4.4x -- and the
+        list call returns every cached filename in one request, so the whole
+        activity can be surveyed for one round trip plus one fetch per frame
+        analysed.
+
+        Returns None -- never raises -- whenever preview cannot answer: the routes
+        are absent, the window crosses the hour boundary Frigate clears at, the
+        list is empty, or nothing decodes. Every one of those falls back to the
+        recording-snapshot plan, which is the behaviour that existed before, so a
+        deployment with no preview support is unaffected.
+
+        The returned timestamps are chosen from *change*, not from the person's
+        path: a door opening while the person stands still moves no path point at
+        all, and that is the moment the sheet most needs.
+        """
+        if not self._preview_candidates:
+            return None
+        get_frames = getattr(self._client, "async_get_preview_frames", None)
+        get_thumb = getattr(self._client, "async_get_preview_thumbnail", None)
+        if get_frames is None or get_thumb is None:
+            return None
+
+        # Frigate clears an hour's frames when the hour rolls over, so a window
+        # reaching back past the current hour can only be served in part. Asking
+        # anyway would silently analyse a truncated activity, so the whole window
+        # falls back instead -- see the spec's `preview_expired`.
+        start = min(window[0], plan.first_time) - CANDIDATE_PRE_ROLL
+        end = max(window[1], plan.postroll_time) + CANDIDATE_POST_ROLL
+        if int(start // 3600) != int(time.time() // 3600):
+            return None
+
+        try:
+            names = await get_frames(record.camera, start, end)
+        except Exception:  # noqa: BLE001 - preview is an optimisation, never a gate
+            return None
+        if not names:
+            return None
+
+        # The timestamp comes from the name, not from an assumed frame interval:
+        # measured here, the cadence is 1.1 s while something moves and 30 s while
+        # nothing does, so assuming a step would place every frame wrongly.
+        parsed: list[tuple[float, str]] = []
+        for name in names:
+            moment = _preview_frame_time(name)
+            if moment is not None:
+                parsed.append((moment, name))
+        if len(parsed) < 3:
+            return None
+        parsed.sort()
+
+        kept = allocate_budget(len(parsed), PREVIEW_FRAME_BUDGET)
+        selected_names = [parsed[index] for index in kept]
+
+        frames: list[tuple[float, Any]] = []
+        for moment, name in selected_names:
+            try:
+                data = await get_thumb(name)
+            except Exception:  # noqa: BLE001 - one missing frame is not fatal
+                continue
+            frames.append((moment, data))
+        if len(frames) < 3:
+            return None
+
+        analysed = await self._hass.async_add_executor_job(
+            partial(
+                _analyse_preview_frames,
+                frames,
+                self._focus_zones,
+                CHANGE_THRESHOLD,
+                ANCHOR_RESET_THRESHOLD,
+            )
+        )
+        if not analysed:
+            return None
+        scored, segments = analysed
+
+        chosen = choose_cells(
+            scored,
+            segments,
+            plan=plan,
+            cells=DEFAULT_CELLS,
+            max_cells=MAX_CELLS,
+        )
+        if not chosen:
+            return None
+        # The selection has to be able to answer the question the prompt asks.
+        # Checked here rather than in `choose_cells` because the person's window
+        # belongs to the plan, and a selection that cannot describe the person is
+        # a property of THIS activity rather than of the chooser.
+        assert_cells_describe_the_person(
+            chosen,
+            person_start=plan.first_time,
+            person_end=plan.last_time,
+            departure=plan.postroll_time,
+        )
+        names_by_time = {moment: name for moment, name in selected_names}
+        # Publish the segment structure so the repairs can keep a replacement
+        # inside the moment its frame was chosen for. Set here rather than passed
+        # down, because the three repair passes are called from the build with a
+        # signature that predates this and adding a parameter to each would touch
+        # every existing test for no benefit.
+        self._segments = list(segments)
+        return chosen, {
+            "preview_frame_count": len(parsed),
+            "preview_analysed": len(frames),
+            "preview_budget_applied": len(kept) < len(parsed),
+            "segment_count": len(segments),
+            "change_segments": sum(1 for s in segments if s.kind == "change"),
+            "preview_names": [
+                names_by_time.get(moment, "") for moment in chosen
+            ],
+        }
+
     async def _async_probe_widest_gap(
         self,
         camera: str,
@@ -1698,27 +2429,13 @@ class MediaManager:
                 continue
         return intervals
 
-    @staticmethod
-    def _required_times(
-        plan: EvidencePlan, requested: Sequence[float]
-    ) -> tuple[float, ...]:
-        """Return the timestamps the sheet cannot be built without.
-
-        `first` and `last`/`postroll` are derived from the person window and
-        always appear in the sheet; the change candidates do not, so a hole
-        under one of them is recoverable. `sample_times` and `motion_times`
-        are themselves the final selection and are all required.
-        """
-        if plan.sample_times:
-            return plan.sample_times
-        if plan.motion_times:
-            return (
-                plan.first_time,
-                *plan.motion_times,
-                plan.last_time,
-                plan.postroll_time,
-            )
-        return (plan.first_time, plan.last_time, plan.postroll_time)
+    # `_required_times` used to sit here: a static helper returning the
+    # timestamps a sheet could not be built without, by filtering the plan's
+    # roles. It was never called -- `_nudge_uncovered_frames` derives the same set
+    # from the roles it is already given, and `select_required_representatives`
+    # now owns the job with the property that actually matters (never empty).
+    # Removed rather than left, because a function that describes the required
+    # frames invites the next reader to change it believing it decides something.
 
     async def _async_retry_frames(
         self,
@@ -1731,6 +2448,7 @@ class MediaManager:
         tag: str,
         needed: Callable[[int, Path, list[tuple[float, Path]]], bool],
         acceptable: Callable[[Path, int, list[tuple[float, Path]]], bool],
+        segments: Sequence[Any] = (),
     ) -> tuple[list[tuple[float, Path]], list[dict[str, Any]]]:
         """Re-fetch frames that fail `needed`, accepting the first good neighbour.
 
@@ -1739,6 +2457,16 @@ class MediaManager:
         passes. Each candidate must stay strictly between its neighbours so the
         sheet keeps increasing timestamps, must not reuse a taken timestamp, and
         must fall inside the recording coverage.
+
+        `segments`, when given, adds one more rule: a replacement must stay inside
+        the change segment its original frame belongs to. Without it the ladder is
+        bounded only by the neighbours, so a frame could be moved five seconds --
+        into a different moment of the activity entirely. The cell would still be
+        a real frame, still unique, still colour rather than infrared, and every
+        existing check would pass, while the sheet no longer showed the event the
+        cell was chosen for. A rejected candidate is recorded under
+        `cross_segment_rejected` so the metadata says why a frame stayed unusable
+        when a better-looking neighbour existed.
 
         A frame with no acceptable alternative is left in place; the caller
         decides what that means (the IR repair keeps it, the uniqueness repair
@@ -1754,6 +2482,7 @@ class MediaManager:
         result = list(selected)
         taken = {timestamp for timestamp, _ in selected}
         replacements: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
 
         # Process from the last frame backwards. Each frame's forward bound is
         # its successor's *current* position, so resolving the successor first
@@ -1783,6 +2512,20 @@ class MediaManager:
                 if not lower < candidate < upper or candidate in taken:
                     continue
                 if not any(start <= candidate <= end for start, end in covered):
+                    continue
+                # The candidate must depict the same moment. Checked before the
+                # fetch, so a refusal costs no HTTP request.
+                if not within_segment(candidate, timestamp, segments):
+                    rejected.append(
+                        {
+                            "index": index,
+                            "from": round(timestamp, 3),
+                            "to": round(candidate, 3),
+                            "offset": offset,
+                            "reason": tag,
+                            "code": "cross_segment_rejected",
+                        }
+                    )
                     continue
                 try:
                     data = await self._client.async_get_snapshot(camera, candidate, 360)
@@ -1823,6 +2566,11 @@ class MediaManager:
                 break
 
         result.sort(key=lambda item: item[0])
+        # The refusals travel back alongside the replacements so the metadata can
+        # show a frame that stayed unusable although a better-looking neighbour
+        # existed -- otherwise the record would look like the ladder simply found
+        # nothing.
+        self._last_cross_segment_rejected = rejected
         return result, replacements
 
     @staticmethod
@@ -1882,6 +2630,7 @@ class MediaManager:
             tag="ir",
             needed=lambda _index, path, _result: frame_is_infrared(path),
             acceptable=lambda path, _index, _result: not frame_is_infrared(path),
+            segments=self._segments,
         )
 
     async def _async_replace_overexposed(
@@ -1919,6 +2668,7 @@ class MediaManager:
             acceptable=lambda path, _index, _result: (
                 not frame_is_overexposed(path) and not frame_is_infrared(path)
             ),
+            segments=self._segments,
         )
 
     async def _async_replace_duplicates(
@@ -1986,6 +2736,7 @@ class MediaManager:
             tag="uniq",
             needed=collides,
             acceptable=acceptable,
+            segments=self._segments,
         )
 
     def _canonical_path(self, record: ActivityRecord) -> Path:
@@ -2287,7 +3038,7 @@ def _read_existing(
             return None
         if payload.get("activity_id") != activity_id or payload.get(
             "plan_version"
-        ) not in {1, 2, 3, 4}:
+        ) not in {1, 2, 3, 4, 5}:
             return None
         mode = str(payload["mode"])
         source_value = payload.get("selection_source")

@@ -388,6 +388,22 @@ class ActivityRecord:
             "path_motion",
             "image_change",
             "zone_anchor",
+            # Chosen from Frigate's cached preview frames rather than from the
+            # person's tracked path. Added when the preview route landed: the
+            # media builder began writing this value into the artifact while this
+            # whitelist still refused it, so the FIRST build stored a string the
+            # model would not accept back.
+            #
+            # The failure that caused is worth recording, because it was silent.
+            # `_read_existing` hands the stored value straight to `_complete` on
+            # restart, `dataclasses.replace` validates it, and the resulting
+            # `ModelValidationError` is a `ValueError` -- which `runtime.py`
+            # catches only as `(OSError, FrigateApiError, MediaError)`. So it
+            # escaped as an unhandled task error: the activity never reached
+            # FAILED, no Repair card appeared, and the same build failed again
+            # after every restart. The test suite was green throughout, because
+            # the assertion that covered this path pinned the wrong value.
+            "preview_change",
         }:
             raise ModelValidationError("invalid_selection_source")
         if self.evidence_expired_at is not None and (

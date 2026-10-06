@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -110,6 +110,52 @@ def build_recovery_work(
             continue
         work.append(RecoveryWork(record.activity_id, action, run_at))
     return tuple(work)
+
+
+async def _async_resolve_focus_zones(
+    client: FrigateClient,
+    frigate_data: Mapping[str, Any],
+    names: Sequence[str],
+) -> dict[str, tuple[tuple[float, float], ...]]:
+    """Turn configured zone NAMES into polygons, dropping any that are gone.
+
+    The names are what the household picks; the coordinates live in Frigate, which
+    is the whole point of reading them rather than asking for them twice. So this
+    is the one place the two are joined, at setup, rather than on every activity.
+
+    Never raises and never blocks setup. A zone deleted in Frigate, a camera
+    renamed, or a Frigate that is briefly unreachable all mean one region is not
+    used -- and the analysis then runs on the whole frame, which is the behaviour
+    that exists before anyone configures a region. Refusing to start over a
+    missing region would turn a cosmetic mismatch into an outage.
+    """
+    if not names:
+        return {}
+    camera = str(frigate_data.get("camera", ""))
+    if not camera:
+        return {}
+    try:
+        available = await client.async_get_camera_zones(camera)
+    except Exception:  # noqa: BLE001 - a zone lookup must not block setup
+        _LOGGER.warning(
+            "Could not read the camera's zones; the focus regions will not be used"
+        )
+        return {}
+    resolved: dict[str, tuple[tuple[float, float], ...]] = {}
+    for name in names:
+        polygon = available.get(name)
+        if polygon:
+            resolved[name] = polygon
+        else:
+            # Named but not found: logged rather than raised, because the
+            # household most likely renamed or deleted it in Frigate and the rest
+            # of the configuration is still perfectly usable.
+            _LOGGER.warning(
+                "Focus zone %r is not defined for camera %r; ignoring it",
+                name,
+                camera,
+            )
+    return resolved
 
 
 class EntryRuntime[MessageT]:
@@ -348,6 +394,9 @@ class IntegrationRuntime:
                 )
                 media_root = await async_default_media_root(hass)
                 media_config = vision_config_from(entry.data, dict(entry.options))
+                focus_zones = await _async_resolve_focus_zones(
+                    client, frigate_data, media_config.focus_zones
+                )
                 runtime.media_manager = MediaManager(
                     hass,
                     store,
@@ -357,6 +406,7 @@ class IntegrationRuntime:
                     person_highlight=media_config.person_highlight,
                     target_width=media_config.target_width,
                     face_service_url=media_config.face_service_url,
+                    focus_zones=focus_zones,
                 )
                 await runtime.media_manager.async_restore_registry()
                 await runtime.media_manager.async_cleanup(

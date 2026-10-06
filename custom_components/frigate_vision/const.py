@@ -18,6 +18,23 @@ CONF_NEAR_ZONES = "near_zones"
 CONF_TRANSITION_ZONES = "transition_zones"
 CONF_FAR_ZONES = "far_zones"
 
+# Zones whose change is worth an extra evidence cell.
+#
+# Separate from the near/transition/far roles above, and deliberately so: those
+# three describe where a zone sits on a route, while these say "the picture
+# changing HERE matters more than the picture changing on a blank wall". A zone
+# can be both, neither, or one of the two.
+#
+# Names, not coordinates. The regions are drawn in Frigate and read back from
+# `GET /api/config`, so the household edits one drawing rather than keeping two
+# in step -- and a region that Frigate uses to raise the review is exactly the
+# region whose change is worth a cell.
+#
+# Stored as a LIST in `entry.options` and empty by default: empty means the
+# change analysis runs on the whole frame alone, which is the behaviour that
+# exists before anyone configures a region.
+CONF_FOCUS_ZONES = "focus_zones"
+
 # Vision provider settings. Held by this integration rather than borrowed from
 # another component, so the request body is fully under its control -- notably
 # the reasoning toggle, which dominates cost.
@@ -203,38 +220,37 @@ MAX_PROMPT_OVERRIDE_LENGTH = 4000
 # （`vision_config_from` 用 `pick(..., "")`），所以既有 entry 的提示词逐字节
 # 不变——预填不会把内置场景复制进它们的配置里。
 #
+# 文本本身**不在这里**：它从 `prompts/review_six/` 的数据文件读出来，和内置场景
+# 读的是同一份。此前是两份手写副本，靠 `tests/test_config_flow.py` 里一条
+# `assert DEFAULT_PROMPT_OVERRIDE == SCENES["review_six"].template` 维系同步——
+# 那条断言能发现不一致，却说不清是谁改了哪一份。同源之后这个失败模式消失。
+#
 # 标签必须列**全场景的并集**：scene_labels 非空时会**全局替换** allowed 集合，
 # 不区分场景。漏掉某个标签它就永远无法报出，且没有任何报错——预填是默认值，
-# 用户不会意识到自己删掉了一个标签。
-#
-# 并集 = 11 个（只剩 review_six）。其中 8 个的定义来自 `CLASSIFICATION_GLOSSARY`，
-# cleaning / home_arrival / home_departure 的定义写在 `review_six` 的 template
-# 正文里（术语表刻意不重复它们）。顺序按标签名字母序，与 `_glossary` 里的
-# `sorted()` 一致。
-DEFAULT_SCENE_LABELS = (
-    "cleaning: 指连续清楚出现清扫、扫地、拖地或擦拭动作；\n"
-    "elevator_activity: 指人物在电梯间内活动但没有跨越入户门；\n"
-    "food_delivery: 指放下餐饮外卖且离开后餐食仍留在原处；\n"
-    "home_arrival: 指人物从门外走近入户门并进入门内；\n"
-    "home_departure: 指人物从入户门内走出并远离该门；\n"
-    "maintenance: 指维修人员对楼道设施进行作业；\n"
-    "package_delivery: 指放下快递包裹且离开后包裹仍留在原处；\n"
-    "suspicious_activity: 指试探门锁、反复徘徊或窥探等可疑行为；\n"
-    "unable_to_confirm: 指证据不足或画面质量导致无法判断；\n"
-    "unknown_activity: 指画面确实无法支持任何其他判断；\n"
-    "visitor: 指访客到访，例如敲门、在门外等候或被迎入；\n"
-)
+# 用户不会意识到自己删掉了一个标签。并集 = 11 个（只剩 review_six）：8 个来自
+# `labels.txt`，3 个（cleaning / home_arrival / home_departure）的定义写在
+# `rules.txt` 正文里，术语表刻意不重复它们。
+def _prefilled_scene_labels() -> str:
+    """The form's prefilled label set, built from the prompt data files.
 
-# `review_six` 场景的 template 原文，逐字节相同。由该场景的 template 生成，
-# 不是手抄——预填与内置规则必须是同一套规则，否则就成了两个会各自漂移的版本。
-DEFAULT_PROMPT_OVERRIDE = (
-    "图按时间顺序排列，从左到右、再从上到下读取。第一格是人物首帧，最后一格是人物离开后的后置现场，倒数第二格是人物末帧，中间各格是这段时间内的变化候选。"
-    "只有连续清楚出现清扫、扫地、拖地或擦拭动作才可判断cleaning。只有清楚看到放下包裹或外卖且离开后物品仍留下，才可判断配送。"
-    "不能根据制服、携带物或停留时间猜测职业。"
-    "关于回家与离家：只有画面中能看出人物相对入户门的移动方向时才可判断——人物从门内走出并远离该门，判为home_departure；"
-    "人物从门外走近该门并进入门内，判为home_arrival。"
-    "无法看出门的开合或人物的进出方向时，不得据停留时长、出现顺序或是否携带物品推断方向，应选择unknown_activity或unable_to_confirm。"
-    "若人物只是经过、在门前停留或整理物品而未跨越门，也不要判断回家或离家。描述人物时须写明可辨认的外貌（性别、发型、上下身衣着的颜色与款式）；"
-    "看不清就写明看不清，不得补足。画面中没有清晰正面面部时，不得推断年龄，改用中性说法（一名男子、一名女士或一名人员）。"
-    "描述须交代人物从何处来、往何处去，以及门与电梯的状态变化，动作要连贯。"
-)
+    Imported lazily: `scenes.py` imports from `const.py`, so a module-level
+    import here would be circular. The call happens once, when the options
+    schema is built, so the indirection costs nothing measurable.
+    """
+    from .scenes import BUILTIN_SCENE_LABELS
+
+    return "".join(
+        f"{name}: {definition}\n" for name, definition in BUILTIN_SCENE_LABELS
+    )
+
+
+def _prefilled_prompt_override() -> str:
+    """The form's prefilled judgement rules, read from the prompt data file."""
+    from .scenes import load_prompt_text
+
+    return load_prompt_text("review_six", "rules.txt")
+
+
+DEFAULT_SCENE_LABELS = _prefilled_scene_labels()
+
+DEFAULT_PROMPT_OVERRIDE = _prefilled_prompt_override()

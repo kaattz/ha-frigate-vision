@@ -1155,3 +1155,63 @@ async def test_the_module_level_analysis_rejects_malformed_labels_too(
 
     assert str(caught.value) == expected
     assert session.payloads == []
+
+
+class TestFocusZonesAreReadDefensively:
+    """The focus-zone value crosses a JSON round trip and must survive it.
+
+    The failure this guards against is quiet: or name in value over a string
+    iterates its CHARACTERS, so home_door becomes nine one-letter zones that
+    match no Frigate zone. The configuration looks saved, the analysis runs, and
+    no region is ever used.
+    """
+
+    def test_a_list_of_names_is_read_in_order(self) -> None:
+        from custom_components.frigate_vision.vision import pick_focus_zones
+
+        assert pick_focus_zones({"focus_zones": ["home_door", "elevator"]}, {}) == (
+            "home_door",
+            "elevator",
+        )
+
+    def test_a_bare_string_is_one_zone_not_its_characters(self) -> None:
+        """The character-iteration trap, asserted directly."""
+        from custom_components.frigate_vision.vision import pick_focus_zones
+
+        assert pick_focus_zones({"focus_zones": "home_door"}, {}) == ("home_door",)
+
+    def test_a_comma_string_splits_like_the_older_zone_fields(self) -> None:
+        from custom_components.frigate_vision.vision import pick_focus_zones
+
+        assert pick_focus_zones({"focus_zones": "a,b"}, {}) == ("a", "b")
+
+    def test_cleared_and_missing_both_mean_no_regions(self) -> None:
+        from custom_components.frigate_vision.vision import pick_focus_zones
+
+        assert pick_focus_zones({"focus_zones": []}, {}) == ()
+        assert pick_focus_zones({"focus_zones": None}, {}) == ()
+        assert pick_focus_zones({}, {}) == ()
+
+    def test_data_is_the_fallback_when_options_are_empty(self) -> None:
+        from custom_components.frigate_vision.vision import pick_focus_zones
+
+        assert pick_focus_zones({}, {"focus_zones": ["from_data"]}) == ("from_data",)
+
+    def test_non_string_entries_are_dropped_not_fatal(self) -> None:
+        from custom_components.frigate_vision.vision import pick_focus_zones
+
+        assert pick_focus_zones({"focus_zones": ["ok", "", None, 7]}, {}) == ("ok",)
+
+    def test_duplicates_collapse(self) -> None:
+        from custom_components.frigate_vision.vision import pick_focus_zones
+
+        assert pick_focus_zones({"focus_zones": ["a", "a", "b"]}, {}) == ("a", "b")
+
+    def test_an_unconfigured_entry_has_no_regions(self) -> None:
+        """Zero regression: the default must be empty, so nothing changes."""
+        from custom_components.frigate_vision.vision import vision_config_from
+
+        config = vision_config_from(
+            {}, {"llm_base_url": "https://x/v1", "llm_api_key": "k", "llm_model": "m"}
+        )
+        assert config.focus_zones == ()

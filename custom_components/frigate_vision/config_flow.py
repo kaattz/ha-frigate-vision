@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import voluptuous as vol
@@ -35,6 +35,7 @@ from .const import (
     CONF_FALLBACK_LLM_REASONING_EFFORT,
     CONF_FALLBACK_LLM_THINKING,
     CONF_FAR_ZONES,
+    CONF_FOCUS_ZONES,
     CONF_LLM_API_KEY,
     CONF_LLM_BASE_URL,
     CONF_LLM_BASE_URL_DEFAULT,
@@ -58,6 +59,7 @@ from .const import (
     PROVIDER_PRESETS,
     provider_for_url,
 )
+from .frigate import FrigateClient
 from .scenes import parse_scene_labels
 from .vision import (
     REASONING_EFFORTS,
@@ -97,7 +99,14 @@ def _parse_base_url(value: str) -> URL:
     return parsed
 
 
-def _options_schema() -> vol.Schema:
+def _options_schema(*, focus_zones: Sequence[str] = ()) -> vol.Schema:
+    """The options form. `focus_zones` supplies the dropdown's choices.
+
+    The choices arrive as an argument rather than being read here because they
+    come from Frigate, and `vol.Schema` is built synchronously while a Frigate
+    query is not. The caller does the await and passes the result in, which also
+    keeps this function testable without a server.
+    """
     return vol.Schema(
         {
             # Provider settings live in options rather than data so they can be
@@ -195,11 +204,30 @@ def _options_schema() -> vol.Schema:
             ),
             vol.Required("analyze_night_unknown", default=True): bool,
             vol.Required("analyze_all_far_reviews", default=True): bool,
+            # 哪些 Frigate zone 的画面变化值得多占一格证据。可多选，也可以一个都不选。
+            #
+            # 选的是 zone 名字，坐标仍然只存在 Frigate 里——用户画一次，两边共用。
+            # 这项与 near/transition/far 那三个角色字段是不同的用途：那三个描述
+            # zone 在路线上处于哪一段，这一项说「这里变了比墙上变了更值得留一格」。
+            #
+            # 选项由 `_focus_zone_options` 现场查 Frigate 得到；查不到时（服务未启动、
+            # 凭据失效）退回「已保存的值」并允许原样保存，绝不让配置无法提交。
+            vol.Optional(CONF_FOCUS_ZONES, default=list): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=list(focus_zones),
+                    multiple=True,
+                    # Allows a value that is no longer offered -- a zone deleted
+                    # or renamed in Frigate. Without it, Home Assistant would drop
+                    # the stored name on render and the user's selection would
+                    # vanish with no explanation.
+                    custom_value=True,
+                )
+            ),
         }
     )
 
 
-def _setup_schema() -> vol.Schema:
+def _setup_schema(*, focus_zones: Sequence[str] = ()) -> vol.Schema:
     """Everything the initial flow's last step asks for.
 
     The initial flow is a single form built once, so it carries the close-up fields
@@ -210,12 +238,38 @@ def _setup_schema() -> vol.Schema:
     `vol.Schema.extend` cannot be used here: it asserts both operands are plain
     dicts, and both halves are Schemas. Merging the marker dicts is equivalent and
     is what the schema object is built from anyway.
+
+    `focus_zones` carries the camera's zone names, which only the caller can fetch.
+    On the initial flow it is normally empty: the Frigate connection was just
+    validated and the camera query has not run yet, so the field renders as free
+    text the user can fill in, and the options flow offers the real list later.
     """
     combined: dict[Any, Any] = {}
-    for schema in (_options_schema(), _close_up_schema()):
+    for schema in (_options_schema(focus_zones=focus_zones), _close_up_schema()):
         for marker in schema.schema:
             combined[marker] = schema.schema[marker]
     return vol.Schema(combined)
+
+
+def _focus_zone_options(
+    saved: Mapping[str, Any] | Sequence[str], available: Sequence[str] = ()
+) -> list[str]:
+    """Order the focus-zone dropdown: Frigate's zones, then anything saved.
+
+    A pure function so the union rule can be tested without a running Frigate.
+    The union is the point: a zone renamed or deleted in Frigate is still a value
+    the entry holds, and dropping it from the choices would make opening the form
+    silently discard the user's selection.
+    """
+    if isinstance(saved, Mapping):
+        raw = saved.get(CONF_FOCUS_ZONES) or ()
+    else:
+        raw = saved
+    names = [str(name) for name in raw if isinstance(name, str) and name]
+    for name in available:
+        if name not in names:
+            names.append(str(name))
+    return names
 
 
 def _close_up_schema() -> vol.Schema:
@@ -989,10 +1043,11 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
             suggestions[CONF_LLM_BASE_URL] = preset_url
         if preset is not None and preset["models"]:
             suggestions[CONF_LLM_MODEL] = preset["models"][0]
+        focus_zones = await self._async_focus_zone_choices(suggestions)
         return self.async_show_form(
             step_id="settings_form",
             data_schema=self.add_suggested_values_to_schema(
-                _options_schema(), _strip_secrets(suggestions)
+                _options_schema(focus_zones=focus_zones), _strip_secrets(suggestions)
             ),
         )
 
@@ -1068,13 +1123,59 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
                 return self.async_create_entry(data=merged_input)
             # 校验失败时回填用户这次提交的内容，否则表单会清空他填的一切。
             suggestions = user_input
+        focus_zones = await self._async_focus_zone_choices(suggestions)
         return self.async_show_form(
             step_id="settings_form",
             data_schema=self.add_suggested_values_to_schema(
-                _options_schema(), _strip_secrets(suggestions)
+                _options_schema(focus_zones=focus_zones), _strip_secrets(suggestions)
             ),
             errors=errors,
         )
+
+    async def _async_focus_zone_choices(
+        self, suggestions: Mapping[str, Any]
+    ) -> tuple[str, ...]:
+        """The dropdown's zone names: the camera's zones plus anything saved.
+
+        Never raises and never loses a stored value. The available names come from
+        a live Frigate query, and a user editing an unrelated setting while Frigate
+        is down must still be able to save -- so a failed query degrades to "just
+        the saved names" rather than to an error or to an empty dropdown that would
+        silently drop the selection on submit.
+
+        Union rather than replacement: a zone renamed or deleted in Frigate is
+        still a value the entry holds, and dropping it from the choices would
+        discard the user's configuration as a side effect of opening a form.
+        """
+        names = _focus_zone_options(suggestions)
+        client = await self._async_frigate_client()
+        if client is None:
+            return tuple(names)
+        camera = str(self.config_entry.data.get(CONF_CAMERA, ""))
+        if not camera:
+            return tuple(names)
+        try:
+            found = await client.async_get_camera_zones(camera)
+        except Exception:  # noqa: BLE001 - a form must render whatever happens
+            return tuple(names)
+        return tuple(_focus_zone_options(suggestions, sorted(found)))
+
+    async def _async_frigate_client(self) -> FrigateClient | None:
+        """A Frigate client built from the entry's stored connection, or None.
+
+        Built per form render rather than cached on the flow: a flow instance is
+        short-lived, and the client owns an aiohttp session that would leak if it
+        outlived its use. Returns None whenever the stored connection cannot be
+        used at all, because the only caller treats "cannot ask" and "asked and
+        got nothing" the same way.
+        """
+        frigate_data = self.config_entry.data
+        if not isinstance(frigate_data, Mapping) or not frigate_data.get(CONF_BASE_URL):
+            return None
+        try:
+            return await FrigateClient.async_create(self.hass, frigate_data)
+        except Exception:  # noqa: BLE001 - a form must render whatever happens
+            return None
 
     async def async_step_test_connection(
         self, user_input: dict[str, Any] | None = None

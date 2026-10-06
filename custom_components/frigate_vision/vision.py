@@ -32,7 +32,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,6 +50,7 @@ from .const import (
     CONF_FALLBACK_LLM_MODEL,
     CONF_FALLBACK_LLM_REASONING_EFFORT,
     CONF_FALLBACK_LLM_THINKING,
+    CONF_FOCUS_ZONES,
     CONF_PERSON_HIGHLIGHT,
     CONF_PERSON_HIGHLIGHT_DEFAULT,
     CONF_PROMPT_OVERRIDE,
@@ -187,6 +188,15 @@ class VisionConfig:
     # close-up comes from. Empty means the largest-box rule decides alone, which
     # is the behaviour every existing deployment already has.
     face_service_url: str = CONF_FACE_SERVICE_URL_DEFAULT
+    # Frigate zone names whose change is worth an extra evidence cell. Empty means
+    # the change analysis runs on the whole frame alone, which is the behaviour
+    # that exists before anyone configures a region.
+    #
+    # Kept out of the prompt and out of the cache key on purpose: it changes how
+    # frames are CHOSEN, not what is asked of the model. Two activities of the
+    # same scene with different zones configured still deserve one answer each
+    # rather than one shared cached answer.
+    focus_zones: tuple[str, ...] = ()
 
     def endpoint(self) -> str:
         """Return the chat-completions URL for this base URL.
@@ -419,7 +429,44 @@ def vision_config_from(
         reasoning_effort=pick("llm_reasoning_effort", "default"),
         **_shared_prompt_settings(options),
         **_prompt_fields(data, options),
+        focus_zones=pick_focus_zones(options, data),
     )
+
+
+def pick_focus_zones(
+    options: Mapping[str, Any], data: Mapping[str, Any]
+) -> tuple[str, ...]:
+    """Read the focus-zone names from options, falling back to data.
+
+    Written defensively because this value crosses a JSON round trip and can come
+    back in shapes the form never produced: a bare string when one zone was
+    selected, `None` when the field was cleared, or a list holding empty strings.
+    A `for name in value` over a string would iterate its *characters*, silently
+    turning `home_door` into nine one-letter zones that match nothing -- a
+    configuration that looks saved and does nothing.
+
+    Anything that is not a non-empty string is dropped rather than rejected: a
+    stale entry costs a region, while refusing to load would cost the entry.
+    """
+    value = options.get(CONF_FOCUS_ZONES)
+    if value is None or value == "":
+        value = data.get(CONF_FOCUS_ZONES)
+    if isinstance(value, str):
+        # A single zone stored as text, or the comma form the older zone fields
+        # use. Split on commas so both spellings work.
+        candidates: Sequence[Any] = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        candidates = value
+    else:
+        return ()
+    names: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        name = candidate.strip()
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
 
 
 def fallback_config_from(

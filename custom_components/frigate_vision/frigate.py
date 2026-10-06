@@ -229,6 +229,84 @@ class FrigateClient:
             raise FrigateApiError("empty_snapshot")
         return data
 
+    async def async_get_preview_frames(
+        self, camera: str, start: float, end: float
+    ) -> tuple[str, ...]:
+        """Return cached preview frame filenames in the window, or () when none.
+
+        Frigate caches preview frames under `cache/preview_frames` and drops the
+        whole hour's frames when the hour rolls over. A window reaching back past
+        the current hour therefore legitimately has nothing in it, so **an empty
+        array is a normal answer, not a failure**: it means "no cached frames
+        here", and the caller falls back rather than recording an error.
+
+        An unknown camera answers with an empty array too. The endpoint is served
+        from a directory listing, so it cannot tell "no such camera" from "nothing
+        cached"; emptiness must not be read as proof the camera is missing.
+
+        Timestamps are rendered with `str()`, matching `async_get_recordings`.
+        Frigate bisects a sorted filename listing, comparing these as STRINGS --
+        and the filename embeds the same `str(float)` Frigate itself printed, so
+        re-rendering that float reproduces the exact text. That is what makes a
+        boundary timestamp match the frame at it instead of one frame away.
+        """
+        if (
+            not math.isfinite(start)
+            or not math.isfinite(end)
+            or start < 0
+            or end <= start
+        ):
+            raise FrigateApiError("invalid_preview_range")
+        payload = await self._request_json(
+            "GET",
+            f"{self._base_url}/api/preview/{quote(camera, safe='')}"
+            f"/start/{start}/end/{end}/frames",
+        )
+        if not isinstance(payload, list) or any(
+            not isinstance(item, str) or not item for item in payload
+        ):
+            raise FrigateApiError("invalid_preview_frames")
+        return tuple(payload)
+
+    async def async_get_preview_thumbnail(self, file_name: str) -> bytes:
+        """Return one cached preview frame's bytes.
+
+        **The body is WebP even though the URL ends in `.jpg`.** Frigate serves
+        this route with `media_type="image/webp"` and stores the frames as WebP;
+        the `.jpg` in the path is a legacy name and nothing more. So the
+        `content_type != "image/jpeg"` check that `async_get_snapshot` uses MUST
+        NOT be reused here: measured against Frigate 0.17.2 it rejects every
+        preview frame, and because the preview path falls back silently by
+        design, that failure would look exactly like "this window had no frames"
+        forever.
+
+        Hence validation by content rather than by the `.jpg` name: the declared
+        type has to be one of the formats this route actually serves, and the
+        body has to carry that format's signature. The signature check is what
+        catches a 200 carrying an error page. It deliberately stops short of a
+        full decode -- that belongs to the change analyzer, which runs it in an
+        executor, and doing it here would decode every frame on the event loop.
+
+        `file_name` has to be a name `async_get_preview_frames` returned. Frigate
+        looks the name up on disk, so a name rebuilt from a timestamp would have
+        to reproduce Frigate's float formatting exactly; a returned name cannot
+        drift from the file it names.
+        """
+        if not isinstance(file_name, str) or not file_name:
+            raise FrigateApiError("invalid_preview_frame_name")
+        content_type, data = await self._request_bytes(
+            "GET",
+            f"{self._base_url}/api/preview/{quote(file_name, safe='')}"
+            "/thumbnail.jpg",
+        )
+        if content_type not in {"image/jpeg", "image/webp"}:
+            raise FrigateApiError("unexpected_content_type")
+        if not data:
+            raise FrigateApiError("empty_preview_frame")
+        if not _is_supported_image(data):
+            raise FrigateApiError("preview_decode_failed")
+        return data
+
     async def _get_json(self, path: str) -> dict[str, Any]:
         payload = await self._request_json("GET", f"{self._base_url}/api/{path}")
         if not isinstance(payload, dict):
@@ -315,6 +393,49 @@ class FrigateClient:
             raise FrigateApiError("frigate_unavailable") from exc
         self._last_auth_check = time.monotonic()
 
+    async def async_get_camera_zones(
+        self, camera: str
+    ) -> dict[str, tuple[tuple[float, float], ...]]:
+        """Return a camera's Frigate zones as normalized polygons.
+
+        The zones are the household's own drawing, so reusing them keeps one
+        source of truth: the region a person must stand in for Frigate to raise
+        the review is the same region whose change is worth an extra cell. Asking
+        the user to draw it twice would let the two drift, and only one of them
+        would be visible in Frigate's UI.
+
+        `coordinates` is a FLAT vertex list -- `x1,y1,x2,y2,...` -- not a
+        rectangle. Measured on this deployment: `home_door` has 6 vertices and
+        `elevator` 7, both with diagonal edges. Treating the list as a bounding
+        box would crop the door and the lift door as rectangles that include a
+        good deal of wall.
+
+        Returns only zones whose coordinates parse; a malformed zone is skipped
+        rather than failing the whole call, because one bad polygon must not cost
+        the user every other region. Raises `FrigateApiError` when the config
+        itself cannot be read or the camera is absent, so a caller can tell "this
+        camera has no zones" (an empty dict) from "Frigate did not answer".
+        """
+        payload = await self._get_json("config")
+        cameras = payload.get("cameras")
+        if not isinstance(cameras, Mapping):
+            raise FrigateApiError("invalid_config")
+        camera_config = cameras.get(camera)
+        if not isinstance(camera_config, Mapping):
+            raise FrigateApiError("unknown_camera")
+        raw_zones = camera_config.get("zones")
+        if not isinstance(raw_zones, Mapping):
+            return {}
+
+        zones: dict[str, tuple[tuple[float, float], ...]] = {}
+        for name, definition in raw_zones.items():
+            if not isinstance(name, str) or not isinstance(definition, Mapping):
+                continue
+            polygon = _parse_zone_polygon(definition.get("coordinates"))
+            if polygon is not None:
+                zones[name] = polygon
+        return zones
+
     @staticmethod
     def _validate_time_window(payload: Mapping[str, Any], code: str) -> None:
         start = payload.get("start_time")
@@ -347,6 +468,59 @@ def _load_payload(payload: str) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise FrigatePayloadError("invalid_payload")
     return value
+
+
+def _parse_zone_polygon(
+    coordinates: object,
+) -> tuple[tuple[float, float], ...] | None:
+    """Parse Frigate's flat coordinate list into normalized (x, y) vertices.
+
+    Accepts the flat `[x1, y1, x2, y2, ...]` form Frigate writes. Returns None for
+    anything that is not a usable polygon -- odd length, fewer than three
+    vertices, non-finite values, or coordinates outside the frame -- so the caller
+    can skip one bad zone instead of losing the camera's whole set.
+
+    Three vertices is the minimum that encloses any area, and the bounds check
+    catches the units mistake that would otherwise be silent: Frigate stores
+    fractions of the frame, and a polygon copied from a pixel-space editor would
+    land far outside, drawing an empty mask for a region the user believes is
+    configured.
+    """
+    if not isinstance(coordinates, (list, tuple)) or len(coordinates) % 2:
+        return None
+    values: list[float] = []
+    for raw in coordinates:
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None
+        value = float(raw)
+        if not math.isfinite(value) or value < 0.0 or value > 1.0:
+            return None
+        values.append(value)
+    if len(values) < 6:
+        return None
+    return tuple(
+        (values[index], values[index + 1]) for index in range(0, len(values), 2)
+    )
+
+
+def _is_supported_image(data: bytes) -> bool:
+    """Whether `data` carries a JPEG or WebP signature.
+
+    Cheap on purpose. A real Pillow decode costs ~6.7 ms for a 320x180 frame
+    (measured, Pillow 12.3.0), so decoding up to the 120 frames of a preview
+    budget inside `async_get_preview_thumbnail` would block the event loop for
+    the better part of a second -- and this codebase runs every other PIL call
+    through `async_add_executor_job`. So the client checks the container
+    signature, which is what catches a 200 carrying an error page or an HTML
+    login form, and leaves the pixel-level decode to the change analyzer, which
+    already runs it in an executor and reports `preview_decode_failed`.
+
+    Both signatures are checked because both are live: `recordings/.../snapshot.jpg`
+    really is JPEG, while the preview frames are WebP behind a `.jpg` URL.
+    """
+    if data.startswith(b"\xff\xd8\xff"):
+        return True
+    return len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP"
 
 
 def event_box(after: Mapping[str, Any]) -> tuple[float, float, float, float] | None:
