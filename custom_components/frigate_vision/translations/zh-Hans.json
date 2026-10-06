@@ -157,6 +157,10 @@
         "title": "连通性测试",
         "description": "使用已保存的配置测试：模型 {model}，耗时 {seconds} 秒，消耗 {tokens} Token。能收到回复即表示地址、密钥与模型名称均可用。"
       },
+      "refresh_models": {
+        "title": "模型列表已刷新",
+        "description": "主组 {primary} 个可选模型，备用组 {fallback} 个。打开「配置参数」即可看到新的下拉列表。列表每 5 分钟自动缓存一次，这里会跳过缓存重新获取。拉取失败时使用内置清单，不影响分析。"
+      },
       "close_up_form": {
         "title": "人物特写 / Person close-up",
         "data": {

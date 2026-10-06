@@ -150,6 +150,10 @@
         "title": "Test connection",
         "description": "Result using the saved settings: model {model}, {seconds}s, {tokens} tokens. A successful reply means the URL, key and model name all work."
       },
+      "refresh_models": {
+        "title": "Model list refreshed",
+        "description": "Primary: {primary} models available. Fallback: {fallback}. Open \"Configure settings\" to see the new list. The list is cached for 5 minutes; this action skips the cache. If the lookup fails, the built-in list is used and analysis is unaffected."
+      },
       "provider": {
         "title": "Switch provider"
       },

@@ -435,10 +435,15 @@ async def test_options_flow_updates_behavior_settings(hass: HomeAssistant) -> No
     result = await hass.config_entries.options.async_init(entry.entry_id)
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "init"
-    # The menu routes to settings or the provider switch. The connectivity check
-    # lives inside「配置参数」now: it tests the settings, so listing it as a
-    # sibling made it read as unrelated to them.
-    assert set(result["menu_options"]) == {"settings", "provider"}
+    # The menu routes to settings, the provider switch, or a model-list refresh.
+    # The connectivity check lives inside「配置参数」now: it tests the settings, so
+    # listing it as a sibling made it read as unrelated to them.
+    #
+    # `refresh_models` is a top-level sibling rather than living under「配置参数」
+    # because its whole purpose is to be found when the user suspects the list is
+    # stale -- it is a re-query, not a setting, and burying it one level down (in a
+    # submenu that already means "the settings") would put it where nobody looks.
+    assert set(result["menu_options"]) == {"settings", "provider", "refresh_models"}
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"next_step_id": "settings"}
     )
@@ -1653,9 +1658,15 @@ async def test_fallback_fields_are_reachable_from_the_settings_menu(
     entry.add_to_hass(hass)
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
-    assert set(result["menu_options"]) == {"settings", "provider"}, (
-        "第二组不该新增顶层菜单项：它只有输入框，没有预设菜单"
-    )
+    # `refresh_models` refreshes BOTH groups' lists, so it is not a second-group
+    # menu item in the sense this test guards against -- there is still no
+    # provider-preset menu for the second group. The assertion below (the submenu
+    # set) is what pins that: "预设菜单是主组专有的".
+    assert set(result["menu_options"]) == {
+        "settings",
+        "provider",
+        "refresh_models",
+    }, "第二组不该新增顶层菜单项：它只有输入框，没有预设菜单"
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"next_step_id": "settings"}
     )
@@ -1698,14 +1709,30 @@ async def test_fallback_fields_are_reachable_from_the_settings_menu(
     _, key_selector = _field(schema, CONF_FALLBACK_LLM_API_KEY)
     assert key_selector.config["type"] == "password", "第二组密钥必须是密码框"
 
-    texts = [
-        _field(schema, CONF_FALLBACK_LLM_BASE_URL)[1],
-        _field(schema, CONF_FALLBACK_LLM_MODEL)[1],
-    ]
-    for selector_ in texts:
-        assert type(selector_).__name__ == "TextSelector", (
-            "地址与模型名是自由文本：本地路由器或反向代理都要能填"
-        )
+    # Split deliberately, because the two fields now answer different questions and
+    # an assertion covering both would have to be weakened to say nothing.
+    #
+    # The URL stays FREE TEXT: a local router or reverse proxy is a normal
+    # deployment (this one runs that way) and its address can be anything.
+    _, url_selector = _field(schema, CONF_FALLBACK_LLM_BASE_URL)
+    assert type(url_selector).__name__ == "TextSelector", (
+        "地址仍须是自由文本：本地路由器或反向代理都要能填"
+    )
+
+    # The model is a DROPDOWN that still accepts anything typed. Both halves
+    # matter: the dropdown is the feature (the provider's own model ids, rather
+    # than recalled from documentation), and `custom_value` is what keeps it from
+    # being a restriction -- a name missing from the list, or a provider whose
+    # list could not be fetched, must still be typeable.
+    #
+    # This schema is built with no options here (a bare `_options_schema()` call),
+    # which is the empty-list case, so the field falls back to text. The dropdown
+    # behaviour is pinned where options are supplied, in
+    # `test_model_field.py`.
+    _, model_selector = _field(schema, CONF_FALLBACK_LLM_MODEL)
+    assert type(model_selector).__name__ == "TextSelector", (
+        "没有可选项时必须退回文本框，而不是渲染一个空下拉框"
+    )
 
 
 @pytest.mark.parametrize(

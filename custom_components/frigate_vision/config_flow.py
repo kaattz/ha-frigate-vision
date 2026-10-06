@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -60,6 +62,7 @@ from .const import (
     provider_for_url,
 )
 from .frigate import FrigateClient
+from .models_list import async_fetch_model_ids, merge_model_options
 from .scenes import parse_scene_labels
 from .vision import (
     REASONING_EFFORTS,
@@ -72,6 +75,43 @@ from .vision import (
 
 def _text() -> selector.TextSelector:
     return selector.TextSelector(selector.TextSelectorConfig())
+
+
+def _model_field(
+    options: Sequence[str],
+) -> selector.SelectSelector | selector.TextSelector:
+    """The model field: a dropdown when there is something to choose, text otherwise.
+
+    `custom_value=True` is what keeps this from being a restriction. The stored
+    value is a model id the user is entitled to change independently of any list
+    we can fetch, and `SelectSelector` accepts any string once that flag is set
+    (`helpers/selector.py`: `vol.Any(vol.In(options), str)`), which is exactly what
+    the `TextSelector` it replaces accepted. So a model that is missing from the
+    list -- renamed, too new, or filtered out for a reason this integration cannot
+    see -- is still typeable.
+
+    An EMPTY option list degrades to `TextSelector` rather than rendering a
+    dropdown with no rows. Server-side an empty dropdown is legal, but an
+    unpopulated dropdown is a control the user cannot use at all, and the
+    behaviour is unverified in the frontend; falling back to text is the shape
+    that shipped before this feature and is known to work.
+    """
+    if not options:
+        return _text()
+    return selector.SelectSelector(
+        selector.SelectSelectorConfig(
+            options=list(options),
+            mode=selector.SelectSelectorMode.DROPDOWN,
+            custom_value=True,
+        )
+    )
+
+
+# Model options are passed into the schema factories as arguments rather than
+# read from module state, for the same reason `focus_zones` is: they depend on the
+# entry's own endpoint and key, two entries must not see each other's list, and a
+# `vol.Schema` cannot await the fetch that produces them. The caller does the
+# awaiting; the factories stay synchronous and testable without a server.
 
 
 def _split_values(value: str, *, allow_empty: bool = False) -> list[str]:
@@ -99,13 +139,103 @@ def _parse_base_url(value: str) -> URL:
     return parsed
 
 
-def _options_schema(*, focus_zones: Sequence[str] = ()) -> vol.Schema:
-    """The options form. `focus_zones` supplies the dropdown's choices.
+# How long a fetched model list is reused. Long enough that reopening the form
+# during one configuration session does not hit the network again (the settings
+# form is re-rendered on every validation failure, and each render asks for the
+# models), short enough that a model Google released this afternoon shows up when
+# the user comes back to look.
+_MODEL_LIST_TTL_SECONDS = 300.0
 
-    The choices arrive as an argument rather than being read here because they
-    come from Frigate, and `vol.Schema` is built synchronously while a Frigate
-    query is not. The caller does the await and passes the result in, which also
-    keeps this function testable without a server.
+# Keyed by (base_url, hash of the key). The hash rather than the key itself
+# because this dict is module state: it appears in tracebacks, debugger locals and
+# any diagnostic dump of the process, and a credential does not belong in a cache
+# key -- the thing being cached is a public list of model names, which is worth
+# far less than the secret that fetched it.
+_MODEL_LIST_CACHE: dict[tuple[str, str], tuple[float, tuple[str, ...]]] = {}
+
+
+def _model_cache_key(base_url: str, api_key: str) -> tuple[str, str]:
+    digest = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+    return (base_url.strip().rstrip("/"), digest)
+
+
+async def async_model_choices(
+    hass: HomeAssistant,
+    *,
+    base_url: str,
+    api_key: str,
+    saved: str = "",
+    refresh: bool = False,
+) -> list[str]:
+    """The model dropdown's options for one provider endpoint.
+
+    Three sources, in this order: what the provider currently offers, the built-in
+    preset list, and whatever the entry has stored. Merging rather than choosing
+    between them is deliberate -- `merge_model_options` keeps a stored value that
+    no list mentions, so opening the form cannot rewrite a working model as a side
+    effect of being looked at. A stored value is dropped only when it is empty.
+
+    Never raises and never returns None: a caller is always rendering a form, and
+    the empty list is a meaningful answer that makes the field a text box.
+
+    `refresh` skips the read of the cache (the manual "refresh model list" action)
+    but still writes to it, so the work is not repeated immediately afterwards.
+    """
+    if not base_url:
+        # No endpoint means no provider. Returning the DEFAULT provider's preset
+        # here would put DeepSeek's model names into the fallback group's dropdown
+        # on an entry that has no fallback configured -- options for a provider this
+        # entry never selected. That is why this is a separate branch from "no key",
+        # which does have a preset to offer. The stored value is still honoured.
+        return merge_model_options((), (), saved)
+    preset_entry = PROVIDER_PRESETS.get(provider_for_url(base_url), {})
+    preset = tuple(preset_entry.get("models", ()))
+    if not api_key:
+        # Nothing to ask with. This is the normal state of the setup form's first
+        # render, and it must not produce a request that is certain to 401.
+        return merge_model_options((), preset, saved)
+    cache_key = _model_cache_key(base_url, api_key)
+    if not refresh:
+        cached = _MODEL_LIST_CACHE.get(cache_key)
+        if (
+            cached is not None
+            and time.monotonic() - cached[0] < _MODEL_LIST_TTL_SECONDS
+        ):
+            return merge_model_options(cached[1], preset, saved)
+    found = await async_fetch_model_ids(
+        async_get_clientsession(hass), base_url=base_url, api_key=api_key
+    )
+    if found:
+        # A failure is NOT cached: caching the empty result would pin the built-in
+        # list for the whole TTL because of one timeout, and the user's next look
+        # at the form would not retry.
+        _MODEL_LIST_CACHE[cache_key] = (time.monotonic(), found)
+    return merge_model_options(found, preset, saved)
+
+
+def _options_schema(
+    *,
+    focus_zones: Sequence[str] = (),
+    primary_models: Sequence[str] = (),
+    fallback_models: Sequence[str] = (),
+) -> vol.Schema:
+    """The options form.
+
+    `focus_zones` supplies the zone dropdown's choices; `primary_models` and
+    `fallback_models` supply the two model dropdowns'. All three arrive as
+    arguments rather than being read here because they come from remote services,
+    and `vol.Schema` is built synchronously while those queries are not. The
+    caller does the await and passes the result in, which also keeps this function
+    testable without a server.
+
+    The two model lists are separate because the two providers are: the fallback
+    usually points at a different endpoint with a different catalogue, and
+    offeringthe primary's models under the fallback's field would invite a model
+    name the second provider does not serve.
+
+    Defaulting all three to empty keeps every existing call site working and
+    reproduces the previous behaviour exactly (a text field for the models, no
+    zone choices), so this signature change is inert until a caller passes more.
     """
     return vol.Schema(
         {
@@ -124,7 +254,7 @@ def _options_schema(*, focus_zones: Sequence[str] = ()) -> vol.Schema:
             vol.Optional(CONF_LLM_API_KEY): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
             ),
-            vol.Optional(CONF_LLM_MODEL): _text(),
+            vol.Optional(CONF_LLM_MODEL): _model_field(primary_models),
             # Reasoning is the cost control that does not break reasoning.
             # Measured: disabling thinking entirely returned unrelated output
             # when a task needed multiple steps, while `low` stayed correct at
@@ -154,7 +284,7 @@ def _options_schema(*, focus_zones: Sequence[str] = ()) -> vol.Schema:
             vol.Optional(CONF_FALLBACK_LLM_API_KEY): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
             ),
-            vol.Optional(CONF_FALLBACK_LLM_MODEL): _text(),
+            vol.Optional(CONF_FALLBACK_LLM_MODEL): _model_field(fallback_models),
             # Both dropdowns default to `default`, which is also what an
             # untouched form submits. They carry no evidence that the user meant
             # to configure a second provider, so the validator ignores them when
@@ -227,7 +357,12 @@ def _options_schema(*, focus_zones: Sequence[str] = ()) -> vol.Schema:
     )
 
 
-def _setup_schema(*, focus_zones: Sequence[str] = ()) -> vol.Schema:
+def _setup_schema(
+    *,
+    focus_zones: Sequence[str] = (),
+    primary_models: Sequence[str] = (),
+    fallback_models: Sequence[str] = (),
+) -> vol.Schema:
     """Everything the initial flow's last step asks for.
 
     The initial flow is a single form built once, so it carries the close-up fields
@@ -243,9 +378,22 @@ def _setup_schema(*, focus_zones: Sequence[str] = ()) -> vol.Schema:
     On the initial flow it is normally empty: the Frigate connection was just
     validated and the camera query has not run yet, so the field renders as free
     text the user can fill in, and the options flow offers the real list later.
+
+    `primary_models` / `fallback_models` carry the two model dropdowns' choices.
+    On the initial flow they are normally empty for the same reason -- the setup
+    form is submitted once, before any key has been typed -- so the model fields
+    render as the text fields they have always been until the user opens the
+    options flow, where the real lists are fetched.
     """
     combined: dict[Any, Any] = {}
-    for schema in (_options_schema(focus_zones=focus_zones), _close_up_schema()):
+    for schema in (
+        _options_schema(
+            focus_zones=focus_zones,
+            primary_models=primary_models,
+            fallback_models=fallback_models,
+        ),
+        _close_up_schema(),
+    ):
         for marker in schema.schema:
             combined[marker] = schema.schema[marker]
     return vol.Schema(combined)
@@ -358,13 +506,18 @@ def _provider_for_url(base_url: str) -> str:
     return provider_for_url(base_url)
 
 
-def _llm_schema() -> vol.Schema:
+def _llm_schema(*, model_options: Sequence[str] = ()) -> vol.Schema:
     """The provider step: a preset to pick, and a URL that stays editable.
 
     The URL is the field most easily got wrong -- it must be the OpenAI-compatible
     root, and providers disagree about the shape, so it is worth choosing from a
     list. It remains free text because a local router or reverse proxy is a normal
     deployment (this one runs that way), and a preset only pre-fills it.
+
+    `model_options` is empty on the first render of this step (no key has been
+    submitted yet, so there is nothing to ask), which renders the model as the text
+    field it has always been. It is populated on the re-render that follows a
+    provider choice, which is the moment the user is looking at the model name.
     """
     return vol.Schema(
         {
@@ -373,21 +526,17 @@ def _llm_schema() -> vol.Schema:
             ): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=_provider_options())
             ),
-            vol.Required(
-                CONF_LLM_BASE_URL, default=CONF_LLM_BASE_URL_DEFAULT
-            ): _text(),
+            vol.Required(CONF_LLM_BASE_URL, default=CONF_LLM_BASE_URL_DEFAULT): _text(),
             vol.Required(CONF_LLM_API_KEY): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
             ),
-            vol.Required(CONF_LLM_MODEL): _text(),
+            vol.Required(CONF_LLM_MODEL): _model_field(model_options),
             vol.Required(
                 CONF_LLM_REASONING_EFFORT, default="default"
             ): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=list(REASONING_EFFORTS))
             ),
-            vol.Required(
-                CONF_LLM_THINKING, default="default"
-            ): selector.SelectSelector(
+            vol.Required(CONF_LLM_THINKING, default="default"): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=list(THINKING_MODES))
             ),
         }
@@ -720,10 +869,18 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
                 and not str(user_input.get(CONF_LLM_API_KEY, "")).strip()
             )
             if wants_only_the_preset:
+                # No key was submitted, which is what defines this branch, so there
+                # is nothing to query with: the options are the preset's own model
+                # list. That still leaves the field typeable, and the real list
+                # arrives on the next render once a key exists.
                 return self.async_show_form(
                     step_id="llmvision",
                     data_schema=self.add_suggested_values_to_schema(
-                        _llm_schema(),
+                        _llm_schema(
+                            model_options=await async_model_choices(
+                                self.hass, base_url=preset_url or "", api_key=""
+                            )
+                        ),
                         _strip_secrets(
                             {
                                 CONF_LLM_PROVIDER: provider,
@@ -761,6 +918,14 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
                 CONF_LLM_BASE_URL: base_url,
                 CONF_LLM_MODEL: model,
             }
+        # The initial flow has no config entry, so the key is read from the
+        # submission rather than from storage. On the first render there is none and
+        # the preset list is used, which is the previous behaviour exactly.
+        model_options = await async_model_choices(
+            self.hass,
+            base_url=str(suggestions.get(CONF_LLM_BASE_URL, "")),
+            api_key=str(suggestions.get(CONF_LLM_API_KEY, "")),
+        )
         return self.async_show_form(
             step_id="llmvision",
             # Stripped even though this path's `suggestions` are built from explicit
@@ -768,7 +933,7 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
             # key, not with each caller's care. A future edit that adds the typed key
             # here would otherwise ship it back to the browser.
             data_schema=self.add_suggested_values_to_schema(
-                _llm_schema(), _strip_secrets(suggestions)
+                _llm_schema(model_options=model_options), _strip_secrets(suggestions)
             ),
             errors=errors,
         )
@@ -776,6 +941,24 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
     async def async_step_options(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
+        # The two provider groups' keys arrive across two steps: the primary's in
+        # the step before this one, the fallback's inside this very form. So the
+        # lookup reads the submission when there is one (the error re-render, where
+        # the user has typed both) and the stored primary otherwise, which is the
+        # first render. Either way the schema is rebuilt identically on both paths,
+        # so a validation error cannot turn a dropdown back into a text box.
+        llm = self._data.get("llm") or {}
+        submitted = user_input or {}
+        primary_url = submitted.get(CONF_LLM_BASE_URL) or llm.get(CONF_LLM_BASE_URL, "")
+        primary_key = submitted.get(CONF_LLM_API_KEY) or llm.get(CONF_LLM_API_KEY, "")
+        primary_models = await async_model_choices(
+            self.hass, base_url=str(primary_url), api_key=str(primary_key)
+        )
+        fallback_models = await async_model_choices(
+            self.hass,
+            base_url=str(submitted.get(CONF_FALLBACK_LLM_BASE_URL, "")),
+            api_key=str(submitted.get(CONF_FALLBACK_LLM_API_KEY, "")),
+        )
         if user_input is not None:
             # 初始流也要校验，与选项流共用同一个 helper：标签会被原样存下，填错
             # 了之后每次分析都失败，而用户只看到「没有通知」。两个流的校验一旦各
@@ -798,17 +981,25 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
             return self.async_show_form(
                 step_id="options",
                 data_schema=self.add_suggested_values_to_schema(
-                    _setup_schema(), user_input
+                    _setup_schema(
+                        primary_models=primary_models,
+                        fallback_models=fallback_models,
+                    ),
+                    user_input,
                 ),
                 errors=errors,
             )
         return self.async_show_form(
             step_id="options",
             data_schema=self.add_suggested_values_to_schema(
-                _setup_schema(),
+                _setup_schema(
+                    primary_models=primary_models,
+                    fallback_models=fallback_models,
+                ),
                 self._data.get("llm") or {},
             ),
         )
+
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -946,6 +1137,36 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
             menu_options={
                 "settings": "配置参数 / Configure settings",
                 "provider": f"切换服务商（当前：{label}）",
+                "refresh_models": "刷新模型列表 / Refresh model list",
+            },
+        )
+
+    async def async_step_refresh_models(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Re-fetch both model lists on demand, and report what came back.
+
+        The lists are cached for five minutes so that opening the settings form
+        repeatedly does not re-query the provider each time. This entry exists for
+        the case that cache would otherwise hide: the user has just been told a new
+        model exists, opens the form, and does not see it.
+
+        Counts rather than a yes/no, because "primary 20, fallback 0" is a fact the
+        user can act on (the fallback is unconfigured, or its key is wrong) while
+        "refreshed" is not. Failures are NOT reported as form errors -- the same
+        rule the rest of this feature follows. An unreachable provider is already
+        visible through the connection test, and a form error here would suggest
+        the configuration is broken when only the lookup failed.
+        """
+        primary, fallback = await self._async_model_choices(
+            self.config_entry.options, refresh=True
+        )
+        return self.async_show_form(
+            step_id="refresh_models",
+            data_schema=vol.Schema({}),
+            description_placeholders={
+                "primary": str(len(primary)),
+                "fallback": str(len(fallback)),
             },
         )
 
@@ -1024,6 +1245,57 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
             },
         )
 
+    async def _async_model_choices(
+        self, options: Mapping[str, Any], *, refresh: bool = False
+    ) -> tuple[list[str], list[str]]:
+        """The two model dropdowns' options, for the settings being displayed.
+
+        Returns `(primary, fallback)` and never raises. Both lists are fetched
+        here, in one place, because there are four render sites for this form and a
+        site that forgot one of them would show a text field where the others show
+        a dropdown -- a difference the user would read as the feature being broken.
+
+        The two lookups run in sequence rather than concurrently, and that is
+        deliberate: they share the cache, so when both providers point at the same
+        endpoint with the same key (this deployment's own configuration) the second
+        lookup is a cache hit and no second request is made. Running them
+        concurrently would issue two identical requests instead.
+
+        The stored values are read from `options`, which is what the form will
+        actually save -- not from the raw submission. A blank password box means
+        "keep the stored key", so using the submission would query with an empty
+        key and get the built-in list for a configuration that has a working one.
+        """
+        primary = await async_model_choices(
+            self.hass,
+            base_url=str(options.get(CONF_LLM_BASE_URL, "")),
+            api_key=self._async_effective_key(options, CONF_LLM_API_KEY),
+            saved=str(options.get(CONF_LLM_MODEL, "")),
+            refresh=refresh,
+        )
+        fallback = await async_model_choices(
+            self.hass,
+            base_url=str(options.get(CONF_FALLBACK_LLM_BASE_URL, "")),
+            api_key=self._async_effective_key(options, CONF_FALLBACK_LLM_API_KEY),
+            saved=str(options.get(CONF_FALLBACK_LLM_MODEL, "")),
+            refresh=refresh,
+        )
+        return primary, fallback
+
+    def _async_effective_key(self, options: Mapping[str, Any], field: str) -> str:
+        """The key the form will use, for a field the user may not have touched.
+
+        A password box renders empty even when a key is stored, and
+        `_merge_options` carries the stored one forward on submit. Querying with
+        the rendered value would therefore use "" for every entry that already has
+        a key -- which is every entry after the first save.
+        """
+        submitted = options.get(field)
+        if isinstance(submitted, str) and submitted.strip():
+            return submitted.strip()
+        stored = self.config_entry.options.get(field)
+        return stored.strip() if isinstance(stored, str) else ""
+
     async def _async_apply_provider(self, provider: str) -> ConfigFlowResult:
         """Show the settings form with this provider's URL and model filled in.
 
@@ -1044,10 +1316,18 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
         if preset is not None and preset["models"]:
             suggestions[CONF_LLM_MODEL] = preset["models"][0]
         focus_zones = await self._async_focus_zone_choices(suggestions)
+        # Queried with the values this form is about to display, so picking Gemini
+        # lists Gemini's models rather than the previous provider's.
+        primary_models, fallback_models = await self._async_model_choices(suggestions)
         return self.async_show_form(
             step_id="settings_form",
             data_schema=self.add_suggested_values_to_schema(
-                _options_schema(focus_zones=focus_zones), _strip_secrets(suggestions)
+                _options_schema(
+                    focus_zones=focus_zones,
+                    primary_models=primary_models,
+                    fallback_models=fallback_models,
+                ),
+                _strip_secrets(suggestions),
             ),
         )
 
@@ -1124,10 +1404,19 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
             # 校验失败时回填用户这次提交的内容，否则表单会清空他填的一切。
             suggestions = user_input
         focus_zones = await self._async_focus_zone_choices(suggestions)
+        # Rebuilt on the error path too. Skipping it here would degrade the model
+        # fields to text boxes exactly when the user has just been told something
+        # else was wrong -- the same form, one field shape different.
+        primary_models, fallback_models = await self._async_model_choices(suggestions)
         return self.async_show_form(
             step_id="settings_form",
             data_schema=self.add_suggested_values_to_schema(
-                _options_schema(focus_zones=focus_zones), _strip_secrets(suggestions)
+                _options_schema(
+                    focus_zones=focus_zones,
+                    primary_models=primary_models,
+                    fallback_models=fallback_models,
+                ),
+                _strip_secrets(suggestions),
             ),
             errors=errors,
         )

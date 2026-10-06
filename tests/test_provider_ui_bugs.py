@@ -259,9 +259,11 @@ async def test_the_settings_menu_groups_the_form_with_the_connection_test(
     )
     entry.add_to_hass(hass)
     result = await hass.config_entries.options.async_init(entry.entry_id)
-    assert set(result["menu_options"]) == {"settings", "provider"}, (
-        "顶层不应再有 test_connection —— 它属于配置参数"
-    )
+    assert set(result["menu_options"]) == {
+        "settings",
+        "provider",
+        "refresh_models",
+    }, "顶层不应再有 test_connection —— 它属于配置参数"
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"next_step_id": "settings"}

@@ -136,6 +136,8 @@ Home Assistant 自定义集成（HACS）：把 Frigate 检测到的人物活动�
 **视觉 Provider**
 
 - base URL、API Key、模型名。可从预设（DeepSeek / Gemini / GLM / OpenAI）选择以预填 URL，也可直接手填任意 OpenAI 兼容端点。
+- **模型名是从 provider 在线拉取的可搜索下拉，同时保留手填。** 选完服务商后，下拉里是该端点当前可用的模型（主组与备用组各用**自己那组**的地址和密钥查询）；拉不到时退回内置清单，表单照常打开，列表为空时退回文本框。Options 首页的「刷新模型列表」可跳过 5 分钟缓存重新获取。查询是尽力而为：失败只影响下拉里多几条还是少几条，绝不影响任何一次分析，也不写 Repair。
+- Gemini 的清单优先走原生 `GET /v1beta/models`（带能力元数据），失败再试 OpenAI 兼容层 `/models`。列表按三层过滤，只保留能聊天的模型：前缀白名单（`gemini-` / `gemma-`）→ `supportedGenerationMethods` 含 `generateContent` → 排除词（`tts`/`image`/`embedding`/`live`/`vision`/`transcribe`/`computer-use`/`robotics`/`omni`/`audio`）。所以下拉里**不会**出现 Lyria（音乐）、Veo、Nano Banana（图像）、antigravity、deep-research、Omni（视频）等非聊天模型；需要时仍可手填。
 - 推理档位 `default` / `low` / `medium` / `high`；推理开关 `default` / `disabled`。
 - 保存前可点「测试连接」实测一次往返（纯文本，不发送图片）。
 - **`thinking` 字段并非所有端点都接受。** Google 的 OpenAI 兼容端点会以 HTTP 400 拒绝该字段（`Unknown name "thinking"`），因此集成对已知会拒绝的 provider 自动省略此字段——此时推理保持 provider 默认，代价更高但分析能正常完成。
