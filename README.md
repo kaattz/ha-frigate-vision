@@ -136,9 +136,10 @@ Home Assistant 自定义集成（HACS）：把 Frigate 检测到的人物活动�
 **视觉 Provider**
 
 - base URL、API Key、模型名。可从预设（DeepSeek / Gemini / GLM / OpenAI）选择以预填 URL，也可直接手填任意 OpenAI 兼容端点。
-- 推理档位 `default` / `low` / `high` / `max`；推理开关 `default` / `disabled`。
+- 推理档位 `default` / `low` / `medium` / `high`；推理开关 `default` / `disabled`。
 - 保存前可点「测试连接」实测一次往返（纯文本，不发送图片）。
-- **`thinking` 字段并非所有端点都接受。** Google 的 OpenAI 兼容端点会以 HTTP 400 拒绝该字段（`Unknown name "thinking"`），因此集成对已知会拒绝的 provider 自动省略此字段——此时推理保持 provider 默认，代价更高但分析能正常完成。`reasoning_effort` 不受此限制。
+- **`thinking` 字段并非所有端点都接受。** Google 的 OpenAI 兼容端点会以 HTTP 400 拒绝该字段（`Unknown name "thinking"`），因此集成对已知会拒绝的 provider 自动省略此字段——此时推理保持 provider 默认，代价更高但分析能正常完成。
+- **`reasoning_effort` 的取值同样按 provider 收敛。** 同一个 Google 端点接受这个字段，但只接受 `high` / `low` / `medium` / `minimal` / `none`（实测原文：`Invalid reasoning_effort: max. Valid values are: high, low, medium, minimal, none`）。因此档位里不再提供 `max`，并对已存了 `max` 的旧配置在发送前改成 `high`——否则那条活动会以 `provider_http_400` 失败，且 400 不重试。`minimal` 也不提供：它在 `gemini-3.8-flash` 上 400、在 `gemini-3.5-flash` 上正常，取决于模型而不是开关。其他 provider 的 `max` 不变。
 
 ### 第二组 Provider（故障转移，可选）
 

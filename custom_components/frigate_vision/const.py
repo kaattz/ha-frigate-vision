@@ -179,11 +179,62 @@ def provider_for_url(base_url: str) -> str:
 # user who picks it still gets a working analysis -- at the provider's default
 # reasoning cost -- rather than a lost activity.
 #
-# Only `thinking` is listed. `reasoning_effort` is accepted by the same endpoint:
-# probed, the endpoint answered 429 on quota, and quota is checked *after*
-# validation, where `thinking` was rejected before quota was consulted. Gating a
-# field that works would remove a working cost control.
+# Only `thinking` is listed here. `reasoning_effort` is accepted by the same
+# endpoint -- see `REASONING_EFFORT_TRANSLATIONS` below for which of its *values*
+# are, which is a different question this set does not answer.
 THINKING_UNSUPPORTED_PROVIDERS = frozenset({"gemini"})
+
+# `reasoning_effort` values a provider rejects VERBATIM, and what to send instead.
+#
+# The paragraph above says the *key* is accepted by Google's endpoint. That is
+# true and it is also not the whole question: the key is accepted, some of the
+# values are not. The original probe tested acceptance of the key and stopped
+# there, so `max` sat in the UI's option list while never having been sent by any
+# exercised path.
+#
+# Probed against this deployment's own key (2026-10-06), one text-only request per
+# value, on `gemini-3.5-flash` (the model this deployment actually configures) and
+# `gemini-3.8-flash`:
+#
+#   low, medium, none   -> HTTP 200 on both
+#   high                -> HTTP 200 on 3.5 (503, i.e. load, on 3.8)
+#   max, auto, HIGH     -> HTTP 400 both:
+#       Invalid reasoning_effort: max. Valid values are:
+#       high, low, medium, minimal, none
+#
+# A 400 is not retried -- the request is malformed, so retrying cannot help --
+# and `is_failover_eligible` treats any `provider_http_*` as worth another
+# provider. So picking `max` cost the activity outright when no fallback was
+# configured, which is the same trap `thinking` was, one field over.
+#
+# The UI no longer offers `max`. This table still exists because a value already
+# stored in an entry outlives the option list: a deployment that never reopens the
+# form would otherwise keep 400ing on every activity. `max` is translated to
+# `high`, the endpoint's own maximum, rather than dropped -- the same choice
+# `THINKING_UNSUPPORTED_PROVIDERS` makes, one step narrower: honour the intent at
+# the provider's ceiling instead of discarding the control entirely.
+REASONING_EFFORT_TRANSLATIONS: dict[str, dict[str, str]] = {
+    "gemini": {"max": "high"},
+}
+
+
+def reasoning_effort_for(base_url: str, value: str) -> str:
+    """The `reasoning_effort` to send this provider, or "" to send no field.
+
+    A value the provider is known to reject is translated to one it accepts; an
+    empty result means "leave the field out and let the provider's own default
+    apply". The decision lives here, next to `provider_for_url`, because both the
+    analysis request and the connectivity probe must make it identically -- a
+    probe that sent a rejected value would report HTTP 400 for a configuration
+    that works perfectly.
+    """
+    text = value.strip() if isinstance(value, str) else ""
+    if not text or text == "default":
+        return ""
+    return REASONING_EFFORT_TRANSLATIONS.get(provider_for_url(base_url), {}).get(
+        text, text
+    )
+
 
 # The preset whose endpoint was measured to reject the field. Kept next to the set
 # above so the two cannot drift: a rename in `PROVIDER_PRESETS` would otherwise

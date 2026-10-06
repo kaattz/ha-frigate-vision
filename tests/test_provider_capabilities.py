@@ -11,10 +11,19 @@ Reasoning mode for every provider -- so choosing it on this deployment made
 the request itself is malformed), which made the option a trap rather than a
 cost control.
 
-`reasoning_effort` is deliberately *not* gated: probed against the same endpoint
-and it is accepted by the schema -- the endpoint answers 429 on quota, which is
-checked after validation, where `thinking` was rejected before quota was ever
-consulted. Gating a field that works would remove a working cost control.
+`reasoning_effort` is a *different* question, and the first fix got it half
+right. The key is accepted by that endpoint -- probed, and it answered 429 on
+quota, which is checked after validation, where `thinking` was rejected before
+quota was consulted. But acceptance of the key says nothing about its values,
+and the original probe stopped at the key. Probed properly on 2026-10-06, one
+text-only request per value, Google answers `max` with:
+
+    Invalid reasoning_effort: max. Valid values are: high, low, medium, minimal, none
+
+and `minimal` with "Thinking level MINIMAL is not supported for this model" on
+`gemini-3.8-flash` (though not on 3.5). So `max` was the same trap one field
+over: offered by the UI, rejected by the provider, unbillable and unfailoverable
+past. This module now pins both the option list and the translation.
 """
 
 from __future__ import annotations
@@ -22,10 +31,17 @@ from __future__ import annotations
 import pytest
 
 from custom_components.frigate_vision.const import (
+    REASONING_EFFORT_TRANSLATIONS,
     THINKING_UNSUPPORTED_PROVIDERS,
     provider_for_url,
+    reasoning_effort_for,
 )
-from custom_components.frigate_vision.vision import VisionConfig, build_payload
+from custom_components.frigate_vision.vision import (
+    REASONING_EFFORTS,
+    VisionConfig,
+    async_test_connection,
+    build_payload,
+)
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 DEEPSEEK_URL = "https://api.deepseek.com/v1"
@@ -150,3 +166,138 @@ def test_the_gemini_preset_is_the_one_that_is_gated() -> None:
     assert THINKING_UNSUPPORTED_PROVIDERS <= set(PROVIDER_PRESETS)
     # And the preset whose URL this deployment uses is the gated one.
     assert provider_for_url(PROVIDER_PRESETS["gemini"]["base_url"]) == "gemini"
+
+
+# --- reasoning_effort values -------------------------------------------------
+
+
+def test_the_option_list_drops_max_and_offers_medium() -> None:
+    """The list must match what the endpoint accepts, not what sounds reasonable.
+
+    Measured: `max` is a hard 400 and `medium` is a 200. Shipping `max` is
+    exactly the defect the module docstring describes; omitting `medium` removed
+    a working cost control. Both halves are pinned because either one alone
+    would look fine in review.
+    """
+    assert "max" not in REASONING_EFFORTS
+    assert "medium" in REASONING_EFFORTS
+
+
+def test_minimal_is_not_offered() -> None:
+    """`minimal` is a coin flip by model, so offering it would be a trap.
+
+    Probed: 400 on `gemini-3.8-flash` ("Thinking level MINIMAL is not supported
+    for this model"), 200 on `gemini-3.5-flash`. A UI option whose validity
+    depends on a model name the user can change independently is a failure
+    waiting for the next model release.
+    """
+    assert "minimal" not in REASONING_EFFORTS
+    assert "minimal" not in REASONING_EFFORT_TRANSLATIONS.get("gemini", {})
+
+
+def test_a_stored_max_is_translated_not_dropped() -> None:
+    """The option list is not the only way a value reaches the request.
+
+    An entry that stored `max` before this fix keeps it until someone reopens
+    the form. Sending it verbatim would 400 every activity on a deployment whose
+    owner has no reason to suspect the setting.
+    """
+    payload = build_payload(_config(GEMINI_URL, reasoning_effort="max"), "p", b"jpeg")
+    assert payload["reasoning_effort"] == "high"
+
+
+def test_an_accepted_value_is_sent_unchanged() -> None:
+    """Translation must not rewrite values the provider already accepts."""
+    for value in ("low", "medium", "high"):
+        payload = build_payload(
+            _config(GEMINI_URL, reasoning_effort=value), "p", b"jpeg"
+        )
+        assert payload["reasoning_effort"] == value, value
+
+
+def test_default_still_sends_no_field() -> None:
+    """`default` means "let the provider decide", which is the absence of a field."""
+    payload = build_payload(
+        _config(GEMINI_URL, reasoning_effort="default"), "p", b"jpeg"
+    )
+    assert "reasoning_effort" not in payload
+
+
+@pytest.mark.parametrize("base_url", [DEEPSEEK_URL, GLM_URL, OPENAI_URL])
+def test_another_provider_keeps_max(base_url: str) -> None:
+    """Only the measured provider is translated.
+
+    `max` was never probed against these, and this project's rule is that a fix
+    does not change behaviour for a provider it did not measure. Rewriting it
+    everywhere would silently cap a knob that may work.
+    """
+    payload = build_payload(_config(base_url, reasoning_effort="max"), "p", b"jpeg")
+    assert payload["reasoning_effort"] == "max"
+
+
+def test_a_local_router_keeps_max() -> None:
+    """An unnameable endpoint's capabilities are unknown, so nothing is rewritten."""
+    assert reasoning_effort_for(CUSTOM_URL, "max") == "max"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "value", "expected"),
+    [
+        (GEMINI_URL, "max", "high"),
+        (GEMINI_URL, "MAX", "MAX"),
+        (GEMINI_URL, "auto", "auto"),
+        (GEMINI_URL, "", ""),
+        (GEMINI_URL, "default", ""),
+        (DEEPSEEK_URL, "default", ""),
+    ],
+)
+def test_the_translation_helper_is_the_single_decision_point(
+    base_url: str, value: str, expected: str
+) -> None:
+    """The probe and the analysis must answer identically.
+
+    A probe that sent a rejected value would report HTTP 400 for a configuration
+    that works perfectly, sending the user to inspect their key and model name.
+    Both call this helper, so the mapping is checked here once.
+
+    Case is NOT folded: the endpoint's own message lists lowercase values only,
+    and inventing a case-insensitive match would hide a future `HIGH` that the
+    provider might start accepting.
+    """
+    assert reasoning_effort_for(base_url, value) == expected
+
+
+async def test_the_connection_probe_uses_the_translation() -> None:
+    """The probe is the other caller, and it must not send a rejected value."""
+    sent: list[dict] = []
+
+    class _Response:
+        status = 200
+
+        async def text(self) -> str:
+            return '{"choices":[{"message":{"content":"OK"}}]}'
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Session:
+        def post(self, url, *, json, headers, timeout):
+            sent.append(json)
+            return _Response()
+
+    await async_test_connection(
+        _Session(),  # type: ignore[arg-type]
+        _config(GEMINI_URL, reasoning_effort="max"),
+    )
+    assert sent, "the probe sent no request"
+    assert sent[0]["reasoning_effort"] == "high"
+
+
+def test_the_translation_table_cannot_name_an_unknown_provider() -> None:
+    """A typo here would silently stop translating, which is the whole defect."""
+    from custom_components.frigate_vision.const import PROVIDER_PRESETS
+
+    assert set(REASONING_EFFORT_TRANSLATIONS) <= set(PROVIDER_PRESETS)

@@ -60,6 +60,7 @@ from .const import (
     MAX_SCENE_DESCRIPTION_LENGTH,
     THINKING_UNSUPPORTED_PROVIDERS,
     provider_for_url,
+    reasoning_effort_for,
 )
 from .models import (
     AUTOMATIC_RETRY_STATUSES,
@@ -122,15 +123,26 @@ _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
 
 THINKING_MODES = ("default", "disabled")
 
-# Reasoning effort, as the provider documents it. "default" leaves the field
-# out entirely so the provider's own default applies.
+# Reasoning effort. "default" leaves the field out entirely so the provider's own
+# default applies.
 #
 # Effort is the safer cost control than disabling thinking outright. Measured on
 # a task needing multi-step reasoning: disabled returned unrelated output on
 # every attempt, while `low` answered correctly using ~60% fewer reasoning
 # tokens than the default. So this knob trades cost without giving up the
 # ability to reason at all.
-REASONING_EFFORTS = ("default", "low", "high", "max")
+#
+# These are the values the *endpoint* accepts, not a provider-neutral wish list.
+# Probed on this deployment (2026-10-06): Google's OpenAI-compatible endpoint
+# answers `max` with a hard 400 -- `Valid values are: high, low, medium, minimal,
+# none` -- so `max` is gone and `medium`, which it does accept and which this list
+# was missing, is here. `minimal` is deliberately absent: it 400s on
+# gemini-3.8-flash ("Thinking level MINIMAL is not supported for this model")
+# even though it works on 3.5, so offering it would be a coin flip by model.
+#
+# A stored `max` from an older entry is still honoured via
+# `reasoning_effort_for`, which translates it rather than dropping it.
+REASONING_EFFORTS = ("default", "low", "medium", "high")
 
 # The provider expects a data URL; JPEG keeps the payload small for a photo
 # contact sheet with no visible loss at this size.
@@ -307,10 +319,15 @@ def build_payload(
         and provider_for_url(config.base_url) not in THINKING_UNSUPPORTED_PROVIDERS
     ):
         payload["thinking"] = {"type": config.thinking}
-    # `reasoning_effort` is deliberately not gated: the same endpoint that rejects
-    # `thinking` accepts this one, verified by probing rather than assumed.
-    if config.reasoning_effort and config.reasoning_effort != "default":
-        payload["reasoning_effort"] = config.reasoning_effort
+    # `reasoning_effort`'s *key* is accepted by the endpoint that rejects
+    # `thinking`, verified by probing. Its *values* are a separate question: the
+    # same probe series found `max` rejected with a 400, so the value is passed
+    # through `reasoning_effort_for` -- which translates any known-bad value and
+    # returns "" when nothing should be sent. Leaving the raw value here would
+    # reintroduce the 400 for an entry that still has `max` stored.
+    effort = reasoning_effort_for(config.base_url, config.reasoning_effort)
+    if effort:
+        payload["reasoning_effort"] = effort
     return payload
 
 
@@ -1033,8 +1050,12 @@ async def async_test_connection(
         and provider_for_url(config.base_url) not in THINKING_UNSUPPORTED_PROVIDERS
     ):
         payload["thinking"] = {"type": config.thinking}
-    if config.reasoning_effort and config.reasoning_effort != "default":
-        payload["reasoning_effort"] = config.reasoning_effort
+    # Same translation as `build_payload`, and for the same reason: a probe that
+    # sent a value the endpoint rejects would report HTTP 400 for a configuration
+    # that works perfectly, sending the user to inspect their key and model name.
+    effort = reasoning_effort_for(config.base_url, config.reasoning_effort)
+    if effort:
+        payload["reasoning_effort"] = effort
     started = time.monotonic()
     body = await async_request(session, config, payload)
     elapsed = time.monotonic() - started
