@@ -1,0 +1,41 @@
+# Normalise line endings so an editor cannot turn a small change into a
+# whole-file diff.
+#
+# Why this exists: measured in this repository, a 20-line edit to media.py
+# appeared as a 5360-line diff because the file had been rewritten with CRLF, and
+# the same happened three times in one session. `text=auto` fixes that at the
+# source -- git converts a working-tree file's endings to the canonical form
+# before comparing, so a stray CRLF no longer shows up as churn, and the committed
+# blob is always LF.
+#
+# `eol=lf` additionally makes checkout write LF, so the bytes on disk match on
+# every platform. CI runs on Linux.
+* text=auto eol=lf
+
+# Files that are CRLF in the repository ON PURPOSE, excluded from normalisation.
+#
+# This is not an oversight being preserved; it is a decision this file must not
+# undo. Commit 9c26a66 ("restore the CRLF line endings two test files had before
+# the rewrite") put these back after a mechanical rewrite normalised them, because
+# the normalisation published 6855 lines of phantom churn that hid the ~181 lines
+# the branch actually changed. `git add --renormalize` on this list produces
+# 5591 insertions and 5591 deletions -- byte-identical apart from the newline
+# bytes, and unreviewable.
+#
+# `-text` leaves the bytes alone. `diff` keeps them readable as text rather than
+# letting git call them binary, which would hide their changes entirely -- the
+# same failure by a different route.
+custom_components/frigate_vision/strings.json -text diff
+custom_components/frigate_vision/translations/en.json -text diff
+custom_components/frigate_vision/translations/zh-Hans.json -text diff
+tests/test_idempotency.py -text diff
+tests/test_media.py -text diff
+
+# Explicit binary markers. `text=auto` already detects these by content, but
+# naming them keeps the intent visible and stops a later rule from mangling them.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
