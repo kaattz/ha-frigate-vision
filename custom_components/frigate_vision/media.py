@@ -1647,11 +1647,43 @@ class MediaManager:
         Serializing costs nothing measurable here: builds are dominated by HTTP
         round trips to Frigate, the queue in front of them is already bounded, and
         a single household camera produces activities minutes apart.
+
+        A failed PREVIEW build is retried once on the recordings route. That is not
+        a nicety: measured on the live deployment, activity 14:52:03 built fine
+        from recordings while the preview route refused it with
+        `duplicate_evidence_frame`, and 18:48:07 did the same -- two activities
+        lost to a route the code itself calls "an economy, not a dependency".
         """
         async with self._build_lock:
-            return await self._async_build_locked(activity_id)
+            try:
+                return await self._async_build_locked(activity_id)
+            except MediaError as exc:
+                if (
+                    str(exc) != "duplicate_evidence_frame"
+                    or not self._preview_candidates
+                ):
+                    raise
+                # The record is still SEALED -- `_complete` is what advances it --
+                # and the failed attempt's temporary directory was removed by its
+                # own `finally`, so this re-enters cleanly.
+                #
+                # Only `duplicate_evidence_frame` is retried, because that is the
+                # only failure with evidence behind it: the preview selection can
+                # pick two instants that fetch one picture, and the recordings plan
+                # derives different ones. Retrying the other media errors would be
+                # guessing about causes nobody has measured.
+                _LOGGER.warning(
+                    "Preview selection produced a duplicate frame for %s; "
+                    "rebuilding it from recordings",
+                    activity_id,
+                )
+                return await self._async_build_locked(
+                    activity_id, allow_preview=False
+                )
 
-    async def _async_build_locked(self, activity_id: str) -> ActivityRecord:
+    async def _async_build_locked(
+        self, activity_id: str, *, allow_preview: bool = True
+    ) -> ActivityRecord:
         # Reset per build, before any guard can return early. A structure left
         # over from the previous activity would constrain this one's repairs to
         # the wrong moments -- a silent corruption that no single-activity test
@@ -1803,10 +1835,19 @@ class MediaManager:
         # what runs then, unchanged. That is deliberate: preview is an economy,
         # not a dependency, and a deployment without it must behave exactly as it
         # did before.
-        preview = await self._async_preview_timestamps(
-            record,
-            plan,
-            (plan.first_time, plan.postroll_time),
+        #
+        # `allow_preview=False` is the retry after a preview build failed with
+        # `duplicate_evidence_frame`. It skips straight to the plan, which is the
+        # same code path a deployment without preview support takes -- so the
+        # retry cannot invent a third behaviour.
+        preview = (
+            await self._async_preview_timestamps(
+                record,
+                plan,
+                (plan.first_time, plan.postroll_time),
+            )
+            if allow_preview
+            else None
         )
         if preview is not None:
             preview_times, preview_meta = preview
