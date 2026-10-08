@@ -953,11 +953,16 @@ async def test_media_manager_builds_once_and_atomically_registers(
     completed = await manager.async_build(record.activity_id)
     assert completed.stage is ActivityStage.EVIDENCE_READY
     assert completed.evidence_path is not None
-    # The review layout fetches first + last + 9 change candidates + postroll.
-    assert client.snapshot_calls == 12
+    # The review layout fetches first + last + 9 change candidates + postroll = 12,
+    # and the coverage repair adds 3 more. Those three are not slack: measured on
+    # this very fixture, the change selector aims all three of its picks at the
+    # opening seconds (103.16 / 105.12 / 107.08) and leaves a 13.72 s hole to the
+    # person's last frame -- wider than MAX_SAMPLE_GAP, and the exact defect the
+    # household reported twice. The repair fills it to 3.92 s.
+    assert client.snapshot_calls == 15
     again = await manager.async_build(record.activity_id)
     assert again == completed
-    assert client.snapshot_calls == 12
+    assert client.snapshot_calls == 15
 
 
 async def test_media_manager_serializes_concurrent_builds(
@@ -1015,9 +1020,12 @@ async def test_media_manager_serializes_concurrent_builds(
         manager.async_build(record.activity_id), manager.async_build(record.activity_id)
     )
     assert first == second
-    # The review layout fetches first + last + 9 change candidates + postroll;
-    # a concurrent second build must not re-fetch any of them.
-    assert client.calls == 12
+    # The review layout fetches first + last + 9 change candidates + postroll = 12,
+    # plus the 3 cells the coverage repair adds to close the 13.72 s hole this
+    # fixture's change selection leaves. A concurrent second build must not
+    # re-fetch any of them: the count is unchanged by the second call, which is
+    # what this assertion is really about.
+    assert client.calls == 15
 
 
 async def test_evidence_ready_requires_valid_registered_artifact(
@@ -1762,7 +1770,7 @@ async def test_legacy_image_change_artifact_is_not_kept_as_path_motion(
     assert completed.selection_source == "path_motion"
     assert client.snapshot_calls == 6
     payload = final.with_suffix(".json").read_text()
-    assert '"plan_version": 5' in payload
+    assert '"plan_version": 6' in payload
     assert '"selection_source": "path_motion"' in payload
 
 
@@ -2155,7 +2163,7 @@ async def test_evidence_metadata_records_infrared_replacements(
     )
     completed = await manager.async_build(record.activity_id)
     metadata = (tmp_path / "entry_1" / f"{record.activity_id}.json").read_text()
-    assert '"plan_version": 5' in metadata
+    assert '"plan_version": 6' in metadata
     assert "infrared_replacements" in metadata
     assert "103.2" in metadata
     assert completed.evidence_path is not None
@@ -2260,7 +2268,7 @@ async def test_review_records_uniqueness_replacements(
     completed = await manager.async_build(record.activity_id)
     assert completed.evidence_path is not None
     metadata = (tmp_path / "entry_1" / f"{record.activity_id}.json").read_text()
-    assert '"plan_version": 5' in metadata
+    assert '"plan_version": 6' in metadata
     assert "uniqueness_replacements" in metadata
 
 

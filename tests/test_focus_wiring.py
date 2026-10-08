@@ -404,7 +404,7 @@ class TestTheZonesReachTheAnalyzerThroughTheManager:
             hass, tmp_path, {"home_door": HOME_DOOR}, "review_entry_1_front_zone_mgr"
         )
         assert payload["candidate_source"] == "preview"
-        assert payload["plan_version"] == 5
+        assert payload["plan_version"] == 6
         assert len(samples) in {6, 9}
 
     async def test_the_build_still_works_without_regions(self, hass, tmp_path) -> None:

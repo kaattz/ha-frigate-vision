@@ -594,7 +594,7 @@ class TestTheEvidenceMetadataRecordsTheNewSelection:
             hass, tmp_path, self._preview_client(),
             "review_entry_1_front_review_meta",
         )
-        assert payload["plan_version"] == 5
+        assert payload["plan_version"] == 6
         assert payload["candidate_source"] == "preview"
         assert payload["selection_source"] == "preview_change"
         assert payload["preview_frame_count"] == 20
@@ -661,12 +661,12 @@ class TestTheEvidenceMetadataRecordsTheNewSelection:
             hass, tmp_path, Client(), "review_entry_1_front_review_meta2"
         )
         assert payload["candidate_source"] == "recordings"
-        assert payload["plan_version"] == 5
+        assert payload["plan_version"] == 6
 
     async def test_a_restart_reuses_the_artifact(
         self, hass: HomeAssistant, tmp_path
     ) -> None:
-        """plan_version 5 must be accepted by _read_existing.
+        """plan_version 6 must be accepted by _read_existing.
 
         Otherwise every restart discards the sheet and rebuilds it -- costly, and
         impossible once Frigate has purged the recordings the rebuild needs.

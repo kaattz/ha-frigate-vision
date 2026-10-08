@@ -260,6 +260,405 @@ def select_required_representatives(
     return tuple(sorted(required))
 
 
+def worst_unobserved_gap(
+    cells: Sequence[float], *, start: float, end: float
+) -> tuple[float, float, float]:
+    """The widest stretch of the activity the sheet shows no frame of.
+
+    The sheet is the only evidence the model gets, so a moment no cell covers is
+    a moment it cannot see. `MAX_SAMPLE_GAP` names this measurement -- "the widest
+    unobserved stretch the sheet will tolerate" -- but it was only ever read as a
+    reason to go *looking* for probes, never as a property of the finished sheet.
+    Measuring it is what lets the bound be enforced on the result.
+
+    The window's own edges count as boundaries, because the unobserved stretch at
+    each end is as real as any hole between two cells: measured on the reported
+    six-grid, the person walked in from the far corridor before the detector's
+    first sample, and the 52.9 s that followed that sample held the whole arrival.
+
+    `end` closes the measurement rather than the outermost cell, so the stretch
+    between the person's last frame and the postroll scene is not counted. Those
+    two cells are *meant* to be far apart -- nothing happens between them by
+    definition -- and counting it would make every sheet fail.
+
+    Returns the span and the two instants bounding it, so a caller can aim a
+    replacement at the hole it is told about rather than searching for it again.
+    """
+    if end <= start:
+        return (0.0, start, end)
+    ordered = [start]
+    for value in sorted({float(cell) for cell in cells if start <= float(cell) <= end}):
+        if value > ordered[-1]:
+            ordered.append(value)
+    if end > ordered[-1]:
+        ordered.append(end)
+    worst = 0.0
+    bounds = (start, end)
+    for left, right in zip(ordered, ordered[1:], strict=False):
+        if right - left > worst:
+            worst = right - left
+            bounds = (left, right)
+    return (worst, bounds[0], bounds[1])
+
+
+def _split_instant(
+    gap_start: float,
+    gap_end: float,
+    candidates: Sequence[float],
+    taken: set[float],
+    usable: Sequence[tuple[float, float]],
+) -> float | None:
+    """The best instant to observe inside a hole, or None when there is none.
+
+    A real analysed frame is preferred: the candidates are the preview frames
+    already decoded, or the plan's own evenly spaced change candidates, and the
+    one nearest the hole's midpoint is taken.
+
+    `usable` is the recording coverage. It is a hard filter rather than a
+    preference, and that is what keeps the repair from breaking a build: Frigate
+    writes recordings as fixed segments with gaps between them, and a cell placed
+    in a gap is dropped by the fetch loop, which then reports `recording_gap` and
+    fails the whole activity. Since this function exists to make the sheet
+    better, a hole it cannot fill with fetchable footage is left alone.
+
+    Falls back to the midpoint only when that midpoint is itself fetchable.
+    """
+    if gap_end <= gap_start:
+        return None
+
+    def fetchable(moment: float) -> bool:
+        return any(start <= moment <= end for start, end in usable)
+
+    midpoint = (gap_start + gap_end) / 2.0
+    best: float | None = None
+    best_distance = math.inf
+    for value in candidates:
+        moment = float(value)
+        if not gap_start < moment < gap_end or moment in taken:
+            continue
+        if not fetchable(moment):
+            continue
+        distance = abs(moment - midpoint)
+        if distance < best_distance:
+            best_distance = distance
+            best = moment
+    if best is not None:
+        return best
+    if midpoint in taken or not fetchable(midpoint):
+        return None
+    return midpoint
+
+
+def _best_split(
+    cells: Sequence[float],
+    candidates: Sequence[float],
+    taken: set[float],
+    usable: Sequence[tuple[float, float]],
+    *,
+    start: float,
+    end: float,
+) -> float | None:
+    """The best instant to observe among a sheet's holes, or None.
+
+    Every hole is considered widest-first rather than only the widest one, and
+    that is what lets the sheet reach a whole number of rows. A greedy that only
+    ever looks at the widest hole can strand itself: measured on a fixture whose
+    widest hole sat entirely inside a recording gap, it filled three cells,
+    stopped with five on the sheet, and the row check then discarded the whole
+    repair -- leaving a 25 s hole despite two thirds of the window being
+    observable. Falling through to the next-widest hole fills the sheet in the
+    only place that is fetchable, which keeps the widest hole's improvement and
+    still lands on six or nine cells.
+    """
+    ordered = sorted([start, *(float(v) for v in cells if start < float(v) < end), end])
+    holes = sorted(
+        (
+            (right - left, left, right)
+            for left, right in zip(ordered, ordered[1:], strict=False)
+            if right > left
+        ),
+        key=lambda item: -item[0],
+    )
+    for _, left, right in holes:
+        moment = _split_instant(left, right, candidates, taken, usable)
+        if moment is not None:
+            return moment
+    return None
+
+
+def enforce_coverage(
+    cells: Sequence[float],
+    pool: Sequence[float],
+    *,
+    start: float,
+    end: float,
+    max_gap: float,
+    cap: int,
+    protect: Sequence[float] = (),
+    usable: Sequence[tuple[float, float]] | None = None,
+) -> tuple[float, ...]:
+    """Bound the sheet's unobserved stretches, or leave it exactly as it was.
+
+    Why this exists, measured on the deployment that reported it twice: of 162
+    published sheets, 96 had a hole wider than the declared 12 s bound, 33 were
+    wider than 30 s, and the worst was 206 s. Two of them cost the household a
+    real answer -- a 52.9 s hole swallowed the walk in from the corridor, and a
+    30.3 s hole swallowed lift 1 opening with the person walking out.
+
+    Both layouts failed the same way, so the repair is stated once and applied to
+    whichever route chose the cells. It is not a second selector competing with
+    `choose_cells`: it runs only when the finished sheet breaks the bound the
+    module already declares, and returns the input untouched otherwise. A sheet
+    that covers its window is therefore byte-identical to what it was.
+
+    `protect` holds the cells whose POSITION carries meaning and which therefore
+    never move: the two the prompt's rules read by name (the person's first frame
+    and the emptied scene), plus whatever the caller names. Cells outside the
+    window are fixed automatically, because they cover nothing there but are part
+    of the timeline the prompt reads.
+
+    `cap` is the largest sheet the layout can compose. The arithmetic that decides
+    whether a size is even capable of meeting the bound is worth stating, because
+    getting it wrong is how a bound quietly goes unmet, and it has been stated
+    wrongly twice here. The rule is about cells INSIDE the window: `n` of them
+    split it into `n + 1` gaps, since the two window EDGES are boundaries as well
+    and a person can walk in before the detector's first sample. So the best
+    achievable worst gap is `span / (n + 1)`.
+
+    Applying that to this layout needs care, because the six-cell sheet is NOT six
+    interior cells: its first cell sits ON the start edge and its last ON the end
+    edge (they ARE those boundaries rather than extra ones), and the postroll cell
+    lies outside the window and closes nothing inside it. Six cells therefore have
+    only 3 interior cells -- 4 gaps -- and nine cells have 6 -- 7 gaps. Measured
+    by bisection against this function, the longest window each can hold at the
+    declared 12 s bound is 48 s at six cells and 84 s at nine, the latter being
+    exactly 7 x 12. That is why the sheet is grown towards `cap` rather than left
+    at six: at six cells a typical activity is already over budget.
+
+    Where the budget genuinely cannot reach the bound -- the 153 s nine-grid has
+    6 interior cells and so needs 12 to reach 12 s (153.3 / 13 = 11.8 s), against
+    a cap of 9 -- the result is the best placement that many cells allow, not a
+    claim to have met it. A caller can compare the two with
+    `worst_unobserved_gap`.
+
+    `usable` restricts every added cell to recording coverage. It is optional so
+    the function stays callable without recordings, but the build always passes it:
+    a cell outside the recordings is dropped downstream and fails the activity
+    with `recording_gap`, so an unbounded repair could turn a bad sheet into no
+    sheet at all.
+
+    Never worse: the result is returned only if it strictly improves the worst
+    hole and keeps a whole number of rows. Anything else returns the input, so a
+    caller cannot lose a good sheet to this function.
+    """
+    ordered = tuple(sorted({float(cell) for cell in cells}))
+    if not ordered or end <= start or max_gap <= 0:
+        return ordered
+    before, _, _ = worst_unobserved_gap(ordered, start=start, end=end)
+    if before <= max_gap:
+        return ordered
+    if not usable:
+        # Without coverage information no added cell can be guaranteed fetchable,
+        # and a repair that risks failing the build is worse than a wide hole.
+        return ordered
+
+    # Cells whose POSITION carries meaning, and which therefore never move:
+    #
+    # * the two the prompt's rules read by name -- the person's first frame and
+    #   the emptied scene -- plus `plan.last_time`, the "末帧" the documented
+    #   layout names. Leaving `last_time` out was a real defect: measured over 20k
+    #   random motion-shaped sheets the relocation stage dropped it in 71.6% of
+    #   them, so the sheet silently lost the cell that says where the person was
+    #   last seen.
+    # * every cell OUTSIDE the window. It cannot cover anything there, but it is
+    #   part of the timeline the prompt reads -- the preview route reaches back
+    #   before the person's first sample on purpose -- so dropping it would move
+    #   the sheet's own endpoints.
+    fixed = {float(value) for value in protect} & set(ordered)
+    fixed |= {value for value in ordered if value < start or value > end}
+    if len(fixed) < 2:
+        # Too little to anchor on: the sheet's own extremes stand in.
+        fixed = {ordered[0], ordered[-1]}
+
+    candidates = sorted({float(value) for value in pool} | set(ordered))
+    best: tuple[float, ...] | None = None
+    best_worst = before
+
+    def attempt(existing: list[float], count: int) -> tuple[float, ...] | None:
+        """Add cells to `existing` until it holds `count`, or None."""
+        added = _cells_to_cover(
+            candidates,
+            existing,
+            usable,
+            start=start,
+            end=end,
+            room=count - len(existing),
+        )
+        if added is None:
+            return None
+        trial = tuple(sorted({*existing, *added}))
+        if len(trial) != count:
+            return None
+        return trial
+
+    # ADD FIRST, and it is tried at BOTH sizes before anything is moved.
+    #
+    # ADD keeps every cell the selection chose and only puts new ones in the widest
+    # holes, so it overrules nothing: the change-aware choice of what is worth
+    # showing is the sheet's whole value. It is enough more often than not, and it
+    # is the only strategy allowed to run when the sheet is already within the
+    # bound.
+    for count in (
+        len(ordered),
+        len(ordered) + 3 if len(ordered) + 3 <= cap else 0,
+    ):
+        if count < 6 or count > cap or count % 3 or count < len(fixed):
+            continue
+        trial = attempt(list(ordered), count)
+        if trial is None:
+            continue
+        trial_worst, _, _ = worst_unobserved_gap(trial, start=start, end=end)
+        if trial_worst < best_worst:
+            best_worst = trial_worst
+            best = trial
+            if trial_worst <= max_gap:
+                return best
+
+    # ADD could not reach the bound. Only now is it worth MOVING cells, and this
+    # is why the strategy exists rather than because it is generally better:
+    # measured on the reported six-grid, ADD's three new cells all land inside the
+    # single 52.9 s hole and split it into four parts of 13.2 s -- still over the
+    # 12 s bound -- while spending the same nine cells across the window reaches
+    # 11.0 s.
+    #
+    # It is deliberately the LAST resort, and it only ever runs when the sheet is
+    # over the bound. Running it at a size the sheet already has was tried and
+    # reverted: on a fixture whose cells deliberately collide, restructuring the
+    # sheet at the same size moved cells out of the colliding moment, which removed
+    # the collision the recordings fallback exists to handle -- so a pinned
+    # regression path silently stopped being exercised. A repair that changes which
+    # moments the sheet shows must have a reason, and "the bound is still missed"
+    # is that reason.
+    for count in (
+        len(ordered),
+        len(ordered) + 3 if len(ordered) + 3 <= cap else 0,
+    ):
+        if count < 6 or count > cap or count % 3 or count < len(fixed):
+            continue
+        trial = attempt(sorted(fixed), count)
+        if trial is None:
+            continue
+        trial_worst, _, _ = worst_unobserved_gap(trial, start=start, end=end)
+        if trial_worst < best_worst:
+            best_worst = trial_worst
+            best = trial
+            if trial_worst <= max_gap:
+                return best
+
+    # Nothing improved the sheet: the original comes back untouched, because a
+    # partial row or a worse hole would both be strictly more harmful than the
+    # hole this was called to close.
+    if best is None or len(best) % 3 or len(best) > cap or len(best) < 6:
+        return ordered
+    return best
+
+
+def _cells_to_cover(
+    candidates: Sequence[float],
+    existing: Sequence[float],
+    usable: Sequence[tuple[float, float]],
+    *,
+    start: float,
+    end: float,
+    room: int,
+) -> list[float] | None:
+    """Up to `room` fetchable instants that close the widest holes between cells.
+
+    Water-filling decides how many cells each hole gets. For a fixed number of free
+    points across a span the uniform arrangement is optimal, but that holds only
+    when the points may move: here the existing cells stay exactly where they are,
+    and the holes between them differ wildly -- the reported six-grid is one 52.9 s
+    hole beside four of a few seconds. Splitting the cells evenly across holes would
+    spend them on holes that are already narrow. A hole of width `w` needs
+    `ceil(w / limit) - 1` cells to come under `limit`, so the best achievable limit
+    is the smallest one whose total demand fits the budget, found by bisection.
+
+    Each target snaps to the nearest candidate, so a moment the preview analysis
+    already decoded is reused rather than a fresh instant invented. Returns None
+    when the pool cannot supply a distinct fetchable instant for every target.
+    """
+    if room <= 0:
+        return None
+    edges = sorted({start, *(v for v in existing if start < v < end), end})
+    holes = [
+        (left, right)
+        for left, right in zip(edges, edges[1:], strict=False)
+        if right > left
+    ]
+    if not holes:
+        return None
+
+    low, high = 0.0, max(right - left for left, right in holes)
+    for _ in range(80):
+        middle = (low + high) / 2
+        if middle <= 0:
+            low = high
+            break
+        need = sum(
+            max(0, math.ceil((right - left) / middle) - 1) for left, right in holes
+        )
+        if need <= room:
+            high = middle
+        else:
+            low = middle
+
+    quota = [
+        max(0, math.ceil((right - left) / high) - 1) for left, right in holes
+    ]
+    # Any spare goes to the holes that gain most from one more cell, so the budget
+    # the sheet was given is actually spent.
+    for _ in range(room - sum(quota)):
+        index = max(
+            range(len(holes)),
+            key=lambda i: (holes[i][1] - holes[i][0]) / (quota[i] + 1),
+        )
+        quota[index] += 1
+
+    targets: list[float] = []
+    for (left, right), slots in zip(holes, quota, strict=True):
+        targets.extend(
+            left + (right - left) * (index + 1) / (slots + 1)
+            for index in range(slots)
+        )
+    if len(targets) > room:
+        return None
+    targets.sort()
+
+    def fetchable(moment: float) -> bool:
+        return any(
+            low_bound <= moment <= high_bound for low_bound, high_bound in usable
+        )
+
+    used = {float(value) for value in existing}
+    chosen: list[float] = []
+    for target in targets:
+        best: float | None = None
+        best_distance = math.inf
+        for value in candidates:
+            moment = float(value)
+            if moment in used or not start < moment < end or not fetchable(moment):
+                continue
+            distance = abs(moment - target)
+            if distance < best_distance:
+                best_distance = distance
+                best = moment
+        if best is None:
+            return None
+        used.add(best)
+        chosen.append(best)
+    return chosen
+
+
 def _required_role(
     by_role: Mapping[str, tuple[float, Path]], role: str
 ) -> tuple[float, Path]:
@@ -1480,6 +1879,99 @@ class MediaManager:
         # Refusals collected by the most recent repair pass, for the metadata.
         self._last_cross_segment_rejected: list[dict[str, Any]] = []
 
+    async def _async_enforce_coverage(
+        self,
+        record: ActivityRecord,
+        temporary: Path,
+        selected: Sequence[tuple[float, Path]],
+        plan: EvidencePlan,
+        recordings: Sequence[Mapping[str, Any]],
+        pool: Sequence[float],
+    ) -> list[tuple[float, Path]]:
+        """Add the cells that bound the sheet's unobserved stretches.
+
+        The selection the two routes produce is change-aware: it aims cells at the
+        moments that changed, which is what makes the sheet worth reading. It does
+        not promise to observe the whole activity, and measured on the deployment
+        that reported this twice it usually did not -- 96 of 162 published sheets
+        held a hole wider than the module's own declared 12 s tolerance.
+
+        The window passed to the repair is the PERSON's own span (`first_time` ..
+        `last_time`), not the review's, because that is the stretch the prompt's
+        rules reason about: they read the person's arrival, their movement and
+        their departure from these cells. The postroll scene is protected
+        separately and deliberately sits outside the window.
+
+        Failure is soft in every direction. `enforce_coverage` returns the input
+        unchanged when it cannot improve it, a chosen instant that Frigate will not
+        serve is skipped rather than fatal, and a frame that cannot be written is
+        skipped too. The sheet this method is handed is always still a valid sheet,
+        so an optional improvement must never be able to cost the activity -- the
+        same contract the close-up and the face service follow.
+        """
+        covered = self._coverage_intervals(recordings)
+        try:
+            planned = enforce_coverage(
+                [timestamp for timestamp, _ in selected],
+                pool,
+                start=plan.first_time,
+                end=plan.last_time,
+                max_gap=MAX_SAMPLE_GAP,
+                cap=MAX_CELLS,
+                # The cells whose position the prompt's rules and the documented
+                # layout depend on: the person's first frame, their last, and the
+                # emptied scene. All three are read by name, so none may be traded
+                # away for coverage.
+                protect=(plan.first_time, plan.last_time, plan.postroll_time),
+                usable=covered,
+            )
+        except Exception:  # noqa: BLE001 - an optimisation may never fail a build
+            _LOGGER.warning(
+                "Coverage repair failed for %s; keeping the selected cells",
+                record.activity_id,
+                exc_info=True,
+            )
+            return list(selected)
+
+        # The repair is ADDITIVE plus relocation: the cells the selection chose are
+        # kept unless one is given up to shrink the worst hole, so the frames
+        # already fetched are reused wherever their instants survived. Only the
+        # cells that are genuinely new need a request.
+        known = dict(selected)
+        added = [moment for moment in planned if moment not in known]
+        if not added:
+            return list(selected)
+
+        result: list[tuple[float, Path]] = []
+        for moment in planned:
+            if moment in known:
+                result.append((moment, known[moment]))
+                continue
+            try:
+                data = await self._client.async_get_snapshot(
+                    record.camera, moment, 360
+                )
+            except (FrigateApiError, OSError, MediaError):
+                # The cell was checked against recording coverage already, so this
+                # is Frigate failing to serve an instant it reports as recorded -- a
+                # transient the rest of the build also tolerates. Returning the
+                # original sheet keeps the count valid and the activity alive.
+                _LOGGER.warning(
+                    "Could not fetch the coverage cell at %s for %s; "
+                    "keeping the selected cells",
+                    moment,
+                    record.activity_id,
+                )
+                return list(selected)
+            path = temporary / f"coverage_{len(result)}.jpg"
+            try:
+                await self._hass.async_add_executor_job(path.write_bytes, data)
+            except OSError:
+                return list(selected)
+            result.append((moment, path))
+        result.sort(key=lambda item: item[0])
+        return result
+
     async def _async_person_highlight(
         self,
         record: ActivityRecord,
@@ -1859,6 +2351,10 @@ class MediaManager:
             if allow_preview
             else None
         )
+        # Empty on every route except preview, where it holds the frames the
+        # analysis already decoded. Declared here so the coverage repair below has
+        # one pool to read regardless of which route ran.
+        preview_pool: list[float] = []
         if preview is not None:
             preview_times, preview_meta = preview
             times = preview_times
@@ -1868,6 +2364,21 @@ class MediaManager:
             # scene. Everything between them is a change cell, which is what the
             # sheet's middle has always been.
             roles = _roles_for_preview(preview_times)
+            # EVERY frame the preview analysis decoded, not just the ones it chose.
+            #
+            # `_async_preview_timestamps` scores up to PREVIEW_FRAME_BUDGET (120)
+            # preview frames -- the reported 7xahuw artifact records 80 analysed --
+            # but it only ever returned the 6 it picked. The coverage repair was
+            # therefore choosing from the handful of instants the change selector
+            # had already preferred, which is exactly the set that leaves wide
+            # holes: measured by replaying all 160 published sheets, the repair
+            # takes the over-bound count from 58% to 19% with this pool, against
+            # 10% when the analysed moments are available to it.
+            #
+            # These are frames that were already downloaded and scored, so offering
+            # them costs no extra fetch -- a coverage cell placed on one of them is
+            # an instant the sheet can be shown to have looked at.
+            preview_pool = list(preview_meta.pop("_analysed_times", ()))
         elif plan.motion_times:
             times = (
                 plan.first_time,
@@ -2075,6 +2586,27 @@ class MediaManager:
                     last_frame,
                     postroll_frame,
                 ]
+            # Bound the unobserved stretches before the repairs run, so a cell
+            # added for coverage is itself subject to the night-vision, exposure
+            # and duplicate passes rather than reaching the sheet unchecked.
+            #
+            # This is the one place both routes have converged, which is why the
+            # guarantee lives here rather than in either selector: the reported
+            # defects were one of each -- a 52.9 s hole on the recordings route and
+            # a 30.3 s hole on the preview route -- and both were published as
+            # perfectly ordinary sheets.
+            selected = await self._async_enforce_coverage(
+                record,
+                temporary,
+                selected,
+                plan,
+                recordings,
+                [
+                    *plan.change_candidates,
+                    *(timestamp for timestamp, _ in candidates),
+                    *preview_pool,
+                ],
+            )
             # Each repair pass resets the refusal list, so it is collected after
             # every one of them: a frame the IR ladder refused and then the
             # uniqueness ladder refused as well is two facts, not one.
@@ -2149,12 +2681,12 @@ class MediaManager:
                 json.dumps(
                     {
                         "activity_id": record.activity_id,
-                        # 5: the candidate source, the segment structure and the
-                        # cross-segment refusals are recorded. Bumped rather than
-                        # added silently so a reader can tell which fields to
-                        # expect -- and `_read_existing` accepts 1 through 5, so
-                        # artifacts written before this still restore.
-                        "plan_version": 5,
+                        # 6: the coverage block below is recorded. Bumped rather
+                        # than added silently so a reader can tell which fields to
+                        # expect -- and `_read_existing` accepts 1 through 6, so
+                        # artifacts written before this still restore rather than
+                        # being rebuilt on the next restart.
+                        "plan_version": 6,
                         "mode": plan.mode,
                         "selection_source": selection_source,
                         "candidate_source": (
@@ -2162,6 +2694,34 @@ class MediaManager:
                         ),
                         "planned_times": list(requested),
                         "sample_times": samples,
+                        # What the FINAL sheet's worst unobserved stretch came to,
+                        # measured after all three repair passes rather than when
+                        # the coverage cells were chosen.
+                        #
+                        # This is the field that makes the bound checkable in
+                        # production. The repair is a pre-pass: the night-vision,
+                        # exposure and uniqueness ladders can each move a cell by
+                        # up to 15 s afterwards, so the hole that was closed is not
+                        # guaranteed to still be closed. Nothing re-runs the repair
+                        # (a second pass would fight the repairs for the same
+                        # cells), so instead the result is recorded -- a sheet that
+                        # ends up over the bound is then a fact in the artifact
+                        # rather than something only a reader of the image could
+                        # notice.
+                        "coverage": {
+                            "max_gap_seconds": round(
+                                worst_unobserved_gap(
+                                    samples,
+                                    start=plan.first_time,
+                                    end=plan.last_time,
+                                )[0],
+                                3,
+                            ),
+                            "limit_seconds": MAX_SAMPLE_GAP,
+                            "window_seconds": round(
+                                plan.last_time - plan.first_time, 3
+                            ),
+                        },
                         # Whether this build is the retry that ran after the preview
                         # selection produced a duplicate frame. Without it a retried
                         # activity is indistinguishable from one where preview was
@@ -2402,6 +2962,10 @@ class MediaManager:
             "preview_names": [
                 names_by_time.get(moment, "") for moment in chosen
             ],
+            # Private: read by the build and removed from the metadata before it
+            # is written. Every frame that was decoded and scored -- already paid
+            # for, and the pool the coverage repair should choose from.
+            "_analysed_times": tuple(moment for moment, _ in frames),
         }
 
     async def _async_probe_widest_gap(
@@ -3096,7 +3660,7 @@ def _read_existing(
             return None
         if payload.get("activity_id") != activity_id or payload.get(
             "plan_version"
-        ) not in {1, 2, 3, 4, 5}:
+        ) not in {1, 2, 3, 4, 5, 6}:
             return None
         mode = str(payload["mode"])
         source_value = payload.get("selection_source")
