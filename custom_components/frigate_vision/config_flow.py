@@ -73,6 +73,41 @@ from .vision import (
 )
 
 
+def _reasoning_effort_options(stored: str = "") -> list[str]:
+    """The effort dropdown's choices: what the endpoint accepts, plus what is stored.
+
+    The union is load-bearing and using only the first half was a defect. `max` was
+    offered by v0.1.1 and v0.1.2 and removed from `REASONING_EFFORTS` because
+    Google answers it with a hard 400 -- but removing it from the list does not
+    remove it from a deployment, where it sits in `entry.options` until the form is
+    next saved. A `SelectSelector` built with `options=` and no `custom_value` is a
+    CLOSED list, so Home Assistant prefilled the stored `max`, showed it as the
+    current choice, and then rejected the save with
+
+        value must be one of ['default', 'high', 'low', 'medium']
+
+    -- an error about a field the user never touched, while editing something
+    unrelated. Measured on both the options and setup schemas.
+
+    This is the same rule `_focus_zone_options` and `merge_model_options` already
+    follow: a stored value is kept even when no list mentions it, because dropping
+    it silently rewrites the user's configuration as a side effect of opening a
+    form.
+
+    The union adds the STORED value only, never the historical option set -- so a
+    deployment that never chose `max` still never sees it, and the commit's intent
+    (a rejected value is not on offer) is preserved for everyone else. A stored
+    `max` sent to Gemini is translated to `high` by `reasoning_effort_for` on the
+    request path, and deliberately left alone for a provider that was never
+    measured, which is why this cannot simply rewrite the value instead.
+    """
+    options = list(REASONING_EFFORTS)
+    text = stored.strip() if isinstance(stored, str) else ""
+    if text and text not in options:
+        options.append(text)
+    return options
+
+
 def _text() -> selector.TextSelector:
     return selector.TextSelector(selector.TextSelectorConfig())
 
@@ -218,6 +253,8 @@ def _options_schema(
     focus_zones: Sequence[str] = (),
     primary_models: Sequence[str] = (),
     fallback_models: Sequence[str] = (),
+    primary_effort: str = "",
+    fallback_effort: str = "",
 ) -> vol.Schema:
     """The options form.
 
@@ -236,6 +273,12 @@ def _options_schema(
     Defaulting all three to empty keeps every existing call site working and
     reproduces the previous behaviour exactly (a text field for the models, no
     zone choices), so this signature change is inert until a caller passes more.
+
+    `primary_effort` and `fallback_effort` carry the two STORED effort values into
+    the closed dropdowns. They exist because a stored value can be one an older
+    version offered and this one does not (`max`, removed after Google answered it
+    with a 400), and a closed list that omits it rejects the save on a field the
+    user never edited -- see `_reasoning_effort_options`.
     """
     return vol.Schema(
         {
@@ -262,7 +305,9 @@ def _options_schema(
             vol.Optional(
                 CONF_LLM_REASONING_EFFORT, default="default"
             ): selector.SelectSelector(
-                selector.SelectSelectorConfig(options=list(REASONING_EFFORTS))
+                selector.SelectSelectorConfig(
+                    options=_reasoning_effort_options(primary_effort)
+                )
             ),
             vol.Optional(CONF_LLM_THINKING, default="default"): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=list(THINKING_MODES))
@@ -292,7 +337,9 @@ def _options_schema(
             vol.Optional(
                 CONF_FALLBACK_LLM_REASONING_EFFORT, default="default"
             ): selector.SelectSelector(
-                selector.SelectSelectorConfig(options=list(REASONING_EFFORTS))
+                selector.SelectSelectorConfig(
+                    options=_reasoning_effort_options(fallback_effort)
+                )
             ),
             vol.Optional(
                 CONF_FALLBACK_LLM_THINKING, default="default"
@@ -506,7 +553,9 @@ def _provider_for_url(base_url: str) -> str:
     return provider_for_url(base_url)
 
 
-def _llm_schema(*, model_options: Sequence[str] = ()) -> vol.Schema:
+def _llm_schema(
+    *, model_options: Sequence[str] = (), effort: str = ""
+) -> vol.Schema:
     """The provider step: a preset to pick, and a URL that stays editable.
 
     The URL is the field most easily got wrong -- it must be the OpenAI-compatible
@@ -534,7 +583,9 @@ def _llm_schema(*, model_options: Sequence[str] = ()) -> vol.Schema:
             vol.Required(
                 CONF_LLM_REASONING_EFFORT, default="default"
             ): selector.SelectSelector(
-                selector.SelectSelectorConfig(options=list(REASONING_EFFORTS))
+                selector.SelectSelectorConfig(
+                    options=_reasoning_effort_options(effort)
+                )
             ),
             vol.Required(CONF_LLM_THINKING, default="default"): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=list(THINKING_MODES))
@@ -917,6 +968,9 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
                 CONF_LLM_PROVIDER: provider,
                 CONF_LLM_BASE_URL: base_url,
                 CONF_LLM_MODEL: model,
+                CONF_LLM_REASONING_EFFORT: str(
+                    user_input.get(CONF_LLM_REASONING_EFFORT, "default")
+                ),
             }
         # The initial flow has no config entry, so the key is read from the
         # submission rather than from storage. On the first render there is none and
@@ -933,7 +987,15 @@ class FrigateEntryIntelligenceConfigFlow(config_entries.ConfigFlow, domain=DOMAI
             # key, not with each caller's care. A future edit that adds the typed key
             # here would otherwise ship it back to the browser.
             data_schema=self.add_suggested_values_to_schema(
-                _llm_schema(model_options=model_options), _strip_secrets(suggestions)
+                _llm_schema(
+                    model_options=model_options,
+                    # The re-render after a failed save echoes back what the user
+                    # submitted, which may be a value this version no longer offers.
+                    # Without it the closed dropdown rejects the retry on a field the
+                    # user cannot see is the problem.
+                    effort=str(suggestions.get(CONF_LLM_REASONING_EFFORT, "")),
+                ),
+                _strip_secrets(suggestions),
             ),
             errors=errors,
         )
@@ -1326,6 +1388,10 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
                     focus_zones=focus_zones,
                     primary_models=primary_models,
                     fallback_models=fallback_models,
+                    primary_effort=str(suggestions.get(CONF_LLM_REASONING_EFFORT, "")),
+                    fallback_effort=str(
+                        suggestions.get(CONF_FALLBACK_LLM_REASONING_EFFORT, "")
+                    ),
                 ),
                 _strip_secrets(suggestions),
             ),
@@ -1415,6 +1481,10 @@ class FrigateEntryIntelligenceOptionsFlow(config_entries.OptionsFlowWithReload):
                     focus_zones=focus_zones,
                     primary_models=primary_models,
                     fallback_models=fallback_models,
+                    primary_effort=str(suggestions.get(CONF_LLM_REASONING_EFFORT, "")),
+                    fallback_effort=str(
+                        suggestions.get(CONF_FALLBACK_LLM_REASONING_EFFORT, "")
+                    ),
                 ),
                 _strip_secrets(suggestions),
             ),

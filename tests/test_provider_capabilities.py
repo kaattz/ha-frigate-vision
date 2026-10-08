@@ -301,3 +301,133 @@ def test_the_translation_table_cannot_name_an_unknown_provider() -> None:
     from custom_components.frigate_vision.const import PROVIDER_PRESETS
 
     assert set(REASONING_EFFORT_TRANSLATIONS) <= set(PROVIDER_PRESETS)
+
+
+class TestTheFormAcceptsAValueThisVersionNoLongerOffers:
+    """Dropping `max` from the list is not enough, because the list is CLOSED.
+
+    The request path was reasoned about carefully and is correct. The FORM path was
+    not considered, and it broke: v0.1.1 and v0.1.2 offered `max`, so an entry can
+    hold it, and a `SelectSelector` built with `options=` and no `custom_value`
+    accepts only what it lists. Measured before the fix, on the real schema:
+
+        options  submit 'max' -> vol.Invalid: value must be one of
+                                 ['default','high','low','medium']
+        setup    submit 'max' -> vol.Invalid: value must be one of [...]
+
+    Home Assistant prefills the field with the stored value, so the user is shown
+    `max` as their current choice and then told it is invalid -- on save, about a
+    field they never touched, while editing something unrelated.
+
+    The fix is the union rule this file's siblings already follow
+    (`_focus_zone_options`, `merge_model_options`): keep a stored value even when
+    no list mentions it. These tests pin it on every form path, because a fix
+    applied at one call site is the failure mode this repository keeps finding.
+    """
+
+    @staticmethod
+    def _validator(schema, needle: str):
+        for key in schema.schema:
+            if needle in str(key):
+                return schema.schema[key]
+        raise AssertionError(f"{needle} not in schema: {list(map(str, schema.schema))}")
+
+    @pytest.mark.parametrize(
+        ("label", "kwargs", "needle"),
+        [
+            ("options-primary", {"primary_effort": "max"}, "llm_reasoning_effort"),
+            (
+                "options-fallback",
+                {"fallback_effort": "max"},
+                "fallback_llm_reasoning_effort",
+            ),
+            ("setup", {"effort": "max"}, "llm_reasoning_effort"),
+        ],
+    )
+    def test_a_stored_max_survives_a_save(self, label, kwargs, needle) -> None:
+        from custom_components.frigate_vision.config_flow import (
+            _llm_schema,
+            _options_schema,
+        )
+
+        factory = _llm_schema if label == "setup" else _options_schema
+        validator = self._validator(factory(**kwargs), needle)
+        validator("max")  # must not raise
+
+    def test_the_list_is_still_closed_to_values_nobody_offered(self) -> None:
+        """A union with the stored value must not become an open list.
+
+        The distinction that makes the fix safe rather than merely permissive: a
+        value that was never offered AND never stored is still refused, so this
+        does not reintroduce the "type anything into a cost control" problem.
+        """
+        import voluptuous as vol
+
+        from custom_components.frigate_vision.config_flow import _options_schema
+
+        validator = self._validator(
+            _options_schema(primary_effort="max"), "llm_reasoning_effort"
+        )
+        for rejected in ("totally-made-up", "HIGH", "auto", "minimal"):
+            with pytest.raises(vol.Invalid):
+                validator(rejected)
+
+    def test_nothing_stored_leaves_the_list_exactly_as_shipped(self) -> None:
+        """The union adds the STORED value only, never the historical option set.
+
+        So a deployment that never chose `max` still never sees it, and the
+        original commit's intent -- a value the endpoint rejects is not on offer --
+        is preserved for everyone who did not already hold one.
+        """
+        from custom_components.frigate_vision.config_flow import (
+            _reasoning_effort_options,
+        )
+
+        assert _reasoning_effort_options("") == list(REASONING_EFFORTS)
+        assert _reasoning_effort_options("high") == list(REASONING_EFFORTS)
+        assert _reasoning_effort_options("max") == [*REASONING_EFFORTS, "max"]
+        # Whitespace is what a hand-edited .storage file tends to contain.
+        assert _reasoning_effort_options("  max  ") == [*REASONING_EFFORTS, "max"]
+
+    def test_the_options_flow_feeds_the_stored_value_to_the_schema(self) -> None:
+        """The wiring, not just the helper.
+
+        A correct helper that no caller feeds is the exact class of defect this
+        session found elsewhere: the guard exists, is tested, and is not connected.
+        So this asserts the two settings-form render paths pass the stored effort
+        into the schema each builds. Both matter: the success path returns before
+        the error path, so a fix applied only to one leaves the other broken.
+        """
+        import inspect
+
+        from custom_components.frigate_vision import config_flow as module
+
+        source = inspect.getsource(
+            module.FrigateEntryIntelligenceOptionsFlow
+        )
+        assert source.count("primary_effort=") >= 2, (
+            "the options schema is not built with the stored primary effort on "
+            "every render path, so a legacy `max` is rejected again"
+        )
+        assert source.count("fallback_effort=") >= 2, (
+            "the options schema is not built with the stored fallback effort on "
+            "every render path"
+        )
+
+    def test_the_setup_flow_feeds_the_stored_value_to_the_schema(self) -> None:
+        """The setup step re-renders after a failed save with what was submitted.
+
+        That value is user input, so it can be anything this version no longer
+        offers -- the same closed-list rejection, reached a different way.
+        """
+        import inspect
+
+        from custom_components.frigate_vision import config_flow as module
+
+        source = inspect.getsource(
+            module.FrigateEntryIntelligenceConfigFlow
+        )
+        assert "effort=str(suggestions.get(CONF_LLM_REASONING_EFFORT" in source, (
+            "the setup schema is built without the submitted effort, so a value "
+            "this version no longer offers cannot be corrected"
+        )
