@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
@@ -8,6 +10,41 @@ from homeassistant.core import HomeAssistant
 @pytest.fixture(autouse=True)
 def auto_enable_custom_integrations(enable_custom_integrations: None) -> None:
     """Enable loading custom integrations in every test."""
+
+
+@pytest.fixture(autouse=True)
+def _no_live_model_discovery():
+    """Stop a form render from reaching the network.
+
+    The model dropdown queries the provider for its catalogue while the form is
+    being built. That is deliberate in production -- best effort, 5 s timeout,
+    degrades to the built-in list -- but it means any test that renders the
+    settings form on an entry holding an api_key performs real I/O.
+
+    This was a CI-only failure, and the reason is worth recording. The suite passes
+    on Windows because `tests/windows_socket.py` neutralises
+    `pytest_socket.disable_socket` (asyncio needs a socketpair for its self-pipe and
+    Windows has no AF_UNIX one). CI runs on Linux with the stock guard, which
+    rejects the connection and fails four pre-existing tests at teardown:
+
+        ERROR tests/test_config_flow.py::test_a_valid_fallback_url_is_still_accepted
+        ERROR tests/test_provider_ui_bugs.py::test_choosing_custom_changes_...
+        ERROR tests/test_provider_ui_bugs.py::test_the_settings_form_no_longer_...
+        ERROR tests/test_provider_ui_bugs.py::test_the_settings_menu_groups_...
+
+    So a green local run could not see this, and neither could the review that
+    approved the commit. Stubbing here fixes the class rather than the four: any
+    future test that opens the form is covered, on both platforms.
+
+    Patched at `config_flow.async_fetch_model_ids`, one level above the cache and
+    below the callers, which is the same seam `tests/test_model_dropdown_flow.py`
+    uses. A test that wants a specific catalogue patches over this and wins.
+    """
+    with patch(
+        "custom_components.frigate_vision.config_flow.async_fetch_model_ids",
+        AsyncMock(return_value=()),
+    ) as stub:
+        yield stub
 
 
 @pytest.fixture(autouse=True)
