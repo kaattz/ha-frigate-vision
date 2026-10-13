@@ -54,6 +54,24 @@ CONF_LLM_PROVIDER = "llm_provider"
 CONF_LLM_BASE_URL_DEFAULT = "https://api.deepseek.com/v1"
 CONF_LLM_PROVIDER_DEFAULT = "deepseek"
 
+# 一个 provider 返回 5xx 之后，原地重试多少次才轮到下一个 provider。
+#
+# 默认 **0**，即不重试、失败立刻切兜底。这个默认值是一次事故的结论：每个活动
+# 的尝试数等于 `(重试+1) × provider 数`，而失败是乘法的。默认的 4 次重试让一次
+# 失败花掉 8 次请求（4×2），5 个活动就是 40 次；免费额度只有 20 次/项目/天，
+# 实测日均 13.2 个活动，余量仅约 7 次——一个失败就足以触顶。
+#
+# 代价是明确接受的：短暂抖动不再由重试扛过去，改由兜底 provider 接手。实测
+# 11:48 那次确实靠第 3 次尝试成功，默认 0 之后它会落到兜底上。这个交换是值得的
+# 前提是兜底真的独立——见 `CONF_FALLBACK_LLM_MODEL` 与 `vision_retry_count` 的
+# 文档，同模型兜底会一起失败，那就只剩额度被烧掉。
+CONF_VISION_RETRY_COUNT = "vision_retry_count"
+CONF_VISION_RETRY_COUNT_DEFAULT = 0
+# 上限压在 5：再高也只是把同一份额度烧得更快（每次尝试都可能计费），而 2s/6s/18s
+# 的退避在 5 次之外已到分钟级，用户等的是一个「活动丢没丢」的答案，不是一个更慢
+# 的失败。
+CONF_VISION_RETRY_COUNT_MAX = 5
+
 # 证据图右侧是否再附一栏人物放大特写。九宫格里的人物只有 59x74 px，辨认衣着
 # 与携带物基本不可能；右侧特写栏能到 255-415 px，模型才真的看得清。
 #

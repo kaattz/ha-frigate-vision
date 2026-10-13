@@ -58,6 +58,7 @@
           "analyze_all_far_reviews": "Analyze all far-zone reviews",
           "person_highlight": "Person close-up",
           "face_service_url": "Face detection service URL (optional)",
+          "vision_retry_count": "Retries before failover (0 = switch immediately)",
           "focus_zones": "Focus zones"
         },
         "data_description": {
@@ -138,6 +139,7 @@
           "min_review_seconds": "Minimum activity length (seconds)",
           "analyze_night_unknown": "Analyze unknown night activity",
           "analyze_all_far_reviews": "Analyze all far-zone reviews",
+          "vision_retry_count": "Retries before failover (0 = switch immediately)",
           "focus_zones": "Focus zones"
         },
         "data_description": {

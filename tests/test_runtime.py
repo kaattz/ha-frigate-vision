@@ -21,6 +21,7 @@ from custom_components.frigate_vision.models import (
     IngressKind,
     IngressMessage,
 )
+from custom_components.frigate_vision.outage import OutageNotifier
 from custom_components.frigate_vision.runtime import (
     EntryRuntime,
     IntegrationRuntime,
@@ -954,3 +955,112 @@ def _door_data_legacy() -> dict:
         "contact_entity_id": "binary_sensor.front_contact",
         "doorbell_event_entity_id": "event.front_door_doorbell",
     }
+
+
+def _healthy_runtime(hass: HomeAssistant, entry_id: str = "entry_1"):
+    """A runtime that reports healthy unless something says otherwise.
+
+    `running` comes from the queue, so a started queue plus a Frigate client is
+    the "everything is up" case the health check is measured against.
+    """
+
+    class _Running:
+        running = True
+
+    runtime = IntegrationRuntime(
+        hass=hass,
+        store=ActivityStore(hass, entry_id),
+        queue=_Running(),  # type: ignore[arg-type]
+        entry_id=entry_id,
+    )
+    runtime.frigate_client = object()  # type: ignore[assignment]
+    runtime.correlation = object()  # type: ignore[assignment]
+    return runtime
+
+
+async def test_a_provider_outage_makes_the_health_sensor_unhealthy(
+    hass: HomeAssistant,
+) -> None:
+    """The health sensor must not report `on` while nothing is being analysed.
+
+    This is the 2026-10-13 defect stated as a test. `is_healthy` only asked
+    whether the machinery was running -- queue draining, workers alive, Frigate
+    reachable -- and all of that was true for the entire outage. So the binary
+    sensor read `on` from 13:00 to 18:00 while five activities failed, which is
+    worse than having no sensor: it is the surface a user checks *instead of*
+    investigating.
+    """
+    runtime = _healthy_runtime(hass)
+    assert runtime.is_healthy is True, "control: healthy before any failure"
+
+    runtime.record_error("provider_http_503")
+
+    assert runtime.is_healthy is False, (
+        "a provider outage must be visible on the health sensor, not only on the "
+        "Last error sensor and the Repair card"
+    )
+
+
+async def test_health_recovers_when_the_provider_answers_again(
+    hass: HomeAssistant,
+) -> None:
+    """The sensor has to come back, or it teaches the user to ignore it."""
+    runtime = _healthy_runtime(hass)
+
+    runtime.record_error("provider_http_503")
+    assert runtime.is_healthy is False
+
+    runtime.clear_error("provider_error")
+
+    assert runtime.is_healthy is True, "a recovered provider must restore health"
+
+
+async def test_a_local_failure_does_not_mark_the_provider_unhealthy(
+    hass: HomeAssistant,
+) -> None:
+    """Only provider-side failures may flip health.
+
+    `last_error` carries *any* exception string from the worker's catch-all, so
+    the health check reuses `the_provider_is_the_suspect` rather than testing for
+    `None`. A store conflict is not a provider outage, and reporting one would
+    send the user to the wrong subsystem.
+    """
+    runtime = _healthy_runtime(hass)
+
+    runtime.record_error("stage_conflict")
+
+    assert runtime.is_healthy is True, (
+        "a local error must not be reported as a provider outage"
+    )
+
+
+async def test_the_first_provider_failure_pushes_one_notification(
+    hass: HomeAssistant,
+) -> None:
+    """`record_error` is where the outage is announced, alongside the Repair card.
+
+    Wiring it here rather than in the failover loop is deliberate: the loop sees
+    one activity failing, this sees the entry's provider failing. Only the latter
+    is an outage, so only the latter may send a message.
+    """
+    sent: list[dict] = []
+
+    async def handler(call) -> None:
+        sent.append(dict(call.data))
+
+    hass.services.async_register("script", "alert_notify", handler)
+
+    runtime = _healthy_runtime(hass)
+    runtime.outage = OutageNotifier(hass)
+
+    runtime.record_error("provider_http_503")
+    await hass.async_block_till_done()
+
+    assert len(sent) == 1, "the first failure of an outage sends one message"
+    assert "provider_http_503" in sent[0]["message"]
+
+    # A second failing activity in the same outage must stay silent.
+    runtime.record_error("provider_http_503")
+    await hass.async_block_till_done()
+
+    assert len(sent) == 1, "one outage must not mean one message per activity"

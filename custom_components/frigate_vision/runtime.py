@@ -32,6 +32,7 @@ from .models import (
     IngressMessage,
     the_provider_is_the_suspect,
 )
+from .outage import OutageNotifier
 from .repairs import (
     ISSUES,
     PROVIDER_ERROR,
@@ -261,6 +262,9 @@ class IntegrationRuntime:
     allowed_zones: frozenset[str] = frozenset()
     delivery: DeliveryManager | None = None
     entry_id: str = ""
+    # Announces the first provider failure of an outage. None disables the push,
+    # which is what every existing construction and most tests want.
+    outage: OutageNotifier | None = None
 
     @classmethod
     async def async_create(
@@ -317,6 +321,11 @@ class IntegrationRuntime:
             analysis_tasks={},
         )
         runtime.delivery = DeliveryManager(hass, entry, store)
+        # Owned by the runtime rather than by the VisionClient: the outage is a
+        # property of the entry's provider, not of one activity's analysis, and
+        # `record_error` -- which raises the matching Repair card -- is where it
+        # is detected.
+        runtime.outage = OutageNotifier(hass)
         # Provider settings may have been entered through the Options page
         # rather than the initial flow, so both are considered; testing
         # `entry.data` alone left a UI-configured entry with no client.
@@ -445,6 +454,20 @@ class IntegrationRuntime:
         if not self.running or self.stopping:
             return False
         if self.correlation is not None and self.frigate_client is None:
+            return False
+        # A provider outage used to leave this `on`. The check above only asks
+        # whether the machinery is running, and it was: the queue drained, the
+        # workers ran, Frigate was reachable -- every activity simply failed at
+        # the last step. So for the whole of 2026-10-13's outage the binary sensor
+        # reported healthy while nothing was being analysed, which is worse than
+        # having no sensor at all: it is the surface a user checks *instead of*
+        # investigating.
+        #
+        # `last_error` is the same signal the `Last error` sensor shows and the
+        # same one that raises the Repair card, so the three cannot disagree.
+        if self.last_error is not None and the_provider_is_the_suspect(
+            self.last_error
+        ):
             return False
         return True
 
@@ -672,6 +695,12 @@ class IntegrationRuntime:
                         # would outlive the outage and train the user to ignore
                         # the list.
                         self.clear_error(PROVIDER_ERROR)
+                        # The push is armed again only by a success, so the next
+                        # outage notifies. Driven here rather than by a timeout:
+                        # a timer would re-notify in the middle of one long
+                        # outage, or stay silent through a second one.
+                        if self.outage is not None:
+                            self.outage.reset()
                         return
                     except VisionError as exc:
                         error = exc
@@ -770,6 +799,18 @@ class IntegrationRuntime:
             )
             if self.entry_id:
                 async_set_issue(self.hass, self.entry_id, PROVIDER_ERROR)
+            # The Repair card alone was not enough: on 2026-10-13 it was raised at
+            # 15:08 and went unnoticed until 18:00, with five activities lost in
+            # between. The push is sent from *here* rather than from the failover
+            # loop so that it fires for the same condition the card describes --
+            # the loop sees one activity, this sees the entry's provider failing,
+            # and only the latter is an outage. `OutageNotifier` keeps it to one
+            # message per outage.
+            if self.outage is not None:
+                self.hass.async_create_task(
+                    self.outage.async_notify_failure(code),
+                    f"frigate_vision-outage-{self.entry_id}",
+                )
 
     def clear_error(self, code: str) -> None:
         if code in ISSUES and self.entry_id:

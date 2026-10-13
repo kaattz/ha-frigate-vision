@@ -55,6 +55,9 @@ from .const import (
     CONF_SCENE_DESCRIPTION,
     CONF_SCENE_LABELS,
     CONF_TRANSITION_ZONES,
+    CONF_VISION_RETRY_COUNT,
+    CONF_VISION_RETRY_COUNT_DEFAULT,
+    CONF_VISION_RETRY_COUNT_MAX,
     DEFAULT_PROMPT_OVERRIDE,
     DEFAULT_SCENE_LABELS,
     DOMAIN,
@@ -350,6 +353,18 @@ def _options_schema(
                 int, vol.Range(512, 1920)
             ),
             vol.Required("max_tokens", default=4000): vol.All(int, vol.Range(1, 20000)),
+            # 一个 provider 返回 5xx 之后原地重试几次才切兜底。默认 0＝不重试。
+            #
+            # 每次失败的总请求数是乘法：`(重试+1) × provider 数`。旧行为写死 4 次
+            # 重试，于是一次失败花 8 次请求（5 个活动＝40 次），而免费额度只有
+            # 20 次/项目/天——实测日均 13.2 个活动，余量仅约 7 次，一个失败就触顶。
+            # 默认 0 把一次失败压到 2 次（主 1 + 备 1）。
+            #
+            # 代价是短暂抖动不再由重试扛过，改由兜底接手；前提是兜底真的独立
+            # （不同模型或不同 provider），否则只是把同一份额度烧得更快。
+            vol.Required(
+                CONF_VISION_RETRY_COUNT, default=CONF_VISION_RETRY_COUNT_DEFAULT
+            ): vol.All(int, vol.Range(0, CONF_VISION_RETRY_COUNT_MAX)),
             vol.Required("output_language", default="zh-CN"): _text(),
             # Optional. Empty keeps the prompt exactly as it was, so a
             # deployment that does not need this is unaffected.

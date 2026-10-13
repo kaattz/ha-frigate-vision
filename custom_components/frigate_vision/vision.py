@@ -56,6 +56,9 @@ from .const import (
     CONF_PROMPT_OVERRIDE,
     CONF_SCENE_DESCRIPTION,
     CONF_SCENE_LABELS,
+    CONF_VISION_RETRY_COUNT,
+    CONF_VISION_RETRY_COUNT_DEFAULT,
+    CONF_VISION_RETRY_COUNT_MAX,
     MAX_PROMPT_OVERRIDE_LENGTH,
     MAX_SCENE_DESCRIPTION_LENGTH,
     THINKING_UNSUPPORTED_PROVIDERS,
@@ -70,6 +73,7 @@ from .models import (
     is_failover_eligible,
     provider_status,
 )
+from .outage import OutageNotifier
 from .scenes import (
     SCENES,
     SceneRequest,
@@ -209,6 +213,12 @@ class VisionConfig:
     # same scene with different zones configured still deserve one answer each
     # rather than one shared cached answer.
     focus_zones: tuple[str, ...] = ()
+    # 原地重试次数（不含首次）。0 表示失败立刻交给下一个 provider。
+    #
+    # 放在 VisionConfig 而不是当作全局常量读，是因为它影响「一次失败要花几次
+    # 请求」，而那是每个部署自己该权衡的事：额度越紧、兜底越独立，就越应该直接切。
+    # 总尝试数为 `retry_count + 1`。
+    retry_count: int = CONF_VISION_RETRY_COUNT_DEFAULT
 
     def endpoint(self) -> str:
         """Return the chat-completions URL for this base URL.
@@ -444,10 +454,36 @@ def vision_config_from(
         model=pick("llm_model"),
         thinking=pick("llm_thinking", "default"),
         reasoning_effort=pick("llm_reasoning_effort", "default"),
+        retry_count=pick_retry_count(options, data),
         **_shared_prompt_settings(options),
         **_prompt_fields(data, options),
         focus_zones=pick_focus_zones(options, data),
     )
+
+
+def pick_retry_count(options: Mapping[str, Any], data: Mapping[str, Any]) -> int:
+    """Read the retry count, clamped to a usable range.
+
+    Written defensively for the same reason `pick_focus_zones` is: this value
+    crosses a JSON round trip and can come back as a string, a float, `None`, or a
+    number outside the form's range. A bad value must not be able to turn into an
+    unbounded retry loop, so everything unreadable collapses to the default and
+    everything readable is clamped rather than trusted.
+    """
+    value = options.get(CONF_VISION_RETRY_COUNT)
+    if value is None or value == "":
+        value = data.get(CONF_VISION_RETRY_COUNT)
+    if isinstance(value, bool):
+        # `bool` is an `int`, so it must be rejected before the numeric branch:
+        # `True` would otherwise mean "retry once".
+        return CONF_VISION_RETRY_COUNT_DEFAULT
+    if isinstance(value, (int, float)):
+        return max(0, min(CONF_VISION_RETRY_COUNT_MAX, int(value)))
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("-").isdigit():
+            return max(0, min(CONF_VISION_RETRY_COUNT_MAX, int(text)))
+    return CONF_VISION_RETRY_COUNT_DEFAULT
 
 
 def pick_focus_zones(
@@ -551,10 +587,14 @@ class VisionClient:
         store: ActivityStore,
         config: VisionConfig,
         fallback: VisionConfig | None = None,
+        notifier: OutageNotifier | None = None,
     ) -> None:
         self._hass = hass
         self._store = store
         self._config = config
+        # Announced once per outage when every provider fails. None keeps the
+        # previous behaviour for every existing construction, including tests.
+        self._notifier = notifier
         # The second provider, or None for a single-provider deployment. None is
         # the default so every existing construction keeps today's behaviour
         # exactly, including the error codes it records.
@@ -879,6 +919,7 @@ async def async_request_with_retry(
     config: VisionConfig,
     payload: Mapping[str, Any],
     *,
+    attempts: int = PROVIDER_RETRY_ATTEMPTS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> Mapping[str, Any]:
     """POST the payload, retrying the transient provider statuses.
@@ -889,6 +930,13 @@ async def async_request_with_retry(
     whether the request was handled, and that is the uncertainty that makes a
     replay unsafe.
 
+    `attempts` is the TOTAL number of tries, so `attempts=1` means "try once and
+    give up". It is a parameter rather than the module constant because the right
+    number is a deployment decision, not a property of the protocol: retrying is
+    the only way to survive a brief overload, but every retry is a billed request
+    and the failure path multiplies them by the number of providers. The default
+    keeps the constant's value so no existing caller changes behaviour.
+
     The attempt count is capped. An unbounded loop against a provider that is
     down for the night would never finish the activity, and would keep billing a
     request every backoff interval while it waited; a bounded one turns that into
@@ -897,7 +945,9 @@ async def async_request_with_retry(
     `sleep` is injected so tests can assert the backoff schedule without serving
     it. It defaults to `asyncio.sleep`, and every production caller omits it.
     """
-    attempts = 0
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
+    tried = 0
     while True:
         try:
             return await async_request(session, config, payload)
@@ -905,23 +955,23 @@ async def async_request_with_retry(
             status = provider_status(str(exc))
             if status not in AUTOMATIC_RETRY_STATUSES:
                 raise
-            attempts += 1
-            if attempts >= PROVIDER_RETRY_ATTEMPTS:
+            tried += 1
+            if tried >= attempts:
                 _LOGGER.warning(
                     "Giving up on the vision provider after %s attempts (HTTP %s)",
-                    attempts,
+                    tried,
                     status,
                 )
                 raise
             delay = PROVIDER_RETRY_BACKOFF_SECONDS * (
-                PROVIDER_RETRY_BACKOFF_FACTOR ** (attempts - 1)
+                PROVIDER_RETRY_BACKOFF_FACTOR ** (tried - 1)
             )
             _LOGGER.warning(
                 "Vision provider answered HTTP %s; retrying in %.1fs (attempt %s/%s)",
                 status,
                 delay,
-                attempts + 1,
-                PROVIDER_RETRY_ATTEMPTS,
+                tried + 1,
+                attempts,
             )
             await sleep(delay)
 
@@ -977,7 +1027,11 @@ async def async_analyze(
     )
     payload = build_payload(config, prompt, image_bytes)
     started = time.monotonic()
-    body = await async_request_with_retry(session, config, payload)
+    # `retry_count` is retries, not attempts: 0 means one try and then the
+    # fallback. See `async_request_with_retry`.
+    body = await async_request_with_retry(
+        session, config, payload, attempts=config.retry_count + 1
+    )
     elapsed = time.monotonic() - started
     classification, description, confidence = validate_response(body, allowed)
     usage = body.get("usage") if isinstance(body, Mapping) else None

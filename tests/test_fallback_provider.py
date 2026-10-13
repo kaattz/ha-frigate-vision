@@ -444,13 +444,28 @@ def _png(width: int, height: int) -> bytes:
     return buffer.getvalue()
 
 
-def _provider_config(url: str, model: str) -> VisionConfig:
+def _provider_config(
+    url: str,
+    model: str,
+    *,
+    retry_count: int | None = None,
+) -> VisionConfig:
+    """A provider config, optionally with an explicit retry budget.
+
+    `retry_count` is a deployment setting now (default 0, meaning "fail over
+    immediately"). The failover tests pass it explicitly because they are about
+    the *mechanism* -- how many requests the primary spends before the fallback is
+    tried -- and that accounting should not silently change meaning when the
+    default changes. Tests about the default itself live in
+    `test_retry_count_option.py`.
+    """
     return VisionConfig(
         base_url=url,
         api_key="secret",
         model=model,
         thinking="disabled",
         language="zh-CN",
+        **({} if retry_count is None else {"retry_count": retry_count}),
     )
 
 
@@ -482,6 +497,7 @@ async def _wire(
     fallback_script: list[tuple[int, str]] | None = None,
     with_fallback: bool = True,
     fallback_url: str = _FALLBACK_URL,
+    retry_count: int = PROVIDER_RETRY_ATTEMPTS - 1,
 ) -> tuple[ActivityStore, VisionClient, _RoutingSession]:
     """Build a real store, client and routing session for one analysis.
 
@@ -489,6 +505,12 @@ async def _wire(
     retry: the 2s/6s/18s schedule is a policy this change must not touch, and it
     is pinned as literals by `test_provider_retry.py`, so serving it here would
     only cost 26 seconds per test. The attempt *count* is untouched.
+
+    `retry_count` defaults to the historical hardcoded budget (4 attempts), not
+    to the new deployment default of 0. These tests are about the failover
+    mechanism and their assertions count requests, so an implicit change to the
+    budget would silently rewrite what they measure. The default-of-0 behaviour is
+    covered by `test_retry_count_option.py`.
 
     `fallback_url` exists so a test can hand the client a base URL that is
     malformed rather than merely unreachable. It is a parameter rather than a
@@ -513,8 +535,12 @@ async def _wire(
     client = VisionClient(
         hass,
         store,
-        _provider_config(_PRIMARY_URL, _PRIMARY_MODEL),
-        _provider_config(fallback_url, _FALLBACK_MODEL) if with_fallback else None,
+        _provider_config(_PRIMARY_URL, _PRIMARY_MODEL, retry_count=retry_count),
+        (
+            _provider_config(fallback_url, _FALLBACK_MODEL, retry_count=retry_count)
+            if with_fallback
+            else None
+        ),
     )
     return store, client, session
 
@@ -811,7 +837,12 @@ class TestTheFailoverLoop:
         tmp_path: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """要求 8：传输类失败先花完主组的重试预算，才轮到备用组。"""
+        """要求 8：传输类失败先花完主组的重试预算，才轮到备用组。
+
+        预算由 `_wire` 显式给出（历史值 4），所以这条测的是「主组把预算花光
+        之后才轮到备用组」这个顺序，而不是某个默认值。默认值本身是部署决定，
+        由 `test_retry_count_option.py` 覆盖。
+        """
         _store, client, session = await _wire(
             hass,
             tmp_path,
@@ -824,6 +855,39 @@ class TestTheFailoverLoop:
 
         assert session.calls_to(_PRIMARY_URL) == PROVIDER_RETRY_ATTEMPTS
         assert session.calls_to(_FALLBACK_URL) == 1
+        assert done.description == "备用组接手。"
+
+    async def test_the_default_budget_fails_over_after_a_single_request(
+        self,
+        hass: HomeAssistant,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """默认预算（0＝不重试）时，主组只发一次就切换。
+
+        这是 2026-10-13 事故的结论，量的是成本：一次失败的总请求数是
+        `(重试+1) × provider 数`，旧的 4 次重试让它等于 8，而免费额度是
+        20 次/项目/天、实测日均 13.2 个活动——余量只有约 7 次，一个失败就触顶。
+        默认 0 把它压到 2。
+        """
+        _store, client, session = await _wire(
+            hass,
+            tmp_path,
+            monkeypatch,
+            primary_script=[(503, "down")],
+            fallback_script=[(200, _ok_body("备用组接手。"))],
+            retry_count=0,
+        )
+
+        done = await client.async_analyze("activity_1")
+
+        assert session.calls_to(_PRIMARY_URL) == 1, (
+            "默认预算下主组不得重试，否则默认值没有兑现"
+        )
+        assert session.calls_to(_FALLBACK_URL) == 1
+        assert len(session.calls) == 2, (
+            "一次成功兜底的失败扇出必须正好 2 次请求（主 1 + 备 1）"
+        )
         assert done.description == "备用组接手。"
 
     async def test_without_a_fallback_the_behaviour_is_unchanged(

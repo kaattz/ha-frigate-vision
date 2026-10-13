@@ -120,6 +120,66 @@ async def test_a_persistent_5xx_gives_up_after_a_bounded_number_of_attempts() ->
     assert session.calls == PROVIDER_RETRY_ATTEMPTS
 
 
+async def test_one_attempt_means_no_retry_at_all() -> None:
+    """`attempts=1` is the deployment's new default: one try, then the fallback.
+
+    This is the number that matters for the daily budget. An activity costs
+    `(retries + 1) x providers` requests, so a single failing activity under the
+    old 4-attempt default spent 8 requests against a 20/day free-tier quota;
+    with one attempt per provider it spends 2. Measured on 2026-10-13, five
+    failed activities burned 40 requests that way.
+    """
+    session = _ScriptedSession([(503, "down")])
+
+    with pytest.raises(VisionError, match="provider_http_503"):
+        await async_request_with_retry(  # type: ignore[arg-type]
+            session, _config(), {"model": "vision-model"}, attempts=1, sleep=_Sleeper()
+        )
+
+    assert session.calls == 1, "one attempt must mean exactly one request"
+
+
+async def test_the_retry_budget_is_exactly_the_configured_attempts() -> None:
+    """A configured count must be honoured, not rounded to the constant.
+
+    The whole point of making this a setting is that "how many requests may one
+    failure cost" is a deployment decision; a value that silently did something
+    else would make the option a lie.
+    """
+    for attempts in (1, 2, 3):
+        session = _ScriptedSession([(503, "down")])
+        sleeper = _Sleeper()
+
+        with pytest.raises(VisionError):
+            await async_request_with_retry(  # type: ignore[arg-type]
+                session,
+                _config(),
+                {"model": "vision-model"},
+                attempts=attempts,
+                sleep=sleeper,
+            )
+
+        assert session.calls == attempts
+        assert len(sleeper.waits) == attempts - 1, "no wait after the last try"
+
+
+async def test_zero_attempts_is_refused_rather_than_silently_retried() -> None:
+    """`attempts=0` is a programming error, not "try zero times".
+
+    Rejected loudly because the alternative -- treating it as the default --
+    would hide a miscomputed `retry_count` behind plausible behaviour, and the
+    value reaches here as `config.retry_count + 1` where an off-by-one is easy.
+    """
+    session = _ScriptedSession([(503, "down")])
+
+    with pytest.raises(ValueError, match="at least 1"):
+        await async_request_with_retry(  # type: ignore[arg-type]
+            session, _config(), {"model": "vision-model"}, attempts=0, sleep=_Sleeper()
+        )
+
+    assert session.calls == 0, "nothing may be sent for an invalid budget"
+
+
 async def test_the_backoff_waits_grow_exponentially() -> None:
     """Waiting is what gives an overloaded provider time to recover.
 
