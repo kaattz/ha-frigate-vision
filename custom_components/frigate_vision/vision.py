@@ -550,6 +550,7 @@ def fallback_config_from(
         model=model,
         thinking=pick(CONF_FALLBACK_LLM_THINKING) or "default",
         reasoning_effort=pick(CONF_FALLBACK_LLM_REASONING_EFFORT) or "default",
+        retry_count=pick_retry_count(options, data),
         **_shared_prompt_settings(options),
         **_prompt_fields(data, options),
     )

@@ -15,6 +15,7 @@ from custom_components.frigate_vision.const import (
     CONF_VISION_RETRY_COUNT_MAX,
 )
 from custom_components.frigate_vision.vision import (
+    fallback_config_from,
     pick_retry_count,
     vision_config_from,
 )
@@ -103,3 +104,27 @@ def test_the_count_reaches_the_vision_config() -> None:
 
     unset = vision_config_from(_BASE_DATA, {})
     assert unset.retry_count == CONF_VISION_RETRY_COUNT_DEFAULT
+
+
+@pytest.mark.parametrize(
+    ("data", "options", "expected"),
+    [
+        ({}, {}, 0),
+        ({CONF_VISION_RETRY_COUNT: 2}, {}, 2),
+        ({CONF_VISION_RETRY_COUNT: 2}, {CONF_VISION_RETRY_COUNT: 3}, 3),
+    ],
+)
+def test_retry_budget_reaches_both_provider_configs(
+    data: dict, options: dict, expected: int
+) -> None:
+    configured = {
+        **_BASE_DATA,
+        "fallback_llm_base_url": "https://backup.example.com/v1",
+        "fallback_llm_api_key": "test-key",
+        "fallback_llm_model": "backup-vision",
+        **data,
+    }
+    primary = vision_config_from(configured, options)
+    fallback = fallback_config_from(configured, options)
+    assert fallback is not None
+    assert primary.retry_count == fallback.retry_count == expected
