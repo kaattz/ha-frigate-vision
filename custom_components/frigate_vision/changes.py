@@ -388,11 +388,10 @@ class ScoredFrame:
     def score(self) -> float:
         """The number the segmenter thresholds on.
 
-        The larger of the two comparisons, so a moment qualifies if EITHER kind of
-        change happened there. Taking the sum would let two half-changes stack into
-        a change neither comparison supports.
+        Whole-frame and focus-region changes can each qualify on their own.
+        Taking the maximum avoids adding several sub-threshold changes together.
         """
-        return max(self.sudden, self.cumulative)
+        return max(self.sudden, self.cumulative, self.best_zone)
 
     @property
     def best_zone(self) -> float:
@@ -407,6 +406,7 @@ def analyze_sequence(
     spec: BlockSpec = DEFAULT_SPEC,
     pixel_threshold: float = PIXEL_THRESHOLD,
     anchor_reset_threshold: float | None = None,
+    focus_reset_threshold: float | None = None,
 ) -> list[ScoredFrame]:
     """Score an ordered run of grayscale frames.
 
@@ -431,6 +431,12 @@ def analyze_sequence(
         return []
     scored: list[ScoredFrame] = []
     anchor = frames[0][1]
+    zone_anchors = {name: anchor for name in zones}
+    zone_reset_threshold = (
+        anchor_reset_threshold
+        if focus_reset_threshold is None
+        else focus_reset_threshold
+    )
     previous = frames[0][1]
     for index, (timestamp, frame) in enumerate(frames):
         if index == 0:
@@ -458,7 +464,7 @@ def analyze_sequence(
                 global_shift=global_change(previous, frame),
                 zones={
                     name: focus_region_change(
-                        anchor,
+                        zone_anchors[name],
                         frame,
                         polygon,
                         pixel_threshold=pixel_threshold,
@@ -471,6 +477,12 @@ def analyze_sequence(
             # The change has been seen; the following frames should accumulate
             # against this new state rather than against the one before it.
             anchor = frame
+        if zone_reset_threshold is not None:
+            for name, score in scored[-1].zones.items():
+                if score >= zone_reset_threshold:
+                    # Reset only this region: a small door movement must settle
+                    # without erasing a slow change elsewhere in the frame.
+                    zone_anchors[name] = frame
         previous = frame
     return scored
 

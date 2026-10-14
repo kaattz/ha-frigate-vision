@@ -410,6 +410,121 @@ class TestSegmentScoredFrames:
         assert [s.kind for s in segments] == ["stable"]
 
 
+class TestFocusZoneCanStartAChangeSegment:
+    ZONE = (
+        (25 / 160, 20 / 90),
+        (35 / 160, 20 / 90),
+        (35 / 160, 30 / 90),
+        (25 / 160, 30 / 90),
+    )
+
+    def test_small_zone_change_crosses_the_threshold(self) -> None:
+        from custom_components.frigate_vision.changes import (
+            analyze_sequence,
+            segment_scored_frames,
+        )
+
+        before = _flat(80)
+        opened = _with_patch(80, (20, 25, 30, 35), 160)
+        frames = [(0.0, before), (1.0, before), (2.0, opened)]
+        control = analyze_sequence(frames, anchor_reset_threshold=0.5)
+        focused = analyze_sequence(
+            frames, zones={"door": self.ZONE}, anchor_reset_threshold=0.5
+        )
+
+        assert focused[-1].sudden < 0.25
+        assert focused[-1].cumulative < 0.25
+        assert focused[-1].best_zone == pytest.approx(1.0)
+        assert all(
+            segment.kind == "stable"
+            for segment in segment_scored_frames(control, change_threshold=0.25)
+        )
+        assert any(
+            segment.kind == "change"
+            for segment in segment_scored_frames(focused, change_threshold=0.25)
+        )
+
+    def test_open_hold_close_produces_two_separate_changes(self) -> None:
+        from custom_components.frigate_vision.changes import (
+            analyze_sequence,
+            segment_scored_frames,
+        )
+
+        closed = _flat(80)
+        opened = _with_patch(80, (20, 25, 30, 35), 160)
+        frames = list(
+            enumerate([closed, closed, opened, opened, opened, closed, closed])
+        )
+        scored = analyze_sequence(
+            frames, zones={"door": self.ZONE}, anchor_reset_threshold=0.5
+        )
+
+        assert scored[3].best_zone == 0.0
+        assert scored[5].best_zone == pytest.approx(1.0)
+        assert [
+            segment.kind
+            for segment in segment_scored_frames(scored, change_threshold=0.25)
+        ] == ["stable", "change", "stable", "change", "stable"]
+
+    def test_zone_reset_does_not_erase_other_accumulating_changes(self) -> None:
+        from custom_components.frigate_vision.changes import analyze_sequence
+
+        frames = []
+        for index in range(5):
+            frame = _flat(80)
+            frame[0:15, 0:40] = 80 + index * 6
+            frame[20:30, 25:35] = 160 if index % 2 else 80
+            frames.append((float(index), frame))
+        scored = analyze_sequence(
+            frames, zones={"door": self.ZONE}, anchor_reset_threshold=0.5
+        )
+
+        assert scored[3].cumulative > 0.5
+        assert scored[2].best_zone == pytest.approx(1.0)
+
+    def test_uniform_brightness_does_not_trigger_the_zone(self) -> None:
+        from custom_components.frigate_vision.changes import (
+            analyze_sequence,
+            segment_scored_frames,
+        )
+
+        scored = analyze_sequence(
+            [(0.0, _flat(80)), (1.0, _flat(120)), (2.0, _flat(160))],
+            zones={"door": self.ZONE},
+            anchor_reset_threshold=0.5,
+        )
+        assert all(frame.best_zone == 0.0 for frame in scored)
+        assert [
+            segment.kind
+            for segment in segment_scored_frames(scored, change_threshold=0.25)
+        ] == ["stable"]
+
+    def test_preview_zone_settles_between_detection_and_reset_thresholds(self) -> None:
+        from io import BytesIO
+
+        from PIL import Image
+
+        from custom_components.frigate_vision.media import _analyse_preview_frames
+
+        closed = _flat(80)
+        opened = _with_patch(80, (20, 25, 23, 35), 160)
+        frames = []
+        for index, frame in enumerate([closed, closed, opened, opened, closed]):
+            buffer = BytesIO()
+            Image.fromarray(frame).convert("RGB").save(buffer, "WEBP", lossless=True)
+            frames.append((float(index), buffer.getvalue()))
+
+        result = _analyse_preview_frames(frames, {"door": self.ZONE}, 0.25, 0.5)
+        assert result is not None
+        scored, segments = result
+        assert 0.25 <= scored[2].best_zone < 0.5
+        assert scored[3].best_zone == 0.0
+        assert scored[4].best_zone >= 0.25
+        assert [segment.kind for segment in segments] == [
+            "stable", "change", "stable", "change"
+        ]
+
+
 _DOOR_POLYGON = [
     (0.181, 0.175),
     (0.407, 0.125),

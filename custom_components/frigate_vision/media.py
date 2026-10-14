@@ -12,7 +12,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
@@ -762,6 +762,7 @@ def _analyse_preview_frames(
         decoded,
         zones=zones,
         anchor_reset_threshold=anchor_reset_threshold,
+        focus_reset_threshold=change_threshold,
     )
     segments = segment_scored_frames(scored, change_threshold=change_threshold)
     return scored, segments
@@ -922,6 +923,37 @@ def choose_cells(
             break
         ordered.remove(removable[0])
     return tuple(ordered)
+
+
+def _selected_zone_times(
+    scored: Sequence[Any], segments: Sequence[Any], chosen: Sequence[float]
+) -> tuple[float, ...]:
+    """Keep the selected representatives of meaningful focus-region changes."""
+    selected = set(chosen)
+    protected: set[float] = set()
+    for segment in segments:
+        if segment.kind != "change":
+            continue
+        members = [scored[index] for index in segment.indices]
+        best = max(members, key=lambda item: (item.best_zone, item.score))
+        if best.best_zone > 0:
+            protected.update(
+                selected & {min(item.timestamp for item in members), best.timestamp}
+            )
+    return tuple(sorted(protected))
+
+
+def _analyse_recording_frames(
+    candidates: Sequence[tuple[float, Path]],
+    zones: Mapping[str, Sequence[tuple[float, float]]],
+) -> tuple[list[Any], list[Any]] | None:
+    """Reuse downloaded JPEGs through the same analyzer as preview, in an executor."""
+    return _analyse_preview_frames(
+        [(moment, path.read_bytes()) for moment, path in candidates],
+        zones,
+        CHANGE_THRESHOLD,
+        ANCHOR_RESET_THRESHOLD,
+    )
 
 
 def assert_cells_describe_the_person(
@@ -1876,6 +1908,7 @@ class MediaManager:
         # preview analysis -- and the repairs then apply only the neighbour and
         # coverage rules that existed before.
         self._segments: list[Any] = []
+        self._focus_representatives: tuple[float, ...] = ()
         # Refusals collected by the most recent repair pass, for the metadata.
         self._last_cross_segment_rejected: list[dict[str, Any]] = []
 
@@ -1887,6 +1920,9 @@ class MediaManager:
         plan: EvidencePlan,
         recordings: Sequence[Mapping[str, Any]],
         pool: Sequence[float],
+        *,
+        cached: Mapping[float, Path] | None = None,
+        protect: Sequence[float] = (),
     ) -> list[tuple[float, Path]]:
         """Add the cells that bound the sheet's unobserved stretches.
 
@@ -1922,7 +1958,7 @@ class MediaManager:
                 # layout depend on: the person's first frame, their last, and the
                 # emptied scene. All three are read by name, so none may be traded
                 # away for coverage.
-                protect=(plan.first_time, plan.last_time, plan.postroll_time),
+                protect=(plan.first_time, plan.last_time, plan.postroll_time, *protect),
                 usable=covered,
             )
         except Exception:  # noqa: BLE001 - an optimisation may never fail a build
@@ -1937,9 +1973,9 @@ class MediaManager:
         # kept unless one is given up to shrink the worst hole, so the frames
         # already fetched are reused wherever their instants survived. Only the
         # cells that are genuinely new need a request.
-        known = dict(selected)
-        added = [moment for moment in planned if moment not in known]
-        if not added:
+        known = dict(cached or {})
+        known.update(selected)
+        if tuple(planned) == tuple(moment for moment, _ in selected):
             return list(selected)
 
         result: list[tuple[float, Path]] = []
@@ -2191,6 +2227,7 @@ class MediaManager:
         # the wrong moments -- a silent corruption that no single-activity test
         # could see.
         self._segments = []
+        self._focus_representatives = ()
         self._last_cross_segment_rejected = []
         record = self._store.get(activity_id)
         if record is None:
@@ -2257,7 +2294,13 @@ class MediaManager:
             for _timestamp, box in record.box_updates
             if record.detection_ids
         ]
-        plan = plan_evidence(record, events, self._roles, motion_paths)
+        # A region needs image candidates even when the person has a valid path:
+        # their trajectory does not describe a door moving while they stand still.
+        # Reuse the existing twelve-candidate plan; unconfigured entries keep their
+        # original motion plan and request count.
+        plan = plan_evidence(
+            record, events, self._roles, None if self._focus_zones else motion_paths
+        )
         final = self._canonical_path(record)
         metadata = final.with_suffix(".json")
         recovered = await self._hass.async_add_executor_job(
@@ -2473,6 +2516,12 @@ class MediaManager:
             recordings,
             (plan.first_time, plan.last_time),
         )
+        if self._focus_representatives:
+            actual_times = dict(zip(times, requested, strict=True))
+            self._focus_representatives = tuple(
+                actual_times.get(moment, moment)
+                for moment in self._focus_representatives
+            )
         # The required set is derived from the frames themselves, NOT from the role
         # names. `_nudge_uncovered_frames` still returns `fixed` keyed by role, but
         # feeding that to `recordings_cover` is the defect this replaces: the filter
@@ -2515,7 +2564,41 @@ class MediaManager:
                 await self._hass.async_add_executor_job(path.write_bytes, data)
                 candidates.append((timestamp, path))
                 candidate_roles.append(roles[index])
-            if from_preview or plan.sample_times or plan.motion_times:
+            if not from_preview and self._focus_zones:
+                by_role = {
+                    role: item
+                    for item, role in zip(candidates, candidate_roles, strict=True)
+                    if role in {"first", "last", "postroll"}
+                }
+                selection_plan = replace(
+                    plan,
+                    first_time=_required_role(by_role, "first")[0],
+                    last_time=_required_role(by_role, "last")[0],
+                    postroll_time=_required_role(by_role, "postroll")[0],
+                )
+                analysed = await self._hass.async_add_executor_job(
+                    _analyse_recording_frames, candidates, self._focus_zones
+                )
+                if analysed is None:
+                    raise MediaError("invalid_review_candidate_frame")
+                scored, segments = analysed
+                chosen = choose_cells(
+                    scored, segments, plan=selection_plan,
+                    cells=DEFAULT_CELLS, max_cells=MAX_CELLS,
+                )
+                if len(chosen) not in {DEFAULT_CELLS, MAX_CELLS}:
+                    raise MediaError("insufficient_review_candidates")
+                assert_cells_describe_the_person(
+                    chosen, person_start=plan.first_time,
+                    person_end=plan.last_time, departure=plan.postroll_time,
+                )
+                by_time = dict(candidates)
+                selected = [(moment, by_time[moment]) for moment in chosen]
+                self._segments = list(segments)
+                self._focus_representatives = _selected_zone_times(
+                    scored, segments, chosen
+                )
+            elif from_preview or plan.sample_times or plan.motion_times:
                 selected = candidates
                 # A frame the sheet cannot do without was dropped by a recording hole.
                 #
@@ -2595,6 +2678,13 @@ class MediaManager:
             # defects were one of each -- a 52.9 s hole on the recordings route and
             # a 30.3 s hole on the preview route -- and both were published as
             # perfectly ordinary sheets.
+            coverage_cache: Mapping[float, Path] | None = None
+            coverage_protect: tuple[float, ...] = ()
+            if self._focus_zones:
+                coverage_cache = dict(candidates)
+                coverage_protect = (
+                    selected[0][0], selected[-1][0], *self._focus_representatives
+                )
             selected = await self._async_enforce_coverage(
                 record,
                 temporary,
@@ -2606,6 +2696,8 @@ class MediaManager:
                     *(timestamp for timestamp, _ in candidates),
                     *preview_pool,
                 ],
+                cached=coverage_cache,
+                protect=coverage_protect,
             )
             # Each repair pass resets the refusal list, so it is collected after
             # every one of them: a frame the IR ladder refused and then the
@@ -2953,6 +3045,7 @@ class MediaManager:
         # signature that predates this and adding a parameter to each would touch
         # every existing test for no benefit.
         self._segments = list(segments)
+        self._focus_representatives = _selected_zone_times(scored, segments, chosen)
         return chosen, {
             "preview_frame_count": len(parsed),
             "preview_analysed": len(frames),
