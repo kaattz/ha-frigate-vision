@@ -1015,6 +1015,28 @@ async def test_health_recovers_when_the_provider_answers_again(
     assert runtime.is_healthy is True, "a recovered provider must restore health"
 
 
+@pytest.mark.parametrize(
+    "local_error", ["stage_conflict", "recording_gap", "media_cleanup_failed"]
+)
+async def test_local_errors_do_not_clear_an_unrecovered_provider_outage(
+    hass: HomeAssistant, local_error: str
+) -> None:
+    runtime = _healthy_runtime(hass)
+    runtime.record_error("provider_http_503")
+    assert runtime.is_healthy is False
+
+    runtime.record_error(local_error)
+    assert runtime.last_error == local_error
+    assert runtime.is_healthy is False
+
+    runtime.clear_error(local_error)
+    assert runtime.last_error is None
+    assert runtime.is_healthy is False
+
+    runtime.clear_error("provider_error")
+    assert runtime.is_healthy is True
+
+
 async def test_a_local_failure_does_not_mark_the_provider_unhealthy(
     hass: HomeAssistant,
 ) -> None:
@@ -1064,3 +1086,77 @@ async def test_the_first_provider_failure_pushes_one_notification(
     await hass.async_block_till_done()
 
     assert len(sent) == 1, "one outage must not mean one message per activity"
+
+
+async def test_provider_unavailable_notifies_once_and_keeps_its_own_repair(
+    hass: HomeAssistant,
+) -> None:
+    sent: list[dict] = []
+
+    async def handler(call) -> None:
+        sent.append(dict(call.data))
+
+    hass.services.async_register("script", "alert_notify", handler)
+    runtime = _healthy_runtime(hass)
+    runtime.outage = OutageNotifier(hass)
+
+    runtime.record_error("provider_unavailable")
+    await hass.async_block_till_done()
+    runtime.record_error("provider_unavailable")
+    await hass.async_block_till_done()
+
+    assert len(sent) == 1
+    assert "provider_unavailable" in sent[0]["message"]
+    assert runtime.is_healthy is False
+    registry = ir.async_get(hass)
+    assert ("frigate_vision", "entry_1_provider_unavailable") in registry.issues
+    assert ("frigate_vision", "entry_1_provider_error") not in registry.issues
+
+
+async def test_provider_success_recovers_even_when_delivery_fails(
+    hass: HomeAssistant,
+) -> None:
+    entry = _entry({})
+    entry.add_to_hass(hass)
+    runtime = _healthy_runtime(hass, entry.entry_id)
+    await runtime.store.async_load()
+    record = ActivityRecord(
+        activity_id="provider_recovered",
+        entry_id=entry.entry_id,
+        source=ActivitySource.STANDALONE_REVIEW,
+        stage=ActivityStage.EVIDENCE_READY,
+        created_at=100,
+        updated_at=120,
+        camera="front",
+        detection_ids=("event_1",),
+        finalization_deadline=time.time() + 60,
+    )
+    await runtime.store.async_create(record)
+    runtime.analysis_tasks = {}
+    runtime.vision = SimpleNamespace(  # type: ignore[assignment]
+        async_analyze=AsyncMock(return_value=record)
+    )
+    runtime.delivery = SimpleNamespace(  # type: ignore[assignment]
+        async_start=AsyncMock(side_effect=RuntimeError("stage_conflict"))
+    )
+
+    async def handler(call) -> None:
+        return None
+
+    hass.services.async_register("script", "alert_notify", handler)
+    runtime.outage = OutageNotifier(hass)
+    runtime.record_error("provider_http_503")
+    await hass.async_block_till_done()
+    assert runtime.outage.notified is True
+    assert runtime.is_healthy is False
+
+    runtime._schedule_analysis(entry, record)
+    await asyncio.gather(*(runtime.analysis_tasks or {}).values())
+
+    assert runtime.is_healthy is True
+    assert runtime.outage.notified is False
+    assert runtime.last_error == "stage_conflict"
+    registry = ir.async_get(hass)
+    assert (
+        "frigate_vision", f"{entry.entry_id}_provider_error"
+    ) not in registry.issues

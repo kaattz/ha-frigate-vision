@@ -265,6 +265,7 @@ class IntegrationRuntime:
     # Announces the first provider failure of an outage. None disables the push,
     # which is what every existing construction and most tests want.
     outage: OutageNotifier | None = None
+    _provider_failed: bool = False
 
     @classmethod
     async def async_create(
@@ -463,11 +464,9 @@ class IntegrationRuntime:
         # having no sensor at all: it is the surface a user checks *instead of*
         # investigating.
         #
-        # `last_error` is the same signal the `Last error` sensor shows and the
-        # same one that raises the Repair card, so the three cannot disagree.
-        if self.last_error is not None and the_provider_is_the_suspect(
-            self.last_error
-        ):
+        # Other failures may replace or clear last_error while the provider is
+        # still down. Only a successful analysis clears this outage state.
+        if self._provider_failed:
             return False
         return True
 
@@ -687,8 +686,6 @@ class IntegrationRuntime:
                 else:
                     try:
                         analyzed = await self.vision.async_analyze(record.activity_id)
-                        if self.delivery is not None:
-                            await self.delivery.async_start(analyzed.activity_id)
                         self.clear_error("vision_not_configured")
                         # A success proves the provider is answering again, so
                         # the outage alert comes down. Without this the repair
@@ -701,6 +698,8 @@ class IntegrationRuntime:
                         # outage, or stay silent through a second one.
                         if self.outage is not None:
                             self.outage.reset()
+                        if self.delivery is not None:
+                            await self.delivery.async_start(analyzed.activity_id)
                         return
                     except VisionError as exc:
                         error = exc
@@ -756,6 +755,15 @@ class IntegrationRuntime:
 
     def record_error(self, code: str) -> None:
         self.last_error = code
+        if the_provider_is_the_suspect(code):
+            self._provider_failed = True
+            # Notify before a provider's specific Repair card can return early.
+            # The notifier still sends only once until a successful analysis.
+            if self.outage is not None:
+                self.hass.async_create_task(
+                    self.outage.async_notify_failure(code),
+                    f"frigate_vision-outage-{self.entry_id}",
+                )
         # `provider_error` is the shared alert for every provider-side failure.
         # The user's action does not depend on which code it was, and a per-status
         # issue would need a translation for every status a provider can invent.
@@ -799,18 +807,6 @@ class IntegrationRuntime:
             )
             if self.entry_id:
                 async_set_issue(self.hass, self.entry_id, PROVIDER_ERROR)
-            # The Repair card alone was not enough: on 2026-10-13 it was raised at
-            # 15:08 and went unnoticed until 18:00, with five activities lost in
-            # between. The push is sent from *here* rather than from the failover
-            # loop so that it fires for the same condition the card describes --
-            # the loop sees one activity, this sees the entry's provider failing,
-            # and only the latter is an outage. `OutageNotifier` keeps it to one
-            # message per outage.
-            if self.outage is not None:
-                self.hass.async_create_task(
-                    self.outage.async_notify_failure(code),
-                    f"frigate_vision-outage-{self.entry_id}",
-                )
 
     def clear_error(self, code: str) -> None:
         if code in ISSUES and self.entry_id:
@@ -834,8 +830,11 @@ class IntegrationRuntime:
         #     *and* were blamed on the provider under the old complement-based
         #     predicate, so a successful analysis erased a live Frigate outage
         #     from the sensor while its repair card stayed up.
-        if code == PROVIDER_ERROR and self.last_error is not None:
-            if the_provider_is_the_suspect(self.last_error):
+        if code == PROVIDER_ERROR:
+            self._provider_failed = False
+            if self.last_error is not None and the_provider_is_the_suspect(
+                self.last_error
+            ):
                 self.last_error = None
         if self.last_error == code:
             self.last_error = None
