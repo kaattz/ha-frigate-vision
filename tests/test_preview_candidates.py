@@ -815,9 +815,10 @@ class TestFocusZonesReachTheChangeAnalysis:
             hass, tmp_path, client_c, {}, "review_entry_1_front_zone_c"
         )
         assert payload_c["candidate_source"] == "preview"
-        # Both are valid; the point is that configuring a region is accepted and
-        # does not change the contract of what gets written.
-        assert len(payload_a["sample_times"]) == len(payload_c["sample_times"])
+        # Independent region phases can require the third row. The unconfigured
+        # control still uses its original six cells; both obey the same 6/9 cap.
+        assert len(payload_a["sample_times"]) == 9
+        assert len(payload_c["sample_times"]) == 6
 
 
 class TestARestartCanReadWhatTheBuildWrote:

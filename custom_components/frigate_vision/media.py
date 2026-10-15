@@ -115,8 +115,7 @@ CHANGE_THRESHOLD = 0.25
 ANCHOR_RESET_THRESHOLD = 0.5
 
 # How many cells a sheet may hold. Six is the layout the prompt describes; nine
-# is used only when the activity genuinely has more distinct change segments than
-# six cells can represent.
+# is used when distinct changes or tracked movement need another whole row.
 DEFAULT_CELLS = 6
 MAX_CELLS = 9
 
@@ -812,6 +811,9 @@ def choose_cells(
     if not scored:
         return ()
     by_time = {item.timestamp: item for item in scored}
+    focus_pairs = _focus_change_pairs(scored)
+    available = set(by_time) | {plan.first_time, plan.postroll_time, plan.last_time}
+    focus_limit = max_cells if len(available) >= max_cells else cells
     change_segments = [segment for segment in segments if segment.kind == "change"]
     stable_segments = [segment for segment in segments if segment.kind == "stable"]
 
@@ -826,7 +828,10 @@ def choose_cells(
     chosen: list[float] = []
 
     def add(moment: float | None) -> None:
-        if moment is not None and moment not in chosen:
+        if (
+            moment is not None and moment not in chosen
+            and (not focus_pairs or len(chosen) < focus_limit)
+        ):
             chosen.append(moment)
 
     # The two cells the prompt's rules read by name: "第一格是人物首帧，最后一格是
@@ -842,6 +847,35 @@ def choose_cells(
     anchors: set[float] = {plan.first_time, plan.postroll_time}
     add(plan.first_time)
     add(plan.postroll_time)
+    if focus_pairs:
+        # First represent every active region, rather than spending all cells on
+        # the strongest region. A frame shared by several regions costs one cell.
+        for pairs in focus_pairs:
+            add(pairs[0][1])
+        if focus_limit == cells:
+            # A sparse pool cannot complete nine cells. Keep the available door
+            # pairs ahead of lower-priority motion instead of creating eight
+            # cells and letting geometric trimming remove the door states.
+            for pairs in focus_pairs:
+                for before, peak in pairs:
+                    add(peak)
+                    if peak in chosen:
+                        add(before)
+        # Keep the person's movement alongside the region peaks, before spending
+        # the remaining cells on before-frames and additional region cycles.
+        for moment in sorted(
+            _motion_candidate_times(scored, plan),
+            key=lambda value: min(abs(value - picked) for picked in chosen),
+            reverse=True,
+        ):
+            add(moment)
+        for rank in range(max(len(pairs) for pairs in focus_pairs)):
+            for pairs in focus_pairs:
+                if rank < len(pairs):
+                    add(pairs[rank][1])
+        for pairs in focus_pairs:
+            for before, _peak in pairs:
+                add(before)
     # `last` is not reserved: it sits inside the person's window and a change
     # segment usually covers it, so reserving it too would spend a cell on a
     # moment already represented.
@@ -870,12 +904,36 @@ def choose_cells(
         # "the lift moved" within one segment.
         add(max(members, key=lambda item: (item.best_zone, item.score)).timestamp)
 
-    if len(chosen) < cells:
+    # A change segment can span a whole walk: its start and strongest door frame
+    # do not show the person reaching the bottom of the camera. Keep the motion
+    # phases before spending cells on still stretches, even when six change
+    # cells already filled the default row budget.
+    change_cell_count = len(chosen)
+    motion_candidates = _motion_candidate_times(scored, plan)
+    # A partial row would let the old geometric trim delete a door frame. Only
+    # grow when the decoded pool can complete the new row.
+    motion_limit = max_cells if len(available) >= max_cells else cells
+    for moment in sorted(
+        motion_candidates,
+        key=lambda value: min(abs(value - picked) for picked in chosen),
+        reverse=True,
+    ):
+        if len(chosen) >= motion_limit:
+            break
+        add(moment)
+
+    fill_cells = (
+        max_cells if (
+            len(chosen) > max(cells, change_cell_count)
+            or (focus_pairs and len(chosen) > cells)
+        ) else cells
+    )
+    if len(chosen) < fill_cells:
         add(plan.last_time)
 
-    if len(chosen) < cells:
+    if len(chosen) < fill_cells:
         for segment in sorted(stable_segments, key=lambda s: s.span, reverse=True):
-            if len(chosen) >= cells:
+            if len(chosen) >= fill_cells:
                 break
             add(_segment_middle(scored, segment))
 
@@ -885,10 +943,12 @@ def choose_cells(
     # alternative to filling those cells is a three-cell sheet, which is not a
     # layout this integration builds. The frames chosen this way are the ones the
     # preview analysis already decoded, so they cost nothing extra.
-    if len(chosen) < cells and len(scored) > len(chosen):
+    if len(chosen) < fill_cells and (
+        len(scored) > len(chosen) or fill_cells > cells
+    ):
         times = [item.timestamp for item in scored]
-        for index in allocate_budget(len(times), cells):
-            if len(chosen) >= cells:
+        for index in allocate_budget(len(times), fill_cells):
+            if len(chosen) >= fill_cells:
                 break
             add(times[index])
 
@@ -925,6 +985,47 @@ def choose_cells(
     return tuple(ordered)
 
 
+def _motion_candidate_times(
+    scored: Sequence[Any], plan: EvidencePlan
+) -> tuple[float, ...]:
+    """Map tracked motion to already decoded candidates in the person's window."""
+    times = [
+        item.timestamp for item in scored
+        if plan.first_time <= item.timestamp <= plan.last_time
+    ]
+    if not times:
+        return ()
+    return tuple(sorted({
+        min(times, key=lambda value: abs(value - moment))
+        for moment in plan.motion_times
+        if plan.first_time <= moment <= plan.last_time
+    }))
+
+
+def _focus_change_pairs(scored: Sequence[Any]) -> list[list[tuple[float, float]]]:
+    """Before/peak pairs, ranked within each active region's own phases."""
+    from .changes import segment_focus_zones
+
+    grouped = segment_focus_zones(scored, change_threshold=CHANGE_THRESHOLD)
+    result: list[tuple[float, list[tuple[float, float]]]] = []
+    for name, segments in grouped.items():
+        changes = [segment for segment in segments if segment.kind == "change"]
+        if not changes:
+            continue
+        ranked = []
+        for segment in changes:
+            best = max(segment.indices, key=lambda i: scored[i].zones.get(name, 0.0))
+            before = max(0, segment.indices[0] - 1)
+            ranked.append((
+                scored[best].zones.get(name, 0.0),
+                (scored[before].timestamp, scored[best].timestamp),
+            ))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        result.append((ranked[0][0], [pair for _score, pair in ranked]))
+    result.sort(key=lambda item: item[0], reverse=True)
+    return [pairs for _score, pairs in result]
+
+
 def _selected_zone_times(
     scored: Sequence[Any], segments: Sequence[Any], chosen: Sequence[float]
 ) -> tuple[float, ...]:
@@ -940,6 +1041,9 @@ def _selected_zone_times(
             protected.update(
                 selected & {min(item.timestamp for item in members), best.timestamp}
             )
+    for pairs in _focus_change_pairs(scored):
+        for before, peak in pairs:
+            protected.update(selected & {before, peak})
     return tuple(sorted(protected))
 
 
@@ -954,6 +1058,12 @@ def _analyse_recording_frames(
         CHANGE_THRESHOLD,
         ANCHOR_RESET_THRESHOLD,
     )
+
+
+def _repair_segments(scored: Sequence[Any], segments: Sequence[Any]) -> list[Any]:
+    from .changes import refine_focus_segments
+
+    return refine_focus_segments(scored, segments, change_threshold=CHANGE_THRESHOLD)
 
 
 def assert_cells_describe_the_person(
@@ -1909,6 +2019,7 @@ class MediaManager:
         # coverage rules that existed before.
         self._segments: list[Any] = []
         self._focus_representatives: tuple[float, ...] = ()
+        self._motion_representatives: tuple[float, ...] = ()
         # Refusals collected by the most recent repair pass, for the metadata.
         self._last_cross_segment_rejected: list[dict[str, Any]] = []
 
@@ -2228,6 +2339,7 @@ class MediaManager:
         # could see.
         self._segments = []
         self._focus_representatives = ()
+        self._motion_representatives = ()
         self._last_cross_segment_rejected = []
         record = self._store.get(activity_id)
         if record is None:
@@ -2301,6 +2413,15 @@ class MediaManager:
         plan = plan_evidence(
             record, events, self._roles, None if self._focus_zones else motion_paths
         )
+        # Keep the twelve-image recording route for configured regions, while
+        # giving both change selectors the existing path's phase candidates.
+        selection_plan = replace(
+            plan,
+            motion_times=(select_motion_times(
+                list(motion_paths.values()), lower=plan.first_time,
+                upper=plan.last_time,
+            ) or ()),
+        ) if self._focus_zones else plan
         final = self._canonical_path(record)
         metadata = final.with_suffix(".json")
         recovered = await self._hass.async_add_executor_job(
@@ -2388,7 +2509,7 @@ class MediaManager:
         preview = (
             await self._async_preview_timestamps(
                 record,
-                plan,
+                selection_plan,
                 (plan.first_time, plan.postroll_time),
             )
             if allow_preview
@@ -2522,6 +2643,12 @@ class MediaManager:
                 actual_times.get(moment, moment)
                 for moment in self._focus_representatives
             )
+        if self._motion_representatives:
+            actual_times = dict(zip(times, requested, strict=True))
+            self._motion_representatives = tuple(
+                actual_times.get(moment, moment)
+                for moment in self._motion_representatives
+            )
         # The required set is derived from the frames themselves, NOT from the role
         # names. `_nudge_uncovered_frames` still returns `fixed` keyed by role, but
         # feeding that to `recordings_cover` is the defect this replaces: the filter
@@ -2571,7 +2698,7 @@ class MediaManager:
                     if role in {"first", "last", "postroll"}
                 }
                 selection_plan = replace(
-                    plan,
+                    selection_plan,
                     first_time=_required_role(by_role, "first")[0],
                     last_time=_required_role(by_role, "last")[0],
                     postroll_time=_required_role(by_role, "postroll")[0],
@@ -2594,9 +2721,13 @@ class MediaManager:
                 )
                 by_time = dict(candidates)
                 selected = [(moment, by_time[moment]) for moment in chosen]
-                self._segments = list(segments)
+                self._segments = _repair_segments(scored, segments)
                 self._focus_representatives = _selected_zone_times(
                     scored, segments, chosen
+                )
+                self._motion_representatives = tuple(
+                    moment for moment in _motion_candidate_times(scored, selection_plan)
+                    if moment in chosen
                 )
             elif from_preview or plan.sample_times or plan.motion_times:
                 selected = candidates
@@ -2679,11 +2810,12 @@ class MediaManager:
             # a 30.3 s hole on the preview route -- and both were published as
             # perfectly ordinary sheets.
             coverage_cache: Mapping[float, Path] | None = None
-            coverage_protect: tuple[float, ...] = ()
+            coverage_protect = self._motion_representatives
             if self._focus_zones:
                 coverage_cache = dict(candidates)
                 coverage_protect = (
-                    selected[0][0], selected[-1][0], *self._focus_representatives
+                    selected[0][0], selected[-1][0], *self._focus_representatives,
+                    *self._motion_representatives,
                 )
             selected = await self._async_enforce_coverage(
                 record,
@@ -3044,8 +3176,12 @@ class MediaManager:
         # down, because the three repair passes are called from the build with a
         # signature that predates this and adding a parameter to each would touch
         # every existing test for no benefit.
-        self._segments = list(segments)
+        self._segments = _repair_segments(scored, segments)
         self._focus_representatives = _selected_zone_times(scored, segments, chosen)
+        self._motion_representatives = tuple(
+            moment for moment in _motion_candidate_times(scored, plan)
+            if moment in chosen
+        )
         return chosen, {
             "preview_frame_count": len(parsed),
             "preview_analysed": len(frames),

@@ -144,6 +144,25 @@ async def test_motion_fallback_uses_twelve_candidates_only_with_regions(hass, tm
     assert len(focused.snapshot_times) <= 18
 
 
+async def test_focused_recording_selection_receives_motion_phases(
+    hass, tmp_path, monkeypatch
+):
+    import custom_components.frigate_vision.media as media
+
+    original = media.choose_cells
+    seen = []
+
+    def choose(scored, segments, *, plan, cells, max_cells):
+        seen.append(plan.motion_times)
+        return original(scored, segments, plan=plan, cells=cells, max_cells=max_cells)
+
+    monkeypatch.setattr(media, "choose_cells", choose)
+    client = RecordingClient(motion=True)
+    await _build(hass, tmp_path, client)
+    assert seen and seen[0], "focus zones不能让预览/录像选择器丢弃已有轨迹"
+    assert client.snapshot_times == pytest.approx(TIMES)
+
+
 async def test_recording_selection_reuses_nudged_anchor(hass, tmp_path):
     client = RecordingClient(motion=True, nudge=True)
     _, _, _, result, metadata = await _build(hass, tmp_path, client)

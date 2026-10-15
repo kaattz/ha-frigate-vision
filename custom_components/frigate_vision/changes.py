@@ -499,3 +499,56 @@ def segment_scored_frames(
     times = [item.timestamp for item in scored]
     scores = [item.score for item in scored[1:]]
     return segment_frames(times, scores, change_threshold=change_threshold)
+
+
+def segment_focus_zones(
+    scored: Sequence[ScoredFrame], *, change_threshold: float
+) -> dict[str, list[Segment]]:
+    """Segment each region's own score, independently of larger nearby changes."""
+    names = sorted({name for frame in scored for name in frame.zones})
+    times = [frame.timestamp for frame in scored]
+    return {
+        name: segment_frames(
+            times, [frame.zones.get(name, 0.0) for frame in scored[1:]],
+            change_threshold=change_threshold,
+        )
+        for name in names
+    }
+
+
+def refine_focus_segments(
+    scored: Sequence[ScoredFrame], segments: Sequence[Segment], *,
+    change_threshold: float,
+) -> list[Segment]:
+    """Intersect phase boundaries into a disjoint partition for frame repairs.
+
+    Midpoints assign instants between decoded samples to a phase too, including
+    person anchors that do not coincide with a preview filename's timestamp.
+    """
+    grouped = segment_focus_zones(scored, change_threshold=change_threshold)
+    if not any(s.kind == "change" for group in grouped.values() for s in group):
+        return list(segments)
+    boundaries = {0, len(scored)}
+    for partition in [list(segments), *grouped.values()]:
+        for segment in partition:
+            if segment.indices:
+                boundaries.update((segment.indices[0], segment.indices[-1] + 1))
+    ordered = sorted(boundaries)
+    refined = []
+    for start, stop in zip(ordered, ordered[1:], strict=False):
+        left = (
+            (scored[start - 1].timestamp + scored[start].timestamp) / 2
+            if start else -math.inf
+        )
+        right = (
+            math.nextafter(
+                (scored[stop - 1].timestamp + scored[stop].timestamp) / 2,
+                -math.inf,
+            ) if stop < len(scored) else math.inf
+        )
+        score = max(frame.score for frame in scored[start:stop])
+        refined.append(Segment(
+            left, right, "change" if score >= change_threshold else "stable",
+            score, tuple(range(start, stop)),
+        ))
+    return refined
