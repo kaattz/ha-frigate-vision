@@ -395,7 +395,7 @@ class FrigateClipPlayer extends HTMLElement {
           border: 2px solid transparent; position: relative;
         }
         .cells button::after {
-          content: attr(data-cell);
+          content: attr(data-time);
           position: absolute; top: 4px; left: 4px;
           min-width: 16px; height: 16px; padding: 0 4px;
           border-radius: 8px; background: rgba(0, 0, 0, 0.55);
@@ -582,7 +582,8 @@ class FrigateClipPlayer extends HTMLElement {
       const button = document.createElement("button");
       button.type = "button";
       button.dataset.cell = String(index + 1);
-      button.title = "跳到第 " + (index + 1) + " 格画面";
+      button.dataset.time = offset.toFixed(1) + "s";
+      button.title = "跳到第 " + offset + " 秒";
       button.setAttribute(
         "aria-label",
         "跳到第 " + (index + 1) + " 格画面，第 " + offset + " 秒"

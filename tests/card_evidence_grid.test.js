@@ -446,6 +446,54 @@ check("a source with a sheet builds one button per offset", async () => {
   assert.strictEqual(cells.children[5].dataset.cell, "6");
 });
 
+check("six- and nine-cell badges show playback seconds to one decimal", async () => {
+  for (const offsets of [
+    [2.149, 9.2, 17.8, 26.4, 37, 44.7],
+    [2.149, 9.2, 17.8, 26.4, 37, 44.7, 52.3, 61.8, 70.2],
+  ]) {
+    const { card, cells } = makeCard({ notification_id: "alert_times" });
+    card.hass = storeWith({
+      id: "alert_times",
+      hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
+      evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=Y",
+      evidence_offsets: offsets.join("|"),
+    });
+    await flush();
+    assert.deepStrictEqual(
+      cells.children.map((button) => button.dataset.time),
+      ["2.1s", "9.2s", "17.8s", "26.4s", "37.0s", "44.7s", "52.3s", "61.8s", "70.2s"].slice(0, offsets.length),
+      "badges must show playback time, including a decimal for whole seconds"
+    );
+    assert.match(
+      card.shadowRoot.innerHTML,
+      /\.cells button::after\s*\{\s*content:\s*attr\(data-time\)/,
+      "the visible badge must read the time label"
+    );
+  }
+});
+
+check("rounded badges retain the exact seek time and accessible description", async () => {
+  const { card, video, cells } = makeCard({ notification_id: "alert_precise" });
+  video.readyState = 1;
+  video.duration = 66.3;
+  card.hass = storeWith({
+    id: "alert_precise",
+    hls_url: "/api/frigate/vod/cam/start/1/end/2/index.m3u8?authSig=X",
+    evidence_image_url: "/api/frigate_vision/media/e/a.jpg?authSig=Y",
+    evidence_offsets: "2.149|9.2|17.8|26.4|37|44.7",
+  });
+  await flush();
+  const button = cells.children[0];
+  assert.ok(button.title.includes("2.149 秒"), "the tooltip must state the exact time");
+  assert.ok(
+    button.getAttribute("aria-label").includes("2.149 秒"),
+    "the accessible description must state the exact time"
+  );
+  button.dispatch("click");
+  assert.strictEqual(video.currentTime, 2.149, "rounding a badge must not change seeking");
+  assert.strictEqual(video.paused, true, "the existing pause-for-comparison action stays");
+});
+
 check("a notification without the fields renders no sheet (old notifications)", async () => {
   const { card, cells, evidence } = makeCard({ notification_id: "alert_old" });
   card.hass = storeWith({

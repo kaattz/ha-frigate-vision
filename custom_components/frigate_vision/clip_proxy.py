@@ -18,6 +18,7 @@ single event's recording.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import timedelta
 from urllib.parse import quote
 
@@ -79,7 +80,7 @@ _UPSTREAM_TIMEOUT = aiohttp.ClientTimeout(total=None, sock_read=60)
 
 
 def clip_window(record: ActivityRecord) -> tuple[float, float]:
-    """Return the start and end of the footage for one activity.
+    """Return whole-second start and end times for one activity's footage.
 
     Bounded by `MAX_CLIP_SECONDS` so a record cannot yield an hour-long video,
     and widened by the margin on both sides so the approach and departure are
@@ -89,8 +90,10 @@ def clip_window(record: ActivityRecord) -> tuple[float, float]:
     # non-negative, so the only thing to defend against here is span.
     last = max(record.sample_times) if record.sample_times else record.created_at
     last = max(last, record.created_at)
-    start = max(0.0, record.created_at - CLIP_LEAD_SECONDS)
-    end = min(last + CLIP_TAIL_SECONDS, start + MAX_CLIP_SECONDS)
+    # Round outward here so HLS, MP4 and cell offsets share the same window.
+    # Apply the cap to the rounded start so rounding cannot make it exceed 90s.
+    start = max(0, math.floor(record.created_at - CLIP_LEAD_SECONDS))
+    end = math.ceil(min(last + CLIP_TAIL_SECONDS, start + MAX_CLIP_SECONDS))
     return start, end
 
 

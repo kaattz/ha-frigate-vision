@@ -77,6 +77,55 @@ def test_clip_window_handles_a_record_with_no_samples() -> None:
     assert 8.0 <= end - start <= 90.0
 
 
+@pytest.mark.parametrize(
+    ("created_at", "sample_times", "expected"),
+    [
+        (100.75, (100.75, 110.5, 120.25), (95, 127)),
+        (2.75, (2.75, 3.0, 3.25), (0, 10)),
+        (100.75, (100.75, 200.5, 400.25), (95, 185)),
+        (100.75, (), (95, 107)),
+    ],
+)
+def test_clip_window_rounds_outward_without_exceeding_90_seconds(
+    created_at: float,
+    sample_times: tuple[float, ...],
+    expected: tuple[int, int],
+) -> None:
+    """Integer windows retain the margins, a nonnegative start and the cap."""
+    record = _record(
+        created_at=created_at,
+        updated_at=max((created_at, *sample_times)),
+        sample_times=sample_times,
+    )
+
+    start, end = clip_window(record)
+
+    assert (start, end) == expected
+    assert start >= 0
+    assert end - start <= 90
+
+
+def test_fractional_activity_uses_the_actual_hls_start_for_offsets_and_mp4() -> None:
+    """The cell seek and MP4 range must match the integer HLS range."""
+    from custom_components.frigate_vision.clip_proxy import hls_path_for
+
+    record = _record(
+        created_at=100.75,
+        sample_times=(100.75, 110.5, 120.25),
+    )
+    hls_range = hls_path_for("front", record).split("/start/", 1)[1].split("/")
+    actual_start, actual_end = int(hls_range[0]), int(hls_range[2])
+
+    assert evidence_offsets(record) == tuple(
+        round(sample - actual_start, 1) for sample in record.sample_times
+    )
+    assert (actual_start, actual_end) == (95, 127)
+    assert FrigateClipView(Mock(), "http://frigate").upstream_url(record) == (
+        f"http://frigate/api/front/start/{actual_start:.6f}"
+        f"/end/{actual_end:.6f}/clip.mp4"
+    )
+
+
 def test_clip_url_is_absolute_and_uses_the_ha_origin() -> None:
     """The link goes into a chat message, so it must be a full URL.
 
@@ -250,7 +299,7 @@ def test_hls_path_uses_integer_seconds_and_no_instance_id() -> None:
     """Frigate's VOD path segments accept integers, and this proxy form needs
     no instance id.
 
-    Seconds are truncated to integers: a floating-point timestamp in the URL
+    The shared window uses integers: a floating-point timestamp in the URL
     would make one activity produce two different URLs, and therefore two
     cache entries for identical footage.
     """
